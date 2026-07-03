@@ -4,8 +4,6 @@
 workspaces, история сессий с поиском, аналитика, встроенный code review с чекпоинтами
 и управление конфигурацией pi (extensions/skills/MCP/models) прямо из приложения.
 
-Архитектура и требования — в [PLAN.md](PLAN.md).
-
 ## Как это устроено
 
 - **Tauri 2 + React 19.** Rust-ядро запускает `pi --mode rpc` (JSONL по stdio) на каждую
