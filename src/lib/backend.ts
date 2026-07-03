@@ -247,6 +247,18 @@ class MockBackend implements Backend {
             createdAt: new Date(Date.now() - 200000e3).toISOString(), modifiedMs: Date.now() - 172800e3,
             messageCount: 41, userSnippet: "Рефакторинг supervisor", costTotal: 1.2, tokensIn: 500000, tokensOut: 40000,
           },
+          // две одноимённые сессии (одинаковый стартовый промпт Create PR) —
+          // воспроизводят баг переключения между сессиями с одинаковым названием
+          {
+            path: "/mock/a/pr1.jsonl", id: "pr1", cwd: "/Users/dev/pi-app", name: null,
+            createdAt: new Date(Date.now() - 600e3).toISOString(), modifiedMs: Date.now() - 300e3,
+            messageCount: 3, userSnippet: "Подготовь pull/merge request по текущим изменениям", costTotal: 0.03, tokensIn: 9000, tokensOut: 600,
+          },
+          {
+            path: "/mock/a/pr2.jsonl", id: "pr2", cwd: "/Users/dev/pi-app", name: null,
+            createdAt: new Date(Date.now() - 120e3).toISOString(), modifiedMs: Date.now() - 60e3,
+            messageCount: 3, userSnippet: "Подготовь pull/merge request по текущим изменениям", costTotal: 0.02, tokensIn: 8000, tokensOut: 500,
+          },
         ];
         return [...this.forked, ...base]
           .filter((s) => !this.deleted.has(s.path))
@@ -275,11 +287,13 @@ class MockBackend implements Backend {
       case "write_session_flags":
         this.flags = args.flags as Record<string, unknown>;
         return undefined as T;
-      case "read_session_thread":
+      case "read_session_thread": {
+        const p = String(args.path);
         return [
-          { type: "message", message: { role: "user", content: [{ type: "text", text: "Пример архивной сессии (mock)" }] } },
-          { type: "message", message: { role: "assistant", content: [{ type: "text", text: "Ответ из истории. **Markdown** работает." }], model: "qwen-local" } },
+          { type: "message", message: { role: "user", content: [{ type: "text", text: `Открыта сессия ${p} (mock)` }] } },
+          { type: "message", message: { role: "assistant", content: [{ type: "text", text: `Это содержимое файла ${p}. **Markdown** работает.` }], model: "qwen-local" } },
         ] as T;
+      }
       case "search_sessions":
         return [
           { path: "/mock/a/s1.jsonl", cwd: "/Users/dev/pi-app", entryId: "e1", timestamp: new Date().toISOString(), role: "user", snippet: `…найдено: ${String(args.query)}…` },
@@ -319,6 +333,10 @@ class MockBackend implements Backend {
         ] satisfies SkillInfo[] as T;
       case "spawn_agent": {
         const id = `mock-agent-${this.agentSeq++}`;
+        // как реальный pi: агент открывается на переданной сессии (get_state
+        // затем вернёт её в sessionFile). null → новая сессия.
+        const opts = (args.opts ?? {}) as { sessionPath?: string | null };
+        this.currentSession = opts.sessionPath ?? `/mock/a/new-${Date.now()}.jsonl`;
         return id as T;
       }
       case "agent_send": {

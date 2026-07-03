@@ -437,11 +437,13 @@ async function refreshAgentMeta(cwd: string): Promise<void> {
       // формы пути). Новую сессию (когда пути ещё нет) — усыновляем как есть.
       const liveSessionPath =
         live == null || samePath(live, ws.liveSessionPath) ? ws.liveSessionPath ?? live : live;
-      const sessionPath = isBrowsingAway(ws)
-        ? ws.sessionPath
-        : samePath(ws.sessionPath, liveSessionPath)
-          ? ws.sessionPath
-          : liveSessionPath ?? ws.sessionPath;
+      // ВАЖНО: выбор сессии пользователем авторитетен для вида. Никогда не уводим
+      // sessionPath на live-сессию агента здесь — иначе при двух одноимённых
+      // сессиях (или если switch_session не сработал / pi вернул иную форму пути)
+      // вид «перекидывало» на живую сессию. sessionPath меняют только явные
+      // действия (openSession/newSession/returnToLiveSession); тут лишь усыновляем
+      // live, когда своего вида ещё нет (новая, только что созданная сессия).
+      const sessionPath = ws.sessionPath ?? liveSessionPath;
       return { ...ws, agentState: state, liveSessionPath, sessionPath };
     });
   } catch {
