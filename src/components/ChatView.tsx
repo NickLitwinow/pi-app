@@ -909,14 +909,16 @@ const RENDER_WINDOW = 80;
 function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const ref = useRef<HTMLDivElement>(null);
   const [pinned, setPinned] = useState(true);
-  const [showAll, setShowAll] = useState(false);
+  // сколько сообщений держим в DOM: инкрементально расширяем по «показать
+  // предыдущие», а не рендерим сразу тысячи (подсветка кода раздувает память).
+  const [renderLimit, setRenderLimit] = useState(RENDER_WINDOW);
 
   useEffect(() => {
     if (pinned && ref.current) ref.current.scrollTop = ref.current.scrollHeight;
   }, [ws.chat.seq, pinned]);
 
   // при смене сессии окно рендера сбрасывается
-  useEffect(() => setShowAll(false), [cwd, ws.sessionPath]);
+  useEffect(() => setRenderLimit(RENDER_WINDOW), [cwd, ws.sessionPath]);
 
   const onScroll = () => {
     const el = ref.current;
@@ -925,9 +927,9 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   };
 
   const jumpToPin = (pinId: string) => {
-    setShowAll(true);
+    setRenderLimit(ws.chat.items.length); // раскрыть всё, чтобы долистать до пина
     setPinned(false);
-    // после setShowAll нужен коммит React — ждём кадр с запасом
+    // после расширения окна нужен коммит React — ждём кадр с запасом
     setTimeout(() => {
       const el = ref.current?.querySelector(`[data-pin="${pinId}"]`);
       el?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -936,7 +938,7 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
 
   const empty = ws.chat.items.length === 0 && !ws.chat.streaming;
   const items = ws.chat.items;
-  const visible = showAll || items.length <= RENDER_WINDOW ? items : items.slice(-RENDER_WINDOW);
+  const visible = items.length <= renderLimit ? items : items.slice(items.length - renderLimit);
   const hiddenCount = items.length - visible.length;
   // rewind/fork оперируют номером среди ВСЕХ пользовательских сообщений ветки
   let userCounter = items.slice(0, hiddenCount).filter((it) => it.msg.role === "user").length;
@@ -956,7 +958,7 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         ) : (
           <div className="msg-col">
             {hiddenCount > 0 && (
-              <button className="show-earlier" onClick={() => setShowAll(true)}>
+              <button className="show-earlier" onClick={() => setRenderLimit((l) => l + 200)}>
                 Показать предыдущие сообщения ({hiddenCount})
               </button>
             )}

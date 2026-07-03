@@ -141,9 +141,25 @@ export default function UpdateModal({ onClose }: { onClose: () => void }) {
                 )}
               </div>
 
+              {info.checked && (info.behind > 0 || info.ahead > 0) && (
+                <div className="am-row">
+                  <span className="hint">Относительно upstream</span>
+                  <span className="grow" />
+                  <span style={{ fontFamily: "var(--font-mono)" }}>
+                    {info.behind > 0 ? `↓${info.behind} позади` : ""}
+                    {info.behind > 0 && info.ahead > 0 ? " · " : ""}
+                    {info.ahead > 0 ? `↑${info.ahead} впереди` : ""}
+                  </span>
+                </div>
+              )}
+
               {info.checked && (
                 <div className="am-status" style={{ color: available ? "var(--warn)" : "var(--ok)" }}>
-                  {available ? "● Доступно обновление" : "✓ Установлена последняя версия"}
+                  {available
+                    ? `● Доступно обновление${info.behind > 0 ? ` (${info.behind} коммит(ов))` : ""}`
+                    : info.ahead > 0
+                      ? "✓ Ваша версия новее удалённой"
+                      : "✓ Установлена последняя версия"}
                 </div>
               )}
 

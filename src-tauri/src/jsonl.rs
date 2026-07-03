@@ -1,13 +1,14 @@
 /// Strict JSONL framing per pi's RPC spec: records are delimited by LF (0x0A) only.
 /// Unicode line separators (U+2028/U+2029) inside JSON strings must not split records,
 /// and an optional trailing CR (from CRLF writers) is stripped from each line.
+#[derive(Default)]
 pub struct LineFramer {
     buf: Vec<u8>,
 }
 
 impl LineFramer {
     pub fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self::default()
     }
 
     /// Push a chunk of bytes; returns every complete line accumulated so far

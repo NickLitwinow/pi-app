@@ -59,8 +59,11 @@ pub struct AppUpdateInfo {
     pub notes: String,
     pub html_url: String,
     pub update_available: bool,
-    /// Удалось ли достучаться до GitHub.
+    /// Удалось ли определить статус (локальный git или GitHub).
     pub checked: bool,
+    /// Коммитов позади/впереди upstream (локальный git-путь; 0 в fallback).
+    pub behind: u64,
+    pub ahead: u64,
     pub error: Option<String>,
 }
 
@@ -87,6 +90,81 @@ async fn github_get(url: &str) -> Result<(u16, String), String> {
     let (json, code) = body.rsplit_once('\n').unwrap_or((body.as_str(), ""));
     let status: u16 = code.trim().parse().unwrap_or(0);
     Ok((status, json.to_string()))
+}
+
+/// Запустить git в `repo`, вернуть trimmed stdout при коде 0.
+async fn git_capture(repo: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Upstream-ref, который отслеживает репозиторий: @{upstream} текущей ветки,
+/// иначе — ветка по умолчанию origin (origin/HEAD). Напр. "origin/main".
+async fn upstream_ref(repo: &Path) -> Option<String> {
+    if let Some(u) = git_capture(repo, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).await {
+        if !u.is_empty() && u != "@{upstream}" {
+            return Some(u);
+        }
+    }
+    git_capture(repo, &["rev-parse", "--abbrev-ref", "origin/HEAD"])
+        .await
+        .filter(|s| !s.is_empty() && s != "origin/HEAD")
+}
+
+struct LocalStatus {
+    behind: u64,
+    ahead: u64,
+    up_sha: String,
+    notes: String,
+}
+
+/// Локальный git-взгляд на то, отстаёт ли репозиторий исходников от remote —
+/// это источник истины для «доступно обновление» (то же, что сделал бы
+/// `git pull` при ребилде). Корректно НЕ предлагает обновление, когда локальная
+/// версия впереди или совпадает. None — если upstream/remote не определить.
+async fn local_update_status(repo: &Path) -> Option<LocalStatus> {
+    let upstream = upstream_ref(repo).await?;
+    let remote = upstream
+        .split_once('/')
+        .map(|(r, _)| r.to_string())
+        .unwrap_or_else(|| "origin".into());
+    // best-effort fetch (с таймаутом) — освежить remote-tracking ref
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let _ = Command::new("git")
+            .args(["fetch", "--quiet", &remote])
+            .current_dir(repo)
+            .stdin(Stdio::null())
+            .output()
+            .await;
+    })
+    .await;
+
+    // "<ahead> <behind>": слева — коммиты HEAD не в upstream, справа — наоборот
+    let counts = git_capture(repo, &["rev-list", "--left-right", "--count", &format!("HEAD...{upstream}")]).await?;
+    let mut it = counts.split_whitespace();
+    let ahead: u64 = it.next()?.parse().ok()?;
+    let behind: u64 = it.next()?.parse().ok()?;
+    let up_sha = git_capture(repo, &["rev-parse", "--short", &upstream]).await.unwrap_or_default();
+    let notes = git_capture(repo, &["log", "--format=%h %s", "-n", "20", &format!("HEAD..{upstream}")])
+        .await
+        .unwrap_or_default();
+    Some(LocalStatus { behind, ahead, up_sha, notes })
+}
+
+/// Web-URL репозитория из origin-remote (для кнопки «Открыть на GitHub»).
+async fn repo_web_url(repo: &Path) -> Option<String> {
+    let url = git_capture(repo, &["remote", "get-url", "origin"]).await?;
+    crate::gitops::remote_web_base(url.trim()).map(|(_, web)| web)
 }
 
 fn source_repo_valid(repo: &Path) -> bool {
@@ -120,6 +198,36 @@ pub async fn check_app_update(source_repo: Option<String>) -> AppUpdateInfo {
         ..Default::default()
     };
 
+    // Основной путь: локальная git-ancestry. Достоверно отражает, что сделает
+    // `git pull` при ребилде — и не предлагает «обновиться», когда локально
+    // версия свежее/совпадает (главная жалоба на прежнюю логику сравнения с main).
+    if repo_valid {
+        if let Some(r) = repo.as_deref() {
+            if let Some(head) = git_capture(r, &["rev-parse", "--short", "HEAD"]).await {
+                info.current_sha = head; // локальный HEAD надёжнее встроенного build-sha
+            }
+            if let Some(st) = local_update_status(r).await {
+                info.checked = true;
+                info.behind = st.behind;
+                info.ahead = st.ahead;
+                info.latest = Some(st.up_sha);
+                info.latest_kind = "commit".into();
+                info.update_available = st.behind > 0;
+                info.notes = if st.behind > 0 {
+                    st.notes
+                } else if st.ahead > 0 {
+                    format!("Локальная версия впереди на {} коммит(ов) — обновление не требуется.", st.ahead)
+                } else {
+                    "Установлена последняя версия.".into()
+                };
+                info.html_url = repo_web_url(r).await.unwrap_or_default();
+                return info;
+            }
+        }
+    }
+
+    // Fallback: нет локальных исходников или upstream не определить (напр.,
+    // распространяемый .app без git) — спрашиваем GitHub API.
     let slug = match &repo {
         Some(r) => repo_slug(r).await,
         None => "NickLitwinow/pi-app".to_string(),
@@ -314,4 +422,89 @@ async fn stream_shell<R: Runtime>(app: &AppHandle<R>, run_id: &str, cwd: &str, c
 #[tauri::command]
 pub fn relaunch_app(app: AppHandle) {
     app.restart();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as StdCommand;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = StdCommand::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git run")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed in {}", dir.display());
+    }
+
+    /// Ядро проверки обновлений: локальный git-ancestry не предлагает обновление,
+    /// когда локальная ветка впереди/совпадает с upstream (главная регрессия).
+    #[tokio::test]
+    async fn local_status_does_not_offer_update_when_ahead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        StdCommand::new("git")
+            .args(["init", "--bare", "-q", origin.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let work = tmp.path().join("work");
+        StdCommand::new("git")
+            .args(["clone", "-q", origin.to_str().unwrap(), work.to_str().unwrap()])
+            .output()
+            .unwrap();
+        git(&work, &["config", "user.email", "t@t.dev"]);
+        git(&work, &["config", "user.name", "t"]);
+        std::fs::write(work.join("a.txt"), "1\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "c1"]);
+        git(&work, &["push", "-q", "-u", "origin", "HEAD"]);
+
+        // синхронизировано: ни позади, ни впереди → обновления нет
+        let st = local_update_status(&work).await.expect("status");
+        assert_eq!((st.behind, st.ahead), (0, 0));
+
+        // локально впереди на один коммит → НЕ предлагать обновление
+        std::fs::write(work.join("a.txt"), "2\n").unwrap();
+        git(&work, &["commit", "-qam", "c2"]);
+        let st = local_update_status(&work).await.expect("status");
+        assert_eq!(st.behind, 0, "ahead-версия не должна считаться отстающей");
+        assert_eq!(st.ahead, 1);
+    }
+
+    /// Обратный случай: origin ушёл вперёд → обновление доступно (behind > 0).
+    #[tokio::test]
+    async fn local_status_detects_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        StdCommand::new("git")
+            .args(["init", "--bare", "-q", origin.to_str().unwrap()])
+            .output()
+            .unwrap();
+        // первый клон делает коммит и пушит
+        let a = tmp.path().join("a");
+        StdCommand::new("git").args(["clone", "-q", origin.to_str().unwrap(), a.to_str().unwrap()]).output().unwrap();
+        git(&a, &["config", "user.email", "t@t.dev"]);
+        git(&a, &["config", "user.name", "t"]);
+        std::fs::write(a.join("f.txt"), "1\n").unwrap();
+        git(&a, &["add", "."]);
+        git(&a, &["commit", "-q", "-m", "c1"]);
+        git(&a, &["push", "-q", "-u", "origin", "HEAD"]);
+
+        // второй клон отстаёт после нового коммита в origin через первый клон
+        let b = tmp.path().join("b");
+        StdCommand::new("git").args(["clone", "-q", origin.to_str().unwrap(), b.to_str().unwrap()]).output().unwrap();
+        git(&b, &["config", "user.email", "t@t.dev"]);
+        git(&b, &["config", "user.name", "t"]);
+
+        std::fs::write(a.join("f.txt"), "2\n").unwrap();
+        git(&a, &["commit", "-qam", "c2"]);
+        git(&a, &["push", "-q"]);
+
+        let st = local_update_status(&b).await.expect("status");
+        assert_eq!(st.behind, 1, "b отстаёт на один коммит");
+        assert_eq!(st.ahead, 0);
+    }
 }

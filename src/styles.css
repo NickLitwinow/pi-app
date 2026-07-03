@@ -10,6 +10,8 @@
      физических констант вроде зоны системных traffic lights */
   --ui-scale: 1;
   --sidebar-w: 240px;
+  /* общая ширина колонки контента: сообщения и композер выравниваются по ней */
+  --content-w: 860px;
 
   /* dark is the default */
   --bg: #161618;
@@ -200,6 +202,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); }
 .sidebar .ws.active { background: var(--bg-active); }
 .sidebar .ws.proj-head {
   display: flex; align-items: center; cursor: pointer; position: relative;
+  /* .ws задаёт overflow:hidden (обрезка длинных имён), но это же клиппит
+     выпадающее меню проекта (position:absolute; top:100%) — делаем его видимым;
+     имя всё равно усечётся своим .ws-name{overflow:hidden}. */
+  overflow: visible;
 }
 .sidebar .ws.proj-head .ws-name { flex: 1; min-width: 0; overflow: hidden; }
 .sidebar .ws.proj-head .sess-more {
@@ -251,7 +257,15 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); }
 
 .sidebar .ws .ws-count { color: var(--text-dim); font-size: 10.5px; margin-left: auto; }
 .proj { margin-bottom: 2px; }
-.sess-list { padding: 2px 0 6px 10px; animation: msg-in 0.16s ease both; }
+/* Пока внутри проекта открыто выпадающее меню — поднимаем весь блок над
+   соседними проектами: иначе заголовок проекта ниже перекрывает часть кнопок
+   меню (абсолютное меню выходит за строку и попадает под позиционированный
+   .proj-head следующего проекта). */
+.proj:has(.menu) { position: relative; z-index: 20; }
+/* fade-in вместо msg-in: у msg-in финальный кадр оставляет transform, который
+   создаёт постоянный stacking-context и запирает z-index выпадающего меню — из-за
+   этого часть кнопок меню сессии перекрывалась заголовком проекта ниже. */
+.sess-list { padding: 2px 0 6px 10px; animation: fade-in 0.16s ease both; }
 .sess-row {
   position: relative; display: flex; align-items: center; gap: 6px;
   width: 100%; padding: 6px 6px 6px 8px; border-radius: 6px; cursor: pointer;
@@ -305,7 +319,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); }
 
 .chat { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .msg-scroll { flex: 1; overflow-y: auto; scroll-behavior: auto; }
-.msg-col { max-width: 860px; margin: 0 auto; padding: 18px 24px 8px; }
+.msg-col { max-width: var(--content-w); margin: 0 auto; padding: 18px 24px 8px; }
 
 .msg { margin-bottom: 18px; animation: msg-in 0.22s ease both; }
 @keyframes msg-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
@@ -468,7 +482,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); }
 
 /* composer */
 
-.composer-wrap { padding: 8px 24px 12px; width: 100%; }
+/* композер выровнен по колонке сообщений: та же максимальная ширина + центрирование
+   (+48px компенсируют горизонтальные паддинги, чтобы бокс совпал с .msg-col) */
+.composer-wrap { padding: 8px 24px 12px; width: 100%; max-width: calc(var(--content-w) + 48px); margin: 0 auto; }
 .widgetbar {
   background: var(--bg-raised); border: 1px solid var(--border); border-bottom: none;
   border-radius: 10px 10px 0 0; padding: 6px 12px; font-family: var(--font-mono);

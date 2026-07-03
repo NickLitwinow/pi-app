@@ -15,6 +15,7 @@ import {
   removeWorkspace,
   renameGroup,
   renameSessionAction,
+  samePath,
   selectWorkspace,
   toggleArchived,
   togglePinned,
@@ -416,9 +417,9 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
       key={s.path}
       cwd={cwd}
       s={s}
-      active={isCurrent && ws?.sessionPath === s.path}
-      live={Boolean(ws?.alive && ws?.liveSessionPath === s.path)}
-      streaming={Boolean(ws?.liveStreaming && ws?.liveSessionPath === s.path)}
+      active={isCurrent && samePath(ws?.sessionPath, s.path)}
+      live={Boolean(ws?.alive && samePath(ws?.liveSessionPath, s.path))}
+      streaming={Boolean(ws?.liveStreaming && samePath(ws?.liveSessionPath, s.path))}
       pinned={pinnedSet.has(s.path)}
       archived={false}
       groups={groups}
@@ -517,7 +518,7 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
                     key={s.path}
                     cwd={cwd}
                     s={s}
-                    active={isCurrent && ws?.sessionPath === s.path}
+                    active={isCurrent && samePath(ws?.sessionPath, s.path)}
                     live={false}
                     pinned={false}
                     archived

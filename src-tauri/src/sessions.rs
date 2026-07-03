@@ -110,7 +110,7 @@ pub fn list_projects_in(root: &Path) -> Vec<ProjectInfo> {
             last_modified_ms: newest_ms,
         });
     }
-    out.sort_by(|a, b| b.last_modified_ms.cmp(&a.last_modified_ms));
+    out.sort_by_key(|p| std::cmp::Reverse(p.last_modified_ms));
     out
 }
 
@@ -148,7 +148,8 @@ pub struct SessionMeta {
 
 /// Metadata cache: parsing a session means reading the whole JSONL file, so
 /// re-listing on every refresh would re-read megabytes. Key by (mtime, size).
-static META_CACHE: Mutex<Option<HashMap<String, (i64, u64, SessionMeta)>>> = Mutex::new(None);
+type MetaCache = HashMap<String, (i64, u64, SessionMeta)>;
+static META_CACHE: Mutex<Option<MetaCache>> = Mutex::new(None);
 
 fn file_size(p: &Path) -> u64 {
     fs::metadata(p).map(|m| m.len()).unwrap_or(0)
@@ -270,7 +271,7 @@ pub fn list_sessions_in(project_dir: &Path) -> Vec<SessionMeta> {
             }
         }
     }
-    out.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    out.sort_by_key(|s| std::cmp::Reverse(s.modified_ms));
     out
 }
 
@@ -680,7 +681,8 @@ struct FileAgg {
     per_model: Vec<(String, f64, u64, u64, usize)>,
 }
 
-static ANALYTICS_CACHE: Mutex<Option<HashMap<String, (i64, u64, FileAgg)>>> = Mutex::new(None);
+type AnalyticsCache = HashMap<String, (i64, u64, FileAgg)>;
+static ANALYTICS_CACHE: Mutex<Option<AnalyticsCache>> = Mutex::new(None);
 
 fn analyze_session_file(p: &Path) -> FileAgg {
     let mut agg = FileAgg::default();
@@ -743,7 +745,16 @@ fn analyze_session_file_cached(p: &Path) -> FileAgg {
     }
     let agg = analyze_session_file(p);
     if let Ok(mut cache) = ANALYTICS_CACHE.lock() {
-        cache.get_or_insert_with(HashMap::new).insert(key, (mtime, size, agg.clone()));
+        let map = cache.get_or_insert_with(HashMap::new);
+        // ограничиваем рост кэша: при переполнении выбрасываем половину старых по mtime
+        if map.len() > 4096 {
+            let mut entries: Vec<(String, i64)> = map.iter().map(|(k, (m, _, _))| (k.clone(), *m)).collect();
+            entries.sort_by_key(|(_, m)| *m);
+            for (k, _) in entries.into_iter().take(map.len() / 2) {
+                map.remove(&k);
+            }
+        }
+        map.insert(key, (mtime, size, agg.clone()));
     }
     agg
 }
@@ -797,7 +808,7 @@ pub fn analytics_in(root: &Path) -> AnalyticsOverview {
         .into_iter()
         .map(|(model, (cost, input, output, messages))| ModelStat { model, cost, input, output, messages })
         .collect();
-    per_model.sort_by(|a, b| b.messages.cmp(&a.messages));
+    per_model.sort_by_key(|m| std::cmp::Reverse(m.messages));
 
     AnalyticsOverview { totals, per_day, per_model }
 }

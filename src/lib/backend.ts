@@ -437,9 +437,9 @@ class MockBackend implements Backend {
           currentVersion: "0.1.0", currentSha: "abc1234",
           sourceRepo: "/Users/dev/pi-app", sourceRepoValid: true,
           latest: "def5678", latestKind: "commit",
-          notes: "feat: self-update, dialog fixes, provider-agnostic PR\nfix: statusline layout",
+          notes: "def5678 feat: self-update, dialog fixes\nc0ffee0 fix: statusline layout",
           htmlUrl: "https://github.com/NickLitwinow/pi-app", updateAvailable: true,
-          checked: true, error: null,
+          checked: true, behind: 2, ahead: 0, error: null,
         } as T;
       }
       case "app_update_run": {

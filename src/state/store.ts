@@ -58,11 +58,24 @@ export interface WorkspaceChat {
   mode: AgentMode;
 }
 
+/** Толерантное сравнение путей сессий. pi в get_state может вернуть `sessionFile`
+ *  в чуть иной форме, чем путь из листинга (симлинки, /private, разное кодирование
+ *  каталога) — но имя файла сессии (uuid.jsonl) уникально, поэтому совпадение
+ *  basename трактуем как одну и ту же сессию. Это чинит «живой» индикатор,
+ *  подсветку активной и определение browse при расхождении форм пути. */
+export function samePath(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const fa = a.slice(a.lastIndexOf("/") + 1);
+  const fb = b.slice(b.lastIndexOf("/") + 1);
+  return fa.length > 0 && fa === fb;
+}
+
 /** Просматриваем ли мы сессию, отличную от той, где занят живой агент.
  *  null-путь = ещё не сохранённая новая сессия (агент только что стартовал) —
  *  это НЕ browse, такой вид усыновляет live-файл. */
 export function isBrowsingAway(ws: WorkspaceChat): boolean {
-  return Boolean(ws.alive && ws.liveSessionPath && ws.sessionPath && ws.sessionPath !== ws.liveSessionPath);
+  return Boolean(ws.alive && ws.liveSessionPath && ws.sessionPath && !samePath(ws.sessionPath, ws.liveSessionPath));
 }
 
 export function emptyWorkspaceChat(): WorkspaceChat {
@@ -418,13 +431,19 @@ async function refreshAgentMeta(cwd: string): Promise<void> {
   try {
     const state = (await rpcRequest(cwd, { type: "get_state" }, 10000)) as AgentState;
     const live = (state.sessionFile ?? state.sessionPath ?? null) as string | null;
-    updateChat(cwd, (ws) => ({
-      ...ws,
-      agentState: state,
-      liveSessionPath: live ?? ws.liveSessionPath,
-      // отображаемый путь двигаем к live только если не смотрим другую сессию
-      sessionPath: isBrowsingAway(ws) ? ws.sessionPath : live ?? ws.sessionPath,
-    }));
+    updateChat(cwd, (ws) => {
+      // Сохраняем форму пути из листинга, когда pi сообщил ту же сессию (иначе
+      // подсветка активной/«живой» строки в сайдбаре ломается из-за расхождения
+      // формы пути). Новую сессию (когда пути ещё нет) — усыновляем как есть.
+      const liveSessionPath =
+        live == null || samePath(live, ws.liveSessionPath) ? ws.liveSessionPath ?? live : live;
+      const sessionPath = isBrowsingAway(ws)
+        ? ws.sessionPath
+        : samePath(ws.sessionPath, liveSessionPath)
+          ? ws.sessionPath
+          : liveSessionPath ?? ws.sessionPath;
+      return { ...ws, agentState: state, liveSessionPath, sessionPath };
+    });
   } catch {
     /* agent may be busy or dead */
   }
@@ -753,51 +772,86 @@ async function loadSessionFromFile(path: string): Promise<ChatState> {
   return entriesToChatState(entries);
 }
 
+/** Монотонный токен: если пользователь быстро кликает по разным сессиям (частая
+ *  причина «закидывает на одну» — особенно у сессий с одинаковым именем), к виду
+ *  применяется только последний open, ранние асинхронные результаты отбрасываются. */
+let openToken = 0;
+
 /**
- * Открыть сессию в чате. Всегда сначала мгновенно рендерим полную историю из
- * файла (активная ветка), затем аккуратно синхронизируемся с живым агентом:
- *  - вернулись в live-сессию → просто продолжаем показывать её (события снова
- *    применяются к виду);
- *  - агент простаивает → переносим его в открытую сессию (switch_session);
+ * Открыть сессию в чате.
+ *  - вернулись в live-сессию → показываем её живой чат КАК ЕСТЬ (не перечитываем
+ *    из файла: файл не содержит in-flight сообщений, иначе поток «замирает»);
+ *  - другая сессия, агент простаивает → мгновенно рендерим из файла и переносим
+ *    агента в неё (switch_session);
  *  - агент занят другой сессией → показываем открытую read-only (browse),
  *    живой процесс не трогаем, он продолжает работу в фоне.
  */
 export async function openSession(cwd: string, meta: SessionMeta): Promise<void> {
+  const token = ++openToken;
   const prev = useStore.getState().currentCwd;
   useStore.setState({ currentCwd: cwd, view: "chat" });
   if (prev && prev !== cwd) evictBackgroundWorkspaces(cwd);
   const ws = getChat(cwd);
 
-  // 1) мгновенный рендер полной истории из файла
-  const fileChat = await loadSessionFromFile(meta.path);
-  // если уходим в browse от занятого агента — переносим его pending-диалоги
-  // (разрешения) в новый вид, чтобы на них можно было ответить, не потеряв
-  const willBrowse =
-    ws.alive && Boolean(ws.liveSessionPath) && ws.liveSessionPath !== meta.path && ws.liveStreaming;
-  if (willBrowse && ws.chat.uiRequests.length > 0) {
-    fileChat.uiRequests = ws.chat.uiRequests;
-  }
-  updateChat(cwd, (w) => ({ ...w, chat: fileChat, sessionPath: meta.path, checkpoints: [], stats: null }));
-
-  if (!ws.alive || !ws.agentId) {
-    // живого агента нет — файлового вида достаточно; агент поднимется при отправке
-    return;
-  }
-
-  if (ws.liveSessionPath === meta.path) {
-    // вернулись в live-сессию: события снова применяются к виду; освежим мету
+  // Клик по УЖЕ активной live-сессии (мы её и смотрим) — no-op: не перечитываем
+  // из файла, чтобы не терять живой стрим/in-flight сообщения. Только мета.
+  if (
+    ws.alive &&
+    ws.agentId &&
+    samePath(ws.sessionPath, meta.path) &&
+    samePath(ws.liveSessionPath, meta.path)
+  ) {
     void refreshAgentMeta(cwd);
     return;
   }
 
-  if (!ws.liveStreaming) {
+  // 1) мгновенный рендер полной истории из файла (активная ветка)
+  const fileChat = await loadSessionFromFile(meta.path);
+  if (token !== openToken) return; // клик перекрыт более новым — не применяем
+  const cur = getChat(cwd);
+  // возврат в live-сессию (из browse/другого вида): файл не несёт флаг стрима и
+  // in-flight сообщения — восстанавливаем состояние стрима из live-трекинга, а
+  // pending-диалоги живого агента переносим в новый вид.
+  const returningToLive = cur.alive && Boolean(cur.agentId) && samePath(cur.liveSessionPath, meta.path);
+  const willBrowse =
+    cur.alive && Boolean(cur.liveSessionPath) && !samePath(cur.liveSessionPath, meta.path) && cur.liveStreaming;
+  if ((returningToLive || willBrowse) && cur.chat.uiRequests.length > 0) {
+    fileChat.uiRequests = cur.chat.uiRequests;
+  }
+  if (returningToLive) {
+    fileChat.isStreaming = cur.liveStreaming;
+    fileChat.streamStartedAt = cur.liveStreaming ? Date.now() : null;
+  }
+  updateChat(cwd, (w) => ({
+    ...w,
+    chat: fileChat,
+    sessionPath: meta.path,
+    // при возврате в live сохраняем чекпоинты/стату — refreshAgentMeta их освежит
+    checkpoints: returningToLive ? w.checkpoints : [],
+    stats: returningToLive ? w.stats : null,
+  }));
+
+  if (!cur.alive || !cur.agentId) {
+    // живого агента нет — файлового вида достаточно; агент поднимется при отправке
+    return;
+  }
+
+  if (returningToLive) {
+    // это live-сессия — освежим мету (стрим продолжит применяться к виду)
+    void refreshAgentMeta(cwd);
+    return;
+  }
+
+  if (!cur.liveStreaming) {
     // агент простаивает — безопасно перенести его в открытую сессию
     try {
       await rpcRequest(cwd, { type: "switch_session", sessionPath: meta.path }, 15000);
+      if (token !== openToken) return;
       updateChat(cwd, (w) => ({ ...w, liveSessionPath: meta.path }));
       // перечитаем из файла после switch — на случай, если pi что-то дописал
       const after = await loadSessionFromFile(meta.path);
-      updateChat(cwd, (w) => (w.sessionPath === meta.path ? { ...w, chat: after } : w));
+      if (token !== openToken) return;
+      updateChat(cwd, (w) => (samePath(w.sessionPath, meta.path) ? { ...w, chat: after } : w));
       void refreshAgentMeta(cwd);
     } catch {
       /* switch не удался — остаёмся на файловом виде */
@@ -814,10 +868,20 @@ export async function returnToLiveSession(cwd: string): Promise<void> {
   const ws = getChat(cwd);
   if (!ws.liveSessionPath) return;
   const live = ws.liveSessionPath;
+  const token = ++openToken;
   const pendingUi = ws.chat.uiRequests; // диалоги живого агента переносим
   const fileChat = await loadSessionFromFile(live);
+  if (token !== openToken) return;
   if (pendingUi.length > 0) fileChat.uiRequests = pendingUi;
-  updateChat(cwd, (w) => ({ ...w, chat: fileChat, sessionPath: live }));
+  // Восстанавливаем флаг стрима из независимого live-трекинга: файл его не несёт,
+  // иначе кнопка «стоп»/индикатор пропали бы, хотя агент ещё работает. Следующий
+  // message_update (pi шлёт полный снапшот) вернёт само стримящееся сообщение.
+  const streaming = getChat(cwd).liveStreaming;
+  updateChat(cwd, (w) => ({
+    ...w,
+    chat: { ...fileChat, isStreaming: streaming, streamStartedAt: streaming ? Date.now() : null },
+    sessionPath: live,
+  }));
   void refreshAgentMeta(cwd);
 }
 

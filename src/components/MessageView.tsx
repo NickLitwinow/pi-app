@@ -242,7 +242,17 @@ function PinMessageButton({ cwd, msg }: { cwd: string; msg: ChatMessage }) {
   );
 }
 
-export const MessageView = memo(function MessageView({
+/** Id инструментов, на которые ссылается сообщение (для точечного сравнения execs). */
+function toolCallIds(msg: ChatMessage): string[] {
+  if (!Array.isArray(msg.content)) return [];
+  const ids: string[] = [];
+  for (const b of msg.content) {
+    if (b.type === "toolCall" && typeof b.id === "string") ids.push(b.id);
+  }
+  return ids;
+}
+
+const MessageViewImpl = function MessageView({
   msg,
   execs,
   streaming,
@@ -308,6 +318,27 @@ export const MessageView = memo(function MessageView({
       })}
     </div>
   );
+};
+
+/** Пропускаем ре-рендер, если поменялась только ссылка на общий `execs`, но не те
+ *  инструменты, которые рисует ЭТО сообщение. Во время стрима `flushAgentEvents`
+ *  создаёт новый объект execs каждые 33мс — без этого перерисовывались бы все
+ *  сообщения окна (CPU/GC), хотя завершённые не меняются. */
+export const MessageView = memo(MessageViewImpl, (prev, next) => {
+  if (
+    prev.msg !== next.msg ||
+    prev.streaming !== next.streaming ||
+    prev.busy !== next.busy ||
+    prev.userIndex !== next.userIndex ||
+    prev.cwd !== next.cwd
+  ) {
+    return false;
+  }
+  if (prev.execs === next.execs) return true;
+  for (const id of toolCallIds(next.msg)) {
+    if (prev.execs[id] !== next.execs[id]) return false;
+  }
+  return true;
 });
 
 // ---------- toasts ----------

@@ -217,6 +217,9 @@ export interface AppUpdateInfo {
   htmlUrl: string;
   updateAvailable: boolean;
   checked: boolean;
+  /** Коммитов позади/впереди upstream (локальный git-путь). */
+  behind: number;
+  ahead: number;
   error: string | null;
 }
 
