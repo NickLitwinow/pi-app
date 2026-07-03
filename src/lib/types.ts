@@ -201,6 +201,21 @@ export interface AppConfig {
   theme: string;
   uiScale: number;
   piPath?: string | null;
+  sidebarCollapsed?: boolean;
+  sidebarWidth?: number;
+}
+
+export interface SessionGroup {
+  id: string;
+  name: string;
+  cwd: string;
+}
+
+export interface PinnedMessage {
+  id: string;
+  text: string;
+  role: string;
+  ts: number;
 }
 
 export interface StatusEntry {

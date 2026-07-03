@@ -1,15 +1,18 @@
 import { create } from "zustand";
 import { getBackend } from "../lib/backend";
-import { addUserMessage, applyAgentEvent, entriesToChatState } from "../lib/reducer";
+import { addUserMessage, applyAgentEvent, contentText, entriesToChatState } from "../lib/reducer";
 import {
   emptyChatState,
   type AgentState,
   type AppConfig,
   type ChatState,
   type Checkpoint,
+  type ChatMessage,
   type ModelInfo,
   type PiInfo,
+  type PinnedMessage,
   type ProjectInfo,
+  type SessionGroup,
   type SessionMeta,
   type SessionStats,
 } from "../lib/types";
@@ -19,6 +22,18 @@ export type View = "chat" | "review" | "analytics" | "settings";
 export interface SessionFlags {
   pinned: string[];
   archived: string[];
+  groups: SessionGroup[];
+  groupOf: Record<string, string>;
+  pinnedMessages: Record<string, PinnedMessage[]>;
+}
+
+export function emptySessionFlags(): SessionFlags {
+  return { pinned: [], archived: [], groups: [], groupOf: {}, pinnedMessages: {} };
+}
+
+/** Нормализация flags из конфига (старые файлы без новых полей). */
+function normalizeFlags(f: Partial<SessionFlags> | null | undefined): SessionFlags {
+  return { ...emptySessionFlags(), ...(f ?? {}) };
 }
 
 export type AgentMode = "ask" | "accept-edits" | "plan" | "auto" | "bypass";
@@ -84,7 +99,7 @@ export const useStore = create<Store>((set) => ({
   chats: {},
   sessions: {},
   pendingInsert: null,
-  sessionFlags: { pinned: [], archived: [] },
+  sessionFlags: emptySessionFlags(),
   permCollapsed: false,
   set: (patch) => set(patch),
 }));
@@ -244,11 +259,11 @@ export async function initApp(): Promise<void> {
     });
   });
 
-  const [piInfo, appConfig, projects, sessionFlags] = await Promise.all([
+  const [piInfo, appConfig, projects, rawFlags] = await Promise.all([
     be.invoke<PiInfo>("resolve_pi").catch(() => null),
     be.invoke<AppConfig>("read_app_config").catch(() => null),
     be.invoke<ProjectInfo[]>("list_projects").catch(() => [] as ProjectInfo[]),
-    be.invoke<SessionFlags>("read_session_flags").catch(() => ({ pinned: [], archived: [] })),
+    be.invoke<Partial<SessionFlags>>("read_session_flags").catch(() => null),
   ]);
 
   const currentCwd = projects[0]?.cwd ?? null;
@@ -259,7 +274,7 @@ export async function initApp(): Promise<void> {
     appConfig: appConfig ?? useStore.getState().appConfig,
     projects,
     currentCwd,
-    sessionFlags,
+    sessionFlags: normalizeFlags(rawFlags),
   });
   // убрать legacy-конфиги pi-permission-system (глобальный + текущий проект),
   // иначе расширение сыплет «Legacy policy found…» при каждом старте сессии
@@ -607,9 +622,16 @@ export async function deleteSessionAction(cwd: string, path: string): Promise<vo
   await be.invoke("delete_session", { path });
   // подчистить флаги
   const flags = useStore.getState().sessionFlags;
+  const groupOf = { ...flags.groupOf };
+  delete groupOf[path];
+  const pinnedMessages = { ...flags.pinnedMessages };
+  delete pinnedMessages[path];
   await persistFlags({
+    ...flags,
     pinned: flags.pinned.filter((p) => p !== path),
     archived: flags.archived.filter((p) => p !== path),
+    groupOf,
+    pinnedMessages,
   });
   await refreshSessions(cwd);
   await refreshProjects();
@@ -646,6 +668,137 @@ export async function toggleArchived(path: string): Promise<void> {
   const f = useStore.getState().sessionFlags;
   const archived = f.archived.includes(path) ? f.archived.filter((p) => p !== path) : [...f.archived, path];
   await persistFlags({ ...f, archived });
+}
+
+// ---------- session groups (папки сессий внутри проекта) ----------
+
+export async function createGroup(cwd: string, name: string): Promise<string> {
+  const f = useStore.getState().sessionFlags;
+  const id = `g${Date.now().toString(36)}${Math.floor(Math.random() * 46656).toString(36)}`;
+  await persistFlags({ ...f, groups: [...f.groups, { id, name: name.trim(), cwd }] });
+  return id;
+}
+
+export async function renameGroup(groupId: string, name: string): Promise<void> {
+  const f = useStore.getState().sessionFlags;
+  await persistFlags({
+    ...f,
+    groups: f.groups.map((g) => (g.id === groupId ? { ...g, name: name.trim() } : g)),
+  });
+}
+
+/** Удалить группу: её сессии возвращаются в общий список. */
+export async function deleteGroup(groupId: string): Promise<void> {
+  const f = useStore.getState().sessionFlags;
+  const groupOf = Object.fromEntries(Object.entries(f.groupOf).filter(([, g]) => g !== groupId));
+  await persistFlags({ ...f, groups: f.groups.filter((g) => g.id !== groupId), groupOf });
+}
+
+export async function moveSessionToGroup(path: string, groupId: string | null): Promise<void> {
+  const f = useStore.getState().sessionFlags;
+  const groupOf = { ...f.groupOf };
+  if (groupId) groupOf[path] = groupId;
+  else delete groupOf[path];
+  await persistFlags({ ...f, groupOf });
+}
+
+// ---------- fork / rewind (pi core: fork {entryId}, get_fork_messages) ----------
+
+/** Полный форк сессии из сайдбара: копия файла с новым id, открывается сразу. */
+export async function forkSessionAction(cwd: string, meta: SessionMeta): Promise<void> {
+  const be = await getBackend();
+  const forked = await be.invoke<SessionMeta>("fork_session", { path: meta.path, upToEntryId: null });
+  await refreshSessions(cwd);
+  await openSession(cwd, forked);
+}
+
+function pickForkEntry(
+  msgs: { entryId: string; text: string }[],
+  userIndex: number,
+  text: string,
+): { entryId: string; text: string } | undefined {
+  const wanted = text.trim();
+  if (msgs[userIndex]?.text?.trim() === wanted) return msgs[userIndex];
+  const byText = msgs.filter((m) => m.text.trim() === wanted);
+  if (byText.length === 1) return byText[0];
+  return msgs[userIndex];
+}
+
+/** «Rewind to here»: откат активной сессии к пользовательскому сообщению
+ *  (pi fork создаёт ветку; pi-rewind, если установлен, предложит вернуть файлы).
+ *  Текст сообщения попадает в composer для правки и повторной отправки. */
+export async function rewindToMessage(cwd: string, userIndex: number, text: string): Promise<void> {
+  const ws = getChat(cwd);
+  await ensureAgent(cwd, ws.sessionPath);
+  const data = await rpcRequest(cwd, { type: "get_fork_messages" }, 15000);
+  const msgs = (data.messages ?? []) as { entryId: string; text: string }[];
+  const target = pickForkEntry(msgs, userIndex, text);
+  if (!target) throw new Error("Сообщение для отката не найдено");
+  const res = (await rpcRequest(cwd, { type: "fork", entryId: target.entryId }, 60000)) as {
+    text?: string;
+    cancelled?: boolean;
+  };
+  if (res.cancelled) return;
+  const md = await rpcRequest(cwd, { type: "get_messages" }, 20000);
+  const messages = (md.messages ?? md) as { role: string; content: unknown }[];
+  discardQueuedEvents(cwd);
+  updateChat(cwd, (w) => {
+    const chat = entriesToChatState(
+      (Array.isArray(messages) ? messages : []).map((m) => ({ type: "message", message: m })) as Record<
+        string,
+        unknown
+      >[],
+    );
+    chat.editorPrefill = res.text ?? target.text;
+    return { ...w, chat };
+  });
+  await refreshAgentMeta(cwd);
+}
+
+/** «Fork from here»: новая сессия с историей строго до выбранного сообщения;
+ *  исходная сессия не меняется, текст сообщения — в composer новой. */
+export async function forkFromMessage(cwd: string, userIndex: number, text: string): Promise<void> {
+  const ws = getChat(cwd);
+  if (!ws.sessionPath) throw new Error("Сессия ещё не сохранена на диск");
+  await ensureAgent(cwd, ws.sessionPath);
+  const data = await rpcRequest(cwd, { type: "get_fork_messages" }, 15000);
+  const msgs = (data.messages ?? []) as { entryId: string; text: string }[];
+  const target = pickForkEntry(msgs, userIndex, text);
+  if (!target) throw new Error("Сообщение для форка не найдено");
+  const be = await getBackend();
+  const forked = await be.invoke<SessionMeta>("fork_session", {
+    path: ws.sessionPath,
+    upToEntryId: target.entryId,
+  });
+  await refreshSessions(cwd);
+  await openSession(cwd, forked);
+  updateChat(cwd, (w) => ({ ...w, chat: { ...w.chat, editorPrefill: target.text, seq: w.chat.seq + 1 } }));
+}
+
+// ---------- pinned messages (закреплённые ответы — виджет в чате) ----------
+
+/** Стабильный id сообщения по содержимому (переживает перезагрузку сессии). */
+export function msgPinId(msg: ChatMessage): string {
+  const s = `${msg.role}:${contentText(msg.content)}`;
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return `p${(h >>> 0).toString(36)}-${s.length.toString(36)}`;
+}
+
+export async function toggleMessagePin(cwd: string, msg: ChatMessage): Promise<void> {
+  const ws = getChat(cwd);
+  const key = ws.sessionPath;
+  if (!key) return; // сессия ещё не сохранена — закреплять нечего
+  const id = msgPinId(msg);
+  const f = useStore.getState().sessionFlags;
+  const list = f.pinnedMessages[key] ?? [];
+  const next = list.some((p) => p.id === id)
+    ? list.filter((p) => p.id !== id)
+    : [...list, { id, text: contentText(msg.content), role: String(msg.role), ts: Date.now() }].slice(-20);
+  const pinnedMessages = { ...f.pinnedMessages };
+  if (next.length > 0) pinnedMessages[key] = next;
+  else delete pinnedMessages[key];
+  await persistFlags({ ...f, pinnedMessages });
 }
 
 // ---------- code review ----------

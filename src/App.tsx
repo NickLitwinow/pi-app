@@ -1,16 +1,25 @@
 import { useEffect } from "react";
+import { getBackend } from "./lib/backend";
 import { initApp, newSession, updateAppConfig, useStore } from "./state/store";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import ReviewView from "./components/ReviewView";
 import SettingsView from "./components/SettingsView";
 import AnalyticsView from "./components/AnalyticsView";
+import { SidebarIcon } from "./components/icons";
+
+function toggleSidebar() {
+  const s = useStore.getState();
+  void updateAppConfig({ sidebarCollapsed: !(s.appConfig.sidebarCollapsed ?? false) });
+}
 
 export default function App() {
   const ready = useStore((s) => s.ready);
   const view = useStore((s) => s.view);
   const theme = useStore((s) => s.appConfig.theme);
   const uiScale = useStore((s) => s.appConfig.uiScale);
+  const sidebarCollapsed = useStore((s) => s.appConfig.sidebarCollapsed ?? false);
+  const sidebarWidth = useStore((s) => s.appConfig.sidebarWidth ?? 240);
 
   useEffect(() => {
     void initApp();
@@ -24,10 +33,13 @@ export default function App() {
 
   // Масштаб интерфейса (⌘+ / ⌘− / ⌘0). CSS zoom в WKWebView глючит с layout,
   // поэтому масштабируем корень через transform + компенсацию размеров.
+  // --ui-scale позволяет контр-масштабировать физические константы (например,
+  // зону системных traffic lights, которые transform не трогает).
   useEffect(() => {
     const root = document.getElementById("root");
     if (!root) return;
     const s = uiScale || 1;
+    document.documentElement.style.setProperty("--ui-scale", String(s));
     if (Math.abs(s - 1) < 0.01) {
       root.style.transform = "";
       root.style.transformOrigin = "";
@@ -40,6 +52,21 @@ export default function App() {
       root.style.height = `${100 / s}%`;
     }
   }, [uiScale]);
+
+  // ширина сайдбара (drag-resize пишет live в ту же переменную)
+  useEffect(() => {
+    document.documentElement.style.setProperty("--sidebar-w", `${sidebarWidth}px`);
+  }, [sidebarWidth]);
+
+  // системное меню: View → Toggle Sidebar (эмитится из Rust)
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    void getBackend().then(async (be) => {
+      if (be.isMock) return;
+      un = await be.listen("menu-toggle-sidebar", () => toggleSidebar());
+    });
+    return () => un?.();
+  }, []);
 
   // Надёжный drag окна за шапку: свой обработчик поверх data-tauri-drag-region
   // (штатный инжект в WKWebView срабатывает не всегда). Двойной клик — maximize.
@@ -80,6 +107,11 @@ export default function App() {
         void updateAppConfig({ uiScale: 1 });
         return;
       }
+      if (e.key === "b") {
+        e.preventDefault();
+        toggleSidebar();
+        return;
+      }
       if (e.key === "n" && s.currentCwd) {
         e.preventDefault();
         s.set({ view: "chat" });
@@ -104,7 +136,7 @@ export default function App() {
 
   if (!ready) {
     return (
-      <div className="empty" style={{ height: "100vh" }}>
+      <div className="empty" style={{ height: "100%" }}>
         <div className="spinner" style={{ width: 20, height: 20 }} />
         <div>Запуск…</div>
       </div>
@@ -112,8 +144,13 @@ export default function App() {
   }
 
   return (
-    <div className="app">
-      <Sidebar />
+    <div className={`app ${sidebarCollapsed ? "no-sidebar" : ""}`}>
+      {!sidebarCollapsed && <Sidebar />}
+      {sidebarCollapsed && (
+        <button className="sidebar-expand" title="Показать боковую панель (⌘B)" onClick={toggleSidebar}>
+          <SidebarIcon size={15} />
+        </button>
+      )}
       <div className="main">
         {view === "chat" && <ChatView />}
         {view === "review" && <ReviewView />}

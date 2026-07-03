@@ -7,7 +7,8 @@ pub mod sessions;
 pub mod supervisor;
 pub mod watcher;
 
-use tauri::Manager;
+use tauri::menu::{Menu, MenuItemBuilder, MenuItemKind, SubmenuBuilder};
+use tauri::{Emitter, Manager};
 
 pub fn run() {
     tauri::Builder::default()
@@ -16,6 +17,32 @@ pub fn run() {
             let sup = supervisor::Supervisor::new(app.handle().clone());
             app.manage(sup);
             watcher::start_sessions_watcher(app.handle().clone());
+
+            // системное меню: View → Toggle Sidebar (⌘B)
+            let menu = Menu::default(app.handle())?;
+            let toggle = MenuItemBuilder::with_id("toggle-sidebar", "Toggle Sidebar")
+                .accelerator("CmdOrCtrl+B")
+                .build(app)?;
+            let mut appended = false;
+            for item in menu.items()? {
+                if let MenuItemKind::Submenu(sub) = item {
+                    if sub.text().unwrap_or_default() == "View" {
+                        sub.append(&toggle)?;
+                        appended = true;
+                        break;
+                    }
+                }
+            }
+            if !appended {
+                let view = SubmenuBuilder::new(app, "View").item(&toggle).build()?;
+                menu.append(&view)?;
+            }
+            app.set_menu(menu)?;
+            app.on_menu_event(|app, event| {
+                if event.id() == "toggle-sidebar" {
+                    let _ = app.emit("menu-toggle-sidebar", serde_json::json!({}));
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -28,6 +55,7 @@ pub fn run() {
             sessions::list_projects,
             sessions::list_sessions,
             sessions::list_sessions_for_cwd,
+            sessions::fork_session,
             sessions::read_session,
             sessions::delete_session,
             sessions::rename_session,

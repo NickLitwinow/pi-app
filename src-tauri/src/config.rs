@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -78,6 +79,8 @@ pub struct AppConfig {
     pub ui_scale: f64,
     /// Явно заданный пользователем путь к бинарю pi (приоритетнее авто-детекта).
     pub pi_path: Option<String>,
+    pub sidebar_collapsed: bool,
+    pub sidebar_width: u32,
 }
 
 impl Default for AppConfig {
@@ -89,6 +92,8 @@ impl Default for AppConfig {
             theme: "system".into(),
             ui_scale: 1.0,
             pi_path: None,
+            sidebar_collapsed: false,
+            sidebar_width: 240,
         }
     }
 }
@@ -119,13 +124,36 @@ pub fn write_app_config(config: AppConfig) -> Result<(), String> {
     write_json_atomic(&path, &content)
 }
 
-// ---------- session flags (pin/archive — app-side metadata) ----------
+// ---------- session flags (pin/archive/groups/pinned-messages — app-side metadata) ----------
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGroup {
+    pub id: String,
+    pub name: String,
+    pub cwd: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PinnedMessage {
+    pub id: String,
+    pub text: String,
+    pub role: String,
+    pub ts: i64,
+}
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SessionFlags {
     pub pinned: Vec<String>,
     pub archived: Vec<String>,
+    /// Пользовательские группы (папки) сессий внутри проекта.
+    pub groups: Vec<SessionGroup>,
+    /// sessionPath → groupId.
+    pub group_of: HashMap<String, String>,
+    /// sessionPath → закреплённые сообщения (компактный виджет в чате).
+    pub pinned_messages: HashMap<String, Vec<PinnedMessage>>,
 }
 
 fn session_flags_path() -> PathBuf {
