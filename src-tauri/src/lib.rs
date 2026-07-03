@@ -95,6 +95,7 @@ pub fn run() {
             gitops::git_show_commit,
             gitops::git_file_diff,
             editor::open_in_editor,
+            editor::open_external,
             editor::read_file_base64,
         ])
         .run(tauri::generate_context!())

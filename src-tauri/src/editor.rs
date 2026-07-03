@@ -55,6 +55,32 @@ fn spawn_shell(cmd: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Валидация внешних ссылок: только web/mailto — никаких file:/javascript:
+/// и прочих схем, способных навредить.
+fn is_safe_external_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:"))
+        && !lower.contains('\n')
+        && !lower.contains('\r')
+}
+
+/// Open a URL in the system default browser (ссылки из чата/настроек не должны
+/// перекрывать webview самого приложения).
+#[tauri::command]
+pub fn open_external(url: String) -> Result<(), String> {
+    if !is_safe_external_url(&url) {
+        return Err(format!("недопустимый URL: {url}"));
+    }
+    Command::new("/usr/bin/open")
+        .arg(&url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Open a file (optionally at a line) in the configured external editor.
 #[tauri::command]
 pub fn open_in_editor(editor: String, path: String, line: Option<u32>) -> Result<(), String> {
@@ -79,5 +105,18 @@ mod tests {
         assert_eq!(shell_escape("simple"), "'simple'");
         assert_eq!(shell_escape("it's"), r"'it'\''s'");
         assert_eq!(shell_escape("path with spaces/f.txt"), "'path with spaces/f.txt'");
+    }
+
+    #[test]
+    fn validates_external_urls() {
+        assert!(is_safe_external_url("https://pi.dev/docs"));
+        assert!(is_safe_external_url("http://localhost:8099/v1"));
+        assert!(is_safe_external_url("mailto:dev@example.com"));
+        assert!(is_safe_external_url("  HTTPS://Example.com  "));
+        assert!(!is_safe_external_url("file:///etc/passwd"));
+        assert!(!is_safe_external_url("javascript:alert(1)"));
+        assert!(!is_safe_external_url("ftp://host/x"));
+        assert!(!is_safe_external_url("https://x.com\nrm -rf /"));
+        assert!(!is_safe_external_url(""));
     }
 }

@@ -1,4 +1,5 @@
 import { memo, useEffect, useMemo, useRef } from "react";
+import { getBackend } from "../lib/backend";
 import { enhanceCodeBlocks, renderMarkdown } from "../lib/markdown";
 
 function isDark(): boolean {
@@ -17,5 +18,14 @@ export const Markdown = memo(function Markdown({ source, final }: { source: stri
     if (final && ref.current) void enhanceCodeBlocks(ref.current, isDark());
   }, [html, final]);
 
-  return <div ref={ref} className="md" dangerouslySetInnerHTML={{ __html: html }} />;
+  const handleClick = (e: React.MouseEvent) => {
+    const anchor = (e.target as HTMLElement).closest("a[href]");
+    if (!anchor) return;
+    e.preventDefault();
+    const href = anchor.getAttribute("href");
+    if (!href) return;
+    void getBackend().then((b) => b.invoke("open_external", { url: href }).catch(() => {}));
+  };
+
+  return <div ref={ref} className="md" onClick={handleClick} dangerouslySetInnerHTML={{ __html: html }} />;
 });
