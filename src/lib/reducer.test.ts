@@ -226,8 +226,25 @@ describe("applyAgentEvent — auxiliary events", () => {
       result: { content: [{ type: "text", text: big }] },
       isError: false,
     });
-    expect(chat.toolExecs.c9.output.length).toBeLessThan(200_000);
+    expect(chat.toolExecs.c9.output.length).toBeLessThan(120_000);
     expect(chat.toolExecs.c9.output).toContain("вывод усечён");
+  });
+
+  it("prunes outputs of the oldest tool execs to bound memory", () => {
+    let chat = emptyChatState();
+    for (let i = 0; i < 360; i++) {
+      chat = applyAgentEvent({ ...chat }, {
+        type: "tool_execution_end",
+        toolCallId: `t${i}`,
+        result: { content: [{ type: "text", text: `output-of-${i} ${"y".repeat(500)}` }] },
+        isError: false,
+      });
+    }
+    // самый старый вывод выгружен до маркера, свежий — цел
+    expect(chat.toolExecs.t0.output).toContain("выгружен для экономии памяти");
+    expect(chat.toolExecs.t359.output).toContain("output-of-359");
+    // структура (имя/статус) сохранена даже у выгруженных
+    expect(chat.toolExecs.t0.done).toBe(true);
   });
 
   it("tracks compaction and retry state", () => {

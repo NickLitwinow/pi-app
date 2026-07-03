@@ -416,16 +416,17 @@ pub async fn spawn_agent_impl<R: Runtime>(
                                     match event.get("type").and_then(|t| t.as_str()) {
                                         Some("agent_start") => streaming.store(true, Ordering::Relaxed),
                                         Some("agent_end") => streaming.store(false, Ordering::Relaxed),
-                                        Some("response") => {
-                                            // Sniff the session path from get_state responses.
-                                            if event.get("command").and_then(|c| c.as_str()) == Some("get_state") {
-                                                if let Some(p) = event
-                                                    .pointer("/data/sessionPath")
-                                                    .or_else(|| event.pointer("/data/sessionFile"))
-                                                    .and_then(|v| v.as_str())
-                                                {
-                                                    *session_path.lock().await = Some(p.to_string());
-                                                }
+                                        // Sniff the session path from get_state responses.
+                                        Some("response")
+                                            if event.get("command").and_then(|c| c.as_str())
+                                                == Some("get_state") =>
+                                        {
+                                            if let Some(p) = event
+                                                .pointer("/data/sessionPath")
+                                                .or_else(|| event.pointer("/data/sessionFile"))
+                                                .and_then(|v| v.as_str())
+                                            {
+                                                *session_path.lock().await = Some(p.to_string());
                                             }
                                         }
                                         _ => {}

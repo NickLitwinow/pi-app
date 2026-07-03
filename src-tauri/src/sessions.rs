@@ -110,7 +110,7 @@ pub fn list_projects_in(root: &Path) -> Vec<ProjectInfo> {
             last_modified_ms: newest_ms,
         });
     }
-    out.sort_by(|a, b| b.last_modified_ms.cmp(&a.last_modified_ms));
+    out.sort_by_key(|p| std::cmp::Reverse(p.last_modified_ms));
     out
 }
 
@@ -148,7 +148,8 @@ pub struct SessionMeta {
 
 /// Metadata cache: parsing a session means reading the whole JSONL file, so
 /// re-listing on every refresh would re-read megabytes. Key by (mtime, size).
-static META_CACHE: Mutex<Option<HashMap<String, (i64, u64, SessionMeta)>>> = Mutex::new(None);
+type MetaCache = HashMap<String, (i64, u64, SessionMeta)>;
+static META_CACHE: Mutex<Option<MetaCache>> = Mutex::new(None);
 
 fn file_size(p: &Path) -> u64 {
     fs::metadata(p).map(|m| m.len()).unwrap_or(0)
@@ -270,7 +271,7 @@ pub fn list_sessions_in(project_dir: &Path) -> Vec<SessionMeta> {
             }
         }
     }
-    out.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    out.sort_by_key(|s| std::cmp::Reverse(s.modified_ms));
     out
 }
 
@@ -442,27 +443,74 @@ pub fn rename_session(path: String, name: String) -> Result<(), String> {
     file.write_all(line.as_bytes()).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn read_session(path: String) -> Result<Vec<Value>, String> {
-    if !path.ends_with(".jsonl") {
-        return Err("not a session file".into());
-    }
-    let file = fs::File::open(&path).map_err(|e| e.to_string())?;
+/// Entries of the ACTIVE branch only, in root→leaf order.
+///
+/// A pi session is an append-only tree; the last written entry sits on the
+/// currently active branch. Walking `parentId` from that leaf back to the root
+/// yields the full linear conversation — including pre-compaction messages
+/// (they remain ancestors) — without mixing in abandoned fork branches, which
+/// naive append-order reading would merge together.
+pub fn read_session_thread_entries(path: &Path) -> Result<Vec<Value>, String> {
+    let file = fs::File::open(path).map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
-    let mut out = Vec::new();
+
+    let mut by_id: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut last_id: Option<String> = None;
+    let mut root_fallback: Vec<Value> = Vec::new();
+
     for line in reader.lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            out.push(v);
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        match v.get("id").and_then(|i| i.as_str()) {
+            Some(id) => {
+                let id = id.to_string();
+                last_id = Some(id.clone());
+                by_id.insert(id, v);
+            }
+            None => root_fallback.push(v), // на всякий случай, если у записи нет id
         }
-        if out.len() >= 50_000 {
+        if by_id.len() >= 100_000 {
             break;
         }
     }
-    Ok(out)
+
+    // собрать цепочку leaf → root по parentId
+    let mut chain: Vec<Value> = Vec::new();
+    let mut cursor = last_id;
+    let mut guard = 0usize;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(id) = cursor {
+        if !seen.insert(id.clone()) {
+            break; // защита от циклов в повреждённом файле
+        }
+        let Some(v) = by_id.get(&id) else { break };
+        let parent = v
+            .get("parentId")
+            .and_then(|p| p.as_str())
+            .map(|s| s.to_string());
+        chain.push(v.clone());
+        cursor = parent;
+        guard += 1;
+        if guard >= 100_000 {
+            break;
+        }
+    }
+    chain.reverse();
+    if chain.is_empty() {
+        return Ok(root_fallback);
+    }
+    Ok(chain)
+}
+
+#[tauri::command]
+pub fn read_session_thread(path: String) -> Result<Vec<Value>, String> {
+    if !path.ends_with(".jsonl") {
+        return Err("not a session file".into());
+    }
+    read_session_thread_entries(Path::new(&path))
 }
 
 // ---------- search ----------
@@ -633,7 +681,8 @@ struct FileAgg {
     per_model: Vec<(String, f64, u64, u64, usize)>,
 }
 
-static ANALYTICS_CACHE: Mutex<Option<HashMap<String, (i64, u64, FileAgg)>>> = Mutex::new(None);
+type AnalyticsCache = HashMap<String, (i64, u64, FileAgg)>;
+static ANALYTICS_CACHE: Mutex<Option<AnalyticsCache>> = Mutex::new(None);
 
 fn analyze_session_file(p: &Path) -> FileAgg {
     let mut agg = FileAgg::default();
@@ -696,7 +745,16 @@ fn analyze_session_file_cached(p: &Path) -> FileAgg {
     }
     let agg = analyze_session_file(p);
     if let Ok(mut cache) = ANALYTICS_CACHE.lock() {
-        cache.get_or_insert_with(HashMap::new).insert(key, (mtime, size, agg.clone()));
+        let map = cache.get_or_insert_with(HashMap::new);
+        // ограничиваем рост кэша: при переполнении выбрасываем половину старых по mtime
+        if map.len() > 4096 {
+            let mut entries: Vec<(String, i64)> = map.iter().map(|(k, (m, _, _))| (k.clone(), *m)).collect();
+            entries.sort_by_key(|(_, m)| *m);
+            for (k, _) in entries.into_iter().take(map.len() / 2) {
+                map.remove(&k);
+            }
+        }
+        map.insert(key, (mtime, size, agg.clone()));
     }
     agg
 }
@@ -750,7 +808,7 @@ pub fn analytics_in(root: &Path) -> AnalyticsOverview {
         .into_iter()
         .map(|(model, (cost, input, output, messages))| ModelStat { model, cost, input, output, messages })
         .collect();
-    per_model.sort_by(|a, b| b.messages.cmp(&a.messages));
+    per_model.sort_by_key(|m| std::cmp::Reverse(m.messages));
 
     AnalyticsOverview { totals, per_day, per_model }
 }
@@ -868,6 +926,34 @@ mod session_ops_tests {
 
         // оригинал не тронут
         assert_eq!(parse_session_meta(&file).unwrap().message_count, 3);
+    }
+
+    #[test]
+    fn reads_active_branch_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("--t--");
+        fs::create_dir_all(&proj).unwrap();
+        let file = proj.join("s.jsonl");
+        // линейная ветка: header → u1 → a1 → u2, плюс заброшенная форк-ветка от a1 (u2b)
+        fs::write(
+            &file,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"h\",\"timestamp\":\"2026-07-01T00:00:00.000Z\",\"cwd\":\"/t\"}\n",
+                "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":\"h\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}}\n",
+                "{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"reply\"}]}}\n",
+                "{\"type\":\"message\",\"id\":\"u2b\",\"parentId\":\"a1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"ABANDONED\"}]}}\n",
+                "{\"type\":\"message\",\"id\":\"u2\",\"parentId\":\"a1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"active-second\"}]}}\n",
+            ),
+        )
+        .unwrap();
+
+        let thread = read_session_thread_entries(&file).unwrap();
+        // активная ветка = h, u1, a1, u2 (u2b — заброшенный форк, исключён)
+        let ids: Vec<&str> = thread.iter().filter_map(|v| v.get("id").and_then(|i| i.as_str())).collect();
+        assert_eq!(ids, vec!["h", "u1", "a1", "u2"]);
+        let joined = thread.iter().map(|v| v.to_string()).collect::<String>();
+        assert!(joined.contains("active-second"));
+        assert!(!joined.contains("ABANDONED"));
     }
 
     #[test]

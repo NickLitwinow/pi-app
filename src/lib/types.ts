@@ -203,6 +203,24 @@ export interface AppConfig {
   piPath?: string | null;
   sidebarCollapsed?: boolean;
   sidebarWidth?: number;
+  sourceRepoPath?: string | null;
+}
+
+export interface AppUpdateInfo {
+  currentVersion: string;
+  currentSha: string;
+  sourceRepo: string | null;
+  sourceRepoValid: boolean;
+  latest: string | null;
+  latestKind: "release" | "commit" | "none";
+  notes: string;
+  htmlUrl: string;
+  updateAvailable: boolean;
+  checked: boolean;
+  /** Коммитов позади/впереди upstream (локальный git-путь). */
+  behind: number;
+  ahead: number;
+  error: string | null;
 }
 
 export interface SessionGroup {

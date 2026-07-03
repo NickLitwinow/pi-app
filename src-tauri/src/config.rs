@@ -81,6 +81,8 @@ pub struct AppConfig {
     pub pi_path: Option<String>,
     pub sidebar_collapsed: bool,
     pub sidebar_width: u32,
+    /// Каталог исходников pi-app для локального самообновления (ребилд из исходников).
+    pub source_repo_path: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -94,6 +96,7 @@ impl Default for AppConfig {
             pi_path: None,
             sidebar_collapsed: false,
             sidebar_width: 240,
+            source_repo_path: None,
         }
     }
 }
@@ -154,6 +157,8 @@ pub struct SessionFlags {
     pub group_of: HashMap<String, String>,
     /// sessionPath → закреплённые сообщения (компактный виджет в чате).
     pub pinned_messages: HashMap<String, Vec<PinnedMessage>>,
+    /// cwd проектов, скрытых пользователем из сайдбара (файлы сессий не трогаем).
+    pub hidden_projects: Vec<String>,
 }
 
 fn session_flags_path() -> PathBuf {

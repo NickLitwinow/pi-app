@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getBackend } from "../lib/backend";
 import type { ConfigFile, PiInfo, SkillInfo } from "../lib/types";
-import { updateAppConfig, useStore } from "../state/store";
+import { confirmDialog } from "../lib/dialog";
+import { openExternalUrl, updateAppConfig, useStore } from "../state/store";
 import { CheckIcon, ErrorIcon, FolderIcon, RefreshIcon } from "./icons";
 
 type Tab = "general" | "extensions" | "skills" | "mcp" | "models" | "app";
@@ -434,14 +435,15 @@ function ExtensionsTab() {
               <span style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{p}</span>
               {rec && <span className="badge green">используется клиентом</span>}
               <div className="grow" />
-              <a
-                className="hint"
-                href={p.startsWith("npm:") ? `https://www.npmjs.com/package/${p.slice(4)}` : undefined}
-                target="_blank"
-                rel="noreferrer"
-              >
-                npm ↗
-              </a>
+              {p.startsWith("npm:") && (
+                <button
+                  className="hint"
+                  title="Открыть на npmjs.com"
+                  onClick={() => void openExternalUrl(`https://www.npmjs.com/package/${p.slice(4)}`)}
+                >
+                  npm ↗
+                </button>
+              )}
               <button className="danger" disabled={running} onClick={() => void runPi(["remove", p])}>
                 Удалить
               </button>
@@ -527,7 +529,7 @@ function McpTab() {
   }, [reloadKey]);
 
   const removeServer = async (name: string) => {
-    if (!window.confirm(`Удалить MCP-сервер «${name}» из mcp.json?`)) return;
+    if (!(await confirmDialog(`Удалить MCP-сервер «${name}» из mcp.json?`))) return;
     const be = await getBackend();
     const f = await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
     const parsed = JSON.parse(f.content) as { mcpServers?: Record<string, unknown> };
@@ -750,10 +752,12 @@ function ModelsTab() {
   };
 
   const removeProvider = (name: string) => {
-    if (!window.confirm(`Удалить провайдер «${name}» из models.json?`)) return;
-    const next = { ...providers };
-    delete next[name];
-    void writeProviders(next);
+    void confirmDialog(`Удалить провайдер «${name}» из models.json?`).then((ok) => {
+      if (!ok) return;
+      const next = { ...providers };
+      delete next[name];
+      void writeProviders(next);
+    });
   };
 
   return (

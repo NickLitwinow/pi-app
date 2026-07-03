@@ -40,10 +40,11 @@ class MockBackend implements Backend {
   private uiSeq = 1;
   private pendingUi = new Map<string, (resp: Record<string, unknown>) => void>();
   private steerQueue: string[] = [];
-  private flags: Record<string, unknown> = { pinned: [], archived: [], groups: [], groupOf: {}, pinnedMessages: {} };
+  private flags: Record<string, unknown> = { pinned: [], archived: [], groups: [], groupOf: {}, pinnedMessages: {}, hiddenProjects: [] };
   private deleted = new Set<string>();
   private renamed = new Map<string, string>();
   private forked: SessionMeta[] = [];
+  private currentSession = "/mock/a/live.jsonl";
   private permMode: string | null = null;
   private settings = JSON.stringify(
     {
@@ -274,7 +275,7 @@ class MockBackend implements Backend {
       case "write_session_flags":
         this.flags = args.flags as Record<string, unknown>;
         return undefined as T;
-      case "read_session":
+      case "read_session_thread":
         return [
           { type: "message", message: { role: "user", content: [{ type: "text", text: "Пример архивной сессии (mock)" }] } },
           { type: "message", message: { role: "assistant", content: [{ type: "text", text: "Ответ из истории. **Markdown** работает." }], model: "qwen-local" } },
@@ -330,13 +331,19 @@ class MockBackend implements Backend {
           this.emitAgent(agentId, { type: "queue_update", steering: [...this.steerQueue], followUp: [] });
         } else if (line.type === "extension_ui_response") {
           this.pendingUi.get(String(line.id))?.(line as Record<string, unknown>);
+        } else if (line.type === "switch_session" && line.id) {
+          this.currentSession = String(line.sessionPath ?? this.currentSession);
+          this.emitAgent(agentId, { type: "response", id: line.id, command: "switch_session", success: true, data: { cancelled: false } });
+        } else if (line.type === "new_session" && line.id) {
+          this.currentSession = `/mock/a/new-${Date.now()}.jsonl`;
+          this.emitAgent(agentId, { type: "response", id: line.id, command: "new_session", success: true, data: {} });
         } else if (line.id) {
           await sleep(30);
           const data: Record<string, unknown> =
             line.type === "get_state"
               ? {
                   model: { id: "qwen-local", provider: "ollama", contextWindow: 128000, input: ["text"] },
-                  thinkingLevel: "high", isStreaming: false, sessionId: "mock", messageCount: 2,
+                  thinkingLevel: "high", isStreaming: false, sessionId: "mock", sessionFile: this.currentSession, messageCount: 2,
                 }
               : line.type === "get_available_models"
                 ? { models: [
@@ -424,6 +431,31 @@ class MockBackend implements Backend {
       case "probe_url":
         await sleep(300);
         return "200" as T;
+      case "check_app_update": {
+        await sleep(400);
+        return {
+          currentVersion: "0.1.0", currentSha: "abc1234",
+          sourceRepo: "/Users/dev/pi-app", sourceRepoValid: true,
+          latest: "def5678", latestKind: "commit",
+          notes: "def5678 feat: self-update, dialog fixes\nc0ffee0 fix: statusline layout",
+          htmlUrl: "https://github.com/NickLitwinow/pi-app", updateAvailable: true,
+          checked: true, behind: 2, ahead: 0, error: null,
+        } as T;
+      }
+      case "app_update_run": {
+        const runId = `upd-${Date.now()}`;
+        void (async () => {
+          for (const l of ["▶ Обновление исходников (git pull)", "$ git pull --ff-only", "Already up to date.", "▶ Сборка приложения (tauri build)", "Compiling pi-app…", "✓ Готово. Нажмите «Перезапустить»."]) {
+            await sleep(500);
+            this.emit("app-update-output", { runId, line: l, done: false });
+          }
+          await sleep(400);
+          this.emit("app-update-output", { runId, done: true, code: 0 });
+        })();
+        return runId as T;
+      }
+      case "relaunch_app":
+        return undefined as T;
       case "set_pi_path":
         return { path: String(args.path ?? "/opt/homebrew/bin/pi"), version: "0.80.3 (mock)", agentDir: "~/.pi/agent" } satisfies PiInfo as T;
       case "write_permission_preset":
@@ -463,6 +495,8 @@ class MockBackend implements Backend {
         ].join("\n") as T;
       case "git_checkout_file":
       case "open_in_editor":
+      case "reveal_in_finder":
+      case "open_external":
         return undefined as T;
       case "pi_cli_run": {
         const runId = `run-${Date.now()}`;
