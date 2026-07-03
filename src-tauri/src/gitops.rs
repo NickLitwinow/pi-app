@@ -192,20 +192,101 @@ pub async fn git_summary(cwd: String) -> Result<GitSummary, String> {
     Ok(s)
 }
 
-/// Open a PR for the current branch via the gh CLI in the user's browser.
+/// Normalize a git remote URL (ssh or https) to its https web base without
+/// trailing `.git`. Returns (host, "https://host/owner/repo").
+pub fn remote_web_base(remote: &str) -> Option<(String, String)> {
+    let r = remote.trim();
+    let stripped = r.strip_suffix(".git").unwrap_or(r);
+    // scp-like: git@host:owner/repo
+    let https = if let Some(rest) = stripped.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        format!("https://{host}/{path}")
+    } else if let Some(rest) = stripped.strip_prefix("ssh://git@") {
+        format!("https://{}", rest)
+    } else if stripped.starts_with("https://") || stripped.starts_with("http://") {
+        stripped.to_string()
+    } else {
+        return None;
+    };
+    let host = https
+        .strip_prefix("https://")
+        .or_else(|| https.strip_prefix("http://"))
+        .and_then(|s| s.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    if host.is_empty() {
+        None
+    } else {
+        Some((host, https))
+    }
+}
+
+/// Build the provider-specific "create PR/MR" web URL for a branch.
+fn create_pr_url(host: &str, web_base: &str, branch: &str) -> String {
+    let b = urlencode(branch);
+    if host.contains("gitlab") {
+        format!("{web_base}/-/merge_requests/new?merge_request%5Bsource_branch%5D={b}")
+    } else if host.contains("bitbucket") {
+        format!("{web_base}/pull-requests/new?source={b}")
+    } else {
+        // github и совместимые
+        format!("{web_base}/compare/{b}?expand=1")
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+async fn has_cli(name: &str) -> bool {
+    matches!(
+        tokio::process::Command::new("/bin/zsh")
+            .args(["-lc", &format!("command -v {name}")])
+            .output()
+            .await,
+        Ok(out) if out.status.success() && !out.stdout.is_empty()
+    )
+}
+
+/// Open a "create PR/MR" flow for the current branch using whatever the user's
+/// own setup provides — GitHub (gh), GitLab (glab), or the provider's web page
+/// opened in the default browser. Никакой привязки к конкретному аккаунту: всё
+/// опирается на origin-remote репозитория и локальную авторизацию пользователя.
 #[tauri::command]
 pub async fn git_open_pr(cwd: String) -> Result<(), String> {
-    let check = tokio::process::Command::new("/bin/zsh")
-        .args(["-lc", "command -v gh"])
-        .output()
+    let remote = git_ok(&cwd, &["remote", "get-url", "origin"])
         .await
-        .map_err(|e| e.to_string())?;
-    if !check.status.success() || check.stdout.is_empty() {
-        return Err("gh CLI не установлен (brew install gh) — используйте вариант «через агента»".into());
+        .map_err(|_| "у репозитория нет remote «origin» — добавьте его (git remote add origin …)".to_string())?;
+    let (host, web_base) = remote_web_base(remote.trim())
+        .ok_or_else(|| format!("не удалось разобрать URL remote: {}", remote.trim()))?;
+
+    // нативные CLI дают лучший UX (заполняют заголовок/тело) — если установлены
+    if host.contains("github") && has_cli("gh").await {
+        return spawn_detached(&format!("cd {} && gh pr create --web", crate::editor::shell_escape_pub(&cwd)));
     }
-    let cmd = format!("cd {} && gh pr create --web", crate::editor::shell_escape_pub(&cwd));
+    if host.contains("gitlab") && has_cli("glab").await {
+        return spawn_detached(&format!("cd {} && glab mr create --web", crate::editor::shell_escape_pub(&cwd)));
+    }
+
+    // универсальный путь: открыть страницу создания PR/MR в браузере
+    let branch = git_ok(&cwd, &["branch", "--show-current"]).await?.trim().to_string();
+    if branch.is_empty() {
+        return Err("вы в состоянии detached HEAD — переключитесь на ветку".into());
+    }
+    let url = create_pr_url(&host, &web_base, &branch);
+    crate::editor::open_external(url)
+}
+
+fn spawn_detached(cmd: &str) -> Result<(), String> {
     std::process::Command::new("/bin/zsh")
-        .args(["-lc", &cmd])
+        .args(["-lc", cmd])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -608,6 +689,32 @@ mod tests {
         git_checkout_branch(cwd.clone(), main, false).await.unwrap();
         git_delete_branch(cwd.clone(), "feature-x".into(), true).await.unwrap();
         assert_eq!(git_branches(cwd.clone()).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn normalizes_remotes_and_builds_pr_urls() {
+        // ssh и https формы → одинаковая web-база
+        let (h, base) = remote_web_base("git@github.com:NickLitwinow/pi-app.git").unwrap();
+        assert_eq!(h, "github.com");
+        assert_eq!(base, "https://github.com/NickLitwinow/pi-app");
+        let (_, base2) = remote_web_base("https://github.com/NickLitwinow/pi-app.git").unwrap();
+        assert_eq!(base2, base);
+
+        // GitHub compare-URL
+        assert_eq!(
+            create_pr_url("github.com", &base, "feat/x y"),
+            "https://github.com/NickLitwinow/pi-app/compare/feat%2Fx%20y?expand=1"
+        );
+        // GitLab MR-URL
+        let (gh, gbase) = remote_web_base("git@gitlab.com:acme/app.git").unwrap();
+        assert_eq!(gh, "gitlab.com");
+        assert_eq!(
+            create_pr_url(&gh, &gbase, "topic"),
+            "https://gitlab.com/acme/app/-/merge_requests/new?merge_request%5Bsource_branch%5D=topic"
+        );
+
+        // мусор не парсится
+        assert!(remote_web_base("not-a-url").is_none());
     }
 
     #[test]

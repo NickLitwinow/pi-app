@@ -19,13 +19,23 @@ export const Markdown = memo(function Markdown({ source, final }: { source: stri
   }, [html, final]);
 
   const handleClick = (e: React.MouseEvent) => {
+    // средняя кнопка тоже перехватывается — иначе webview уходит на URL
+    if (e.button !== 0 && e.button !== 1) return;
     const anchor = (e.target as HTMLElement).closest("a[href]");
     if (!anchor) return;
     e.preventDefault();
     const href = anchor.getAttribute("href");
-    if (!href) return;
+    if (!href || href.startsWith("#")) return;
     void getBackend().then((b) => b.invoke("open_external", { url: href }).catch(() => {}));
   };
 
-  return <div ref={ref} className="md" onClick={handleClick} dangerouslySetInnerHTML={{ __html: html }} />;
+  return (
+    <div
+      ref={ref}
+      className="md"
+      onClick={handleClick}
+      onAuxClick={handleClick}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  );
 });

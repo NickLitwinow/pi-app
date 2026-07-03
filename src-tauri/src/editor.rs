@@ -81,6 +81,20 @@ pub fn open_external(url: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Reveal a folder/file in Finder (кнопка «Открыть в Finder» у проектов).
+#[tauri::command]
+pub fn reveal_in_finder(path: String) -> Result<(), String> {
+    Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Open a file (optionally at a line) in the configured external editor.
 #[tauri::command]
 pub fn open_in_editor(editor: String, path: String, line: Option<u32>) -> Result<(), String> {

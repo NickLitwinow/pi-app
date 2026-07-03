@@ -32,6 +32,7 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  Sparkles,
   Settings,
   ShieldQuestion,
   Square,
@@ -82,6 +83,7 @@ export const PinOffIcon = ({ size = 15 }: IconProps) => <PinOff size={size} stro
 export const SidebarIcon = ({ size = 15 }: IconProps) => <PanelLeft size={size} strokeWidth={SW} />;
 export const FolderPlusIcon = ({ size = 15 }: IconProps) => <FolderPlus size={size} strokeWidth={SW} />;
 export const GroupIcon = ({ size = 15 }: IconProps) => <Folder size={size} strokeWidth={SW} />;
+export const UpdateIcon = ({ size = 15 }: IconProps) => <Sparkles size={size} strokeWidth={SW} />;
 
 export const ChevronIcon = ({ size = 13, open }: IconProps & { open?: boolean }) => (
   <ChevronRight

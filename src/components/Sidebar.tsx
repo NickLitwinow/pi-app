@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import { getBackend } from "../lib/backend";
+import { confirmDialog, messageDialog } from "../lib/dialog";
 import type { SearchHit, SessionGroup, SessionMeta } from "../lib/types";
 import {
   addWorkspace,
@@ -11,6 +12,7 @@ import {
   newSession,
   openSession,
   refreshSessions,
+  removeWorkspace,
   renameGroup,
   renameSessionAction,
   selectWorkspace,
@@ -30,7 +32,9 @@ import {
   PlusIcon,
   ReviewIcon,
   SidebarIcon,
+  UpdateIcon,
 } from "./icons";
+import UpdateModal from "./UpdateModal";
 
 const NAV: { view: View; label: string; icon: (p: { size?: number }) => ReactElement }[] = [
   { view: "chat", label: "Чат", icon: ChatIcon },
@@ -71,6 +75,7 @@ function SessionRow({
   s,
   active,
   live,
+  streaming = false,
   pinned,
   archived,
   groups,
@@ -80,6 +85,7 @@ function SessionRow({
   s: SessionMeta;
   active: boolean;
   live: boolean;
+  streaming?: boolean;
   pinned: boolean;
   archived: boolean;
   groups: SessionGroup[];
@@ -145,7 +151,7 @@ function SessionRow({
       }}
       title={s.userSnippet ?? s.path}
     >
-      {live ? <span className="dot live" /> : pinned ? <span className="sess-pin">›</span> : <span className="sess-pin" />}
+      {streaming ? <span className="spinner" /> : live ? <span className="dot live" /> : pinned ? <span className="sess-pin">›</span> : <span className="sess-pin" />}
       <span className="sess-title">{sessionTitle(s)}</span>
       <span className="sess-when">{fmtWhen(s.modifiedMs)}</span>
       <button
@@ -181,7 +187,7 @@ function SessionRow({
               <button
                 onClick={() => {
                   setMenuOpen(false);
-                  void forkSessionAction(cwd, s).catch((e) => window.alert(String(e)));
+                  void forkSessionAction(cwd, s).catch((e) => void messageDialog(String(e), { kind: "error" }));
                 }}
               >
                 Форк сессии
@@ -199,9 +205,9 @@ function SessionRow({
                 className="danger"
                 onClick={() => {
                   setMenuOpen(false);
-                  if (window.confirm(`Удалить сессию «${sessionTitle(s)}» безвозвратно?`)) {
-                    void deleteSessionAction(cwd, s.path);
-                  }
+                  void confirmDialog(`Удалить сессию «${sessionTitle(s)}» безвозвратно?`, { kind: "warning" }).then((ok) => {
+                    if (ok) void deleteSessionAction(cwd, s.path);
+                  });
                 }}
               >
                 Удалить
@@ -269,6 +275,8 @@ function GroupSection({
 }) {
   const [open, setOpen] = useState(true);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [draft, setDraft] = useState(group.name);
   const menuRef = useRef<HTMLDivElement>(null);
   void cwd;
 
@@ -280,6 +288,33 @@ function GroupSection({
     window.addEventListener("mousedown", close);
     return () => window.removeEventListener("mousedown", close);
   }, [menuOpen]);
+
+  const commitRename = () => {
+    setRenaming(false);
+    const name = draft.trim();
+    if (name && name !== group.name) void renameGroup(group.id, name);
+  };
+
+  if (renaming) {
+    return (
+      <div className="sess-group">
+        <div className="sess-row group-head">
+          <GroupIcon size={12} />
+          <input
+            autoFocus
+            className="sess-rename"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitRename();
+              if (e.key === "Escape") setRenaming(false);
+            }}
+            onBlur={commitRename}
+          />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="sess-group">
@@ -302,8 +337,8 @@ function GroupSection({
             <button
               onClick={() => {
                 setMenuOpen(false);
-                const name = window.prompt("Название группы:", group.name);
-                if (name?.trim()) void renameGroup(group.id, name);
+                setDraft(group.name);
+                setRenaming(true);
               }}
             >
               Переименовать группу
@@ -312,9 +347,9 @@ function GroupSection({
               className="danger"
               onClick={() => {
                 setMenuOpen(false);
-                if (window.confirm(`Удалить группу «${group.name}»? Сессии останутся в проекте.`)) {
-                  void deleteGroup(group.id);
-                }
+                void confirmDialog(`Удалить группу «${group.name}»? Сессии останутся в проекте.`).then((ok) => {
+                  if (ok) void deleteGroup(group.id);
+                });
               }}
             >
               Удалить группу
@@ -329,6 +364,11 @@ function GroupSection({
 
 // ---------- project block ----------
 
+async function revealProject(cwd: string) {
+  const be = await getBackend();
+  await be.invoke("reveal_in_finder", { path: cwd }).catch(() => {});
+}
+
 function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: number }) {
   const currentCwd = useStore((s) => s.currentCwd);
   const ws = useStore((s) => s.chats[cwd]);
@@ -336,12 +376,23 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
   const flags = useStore((s) => s.sessionFlags);
   const [expanded, setExpanded] = useState(cwd === currentCwd);
   const [showArchived, setShowArchived] = useState(false);
+  const [projMenu, setProjMenu] = useState(false);
+  const projMenuRef = useRef<HTMLDivElement>(null);
 
   const isCurrent = currentCwd === cwd;
 
   useEffect(() => {
     if (expanded) void refreshSessions(cwd);
   }, [expanded, cwd]);
+
+  useEffect(() => {
+    if (!projMenu) return;
+    const close = (e: MouseEvent) => {
+      if (!projMenuRef.current?.contains(e.target as Node)) setProjMenu(false);
+    };
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [projMenu]);
 
   const pinnedSet = new Set(flags.pinned);
   const archivedSet = new Set(flags.archived);
@@ -366,7 +417,8 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
       cwd={cwd}
       s={s}
       active={isCurrent && ws?.sessionPath === s.path}
-      live={Boolean(ws?.alive && ws?.sessionPath === s.path)}
+      live={Boolean(ws?.alive && ws?.liveSessionPath === s.path)}
+      streaming={Boolean(ws?.liveStreaming && ws?.liveSessionPath === s.path)}
       pinned={pinnedSet.has(s.path)}
       archived={false}
       groups={groups}
@@ -376,20 +428,59 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
 
   return (
     <div className="proj">
-      <button
-        className={`ws ${isCurrent ? "active" : ""}`}
+      <div
+        className={`ws proj-head ${isCurrent ? "active" : ""}`}
         onClick={() => {
           selectWorkspace(cwd);
           setExpanded(isCurrent ? !expanded : true);
         }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setProjMenu(true);
+        }}
         title={cwd}
       >
         <span className="ws-name">
-          {ws?.chat.isStreaming ? <span className="spinner" /> : ws?.alive ? <span className="dot live" /> : <ChevronIcon open={expanded} />}
+          {ws?.liveStreaming ? <span className="spinner" /> : ws?.alive ? <span className="dot live" /> : <ChevronIcon open={expanded} />}
           {name}
           <span className="ws-count">{count > 0 ? count : ""}</span>
         </span>
-      </button>
+        <button
+          className="sess-more"
+          onClick={(e) => {
+            e.stopPropagation();
+            setProjMenu(!projMenu);
+          }}
+        >
+          ⋯
+        </button>
+        {projMenu && (
+          <div className="menu" ref={projMenuRef} onClick={(e) => e.stopPropagation()}>
+            <button
+              onClick={() => {
+                setProjMenu(false);
+                void revealProject(cwd);
+              }}
+            >
+              Открыть в Finder
+            </button>
+            <button
+              className="danger"
+              onClick={() => {
+                setProjMenu(false);
+                void confirmDialog(
+                  `Открепить «${name}» от сайдбара?\n\nЭто только убирает проект из списка — папка проекта и файлы сессий на диске НЕ удаляются. Проект вернётся, если снова открыть его папку.`,
+                  { title: "Открепить проект", kind: "info", okLabel: "Открепить", cancelLabel: "Отмена" },
+                ).then((ok) => {
+                  if (ok) void removeWorkspace(cwd);
+                });
+              }}
+            >
+              Открепить от сайдбара
+            </button>
+          </div>
+        )}
+      </div>
       {expanded && (
         <div className="sess-list">
           <button
@@ -497,10 +588,15 @@ export default function Sidebar() {
   const set = useStore((s) => s.set);
   const width = useStore((s) => s.appConfig.sidebarWidth ?? 240);
   const uiScale = useStore((s) => s.appConfig.uiScale || 1);
+  const hidden = useStore((s) => s.sessionFlags.hiddenProjects);
   const [query, setQuery] = useState("");
+  const [updateOpen, setUpdateOpen] = useState(false);
   const dragRef = useRef<{ startX: number; startW: number } | null>(null);
 
-  const all = [...extra, ...projects.filter((p) => !extra.some((e) => e.cwd === p.cwd))];
+  const hiddenSet = new Set(hidden);
+  const all = [...extra, ...projects.filter((p) => !extra.some((e) => e.cwd === p.cwd))].filter(
+    (p) => !hiddenSet.has(p.cwd),
+  );
 
   // drag-resize правой кромки (координаты мыши физические → делим на uiScale)
   const onResizeStart = (e: React.MouseEvent) => {
@@ -581,13 +677,20 @@ export default function Sidebar() {
       </div>
 
       <div className="footer">
-        {piInfo?.path ? (
-          <>pi {piInfo.version ?? "?"} · {isMock ? "demo" : "готов"}</>
-        ) : (
-          <span style={{ color: "var(--danger)" }}>pi не найден — установите с pi.dev</span>
-        )}
+        <span className="footer-text">
+          {piInfo?.path ? (
+            <>pi {piInfo.version ?? "?"} · {isMock ? "demo" : "готов"}</>
+          ) : (
+            <span style={{ color: "var(--danger)" }}>pi не найден — установите с pi.dev</span>
+          )}
+        </span>
+        <div className="grow" />
+        <button className="footer-update" title="Проверить обновления Pi" onClick={() => setUpdateOpen(true)}>
+          <UpdateIcon size={13} /> Обновления
+        </button>
       </div>
       <div className="side-resize" onMouseDown={onResizeStart} title="Потяните, чтобы изменить ширину" />
+      {updateOpen && <UpdateModal onClose={() => setUpdateOpen(false)} />}
     </div>
   );
 }

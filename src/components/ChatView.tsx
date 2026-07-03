@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getBackend } from "../lib/backend";
+import { messageDialog } from "../lib/dialog";
 import { stripAnsi } from "../lib/markdown";
 import { contentText } from "../lib/reducer";
 import type { ExtUiRequest, GitSummary, ModelInfo } from "../lib/types";
@@ -7,10 +8,13 @@ import {
   abortAgent,
   compactContext,
   ensureAgent,
+  isBrowsingAway,
   loadModelsAndCommands,
   newSession,
+  notifyChat,
   refreshStats,
   respondToUiRequest,
+  returnToLiveSession,
   sendFollowUp,
   sendPrompt,
   setAgentMode,
@@ -104,7 +108,7 @@ function GitBar({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
     setPrOpen(false);
     void sendPrompt(
       cwd,
-      "Подготовь pull request по текущим незакоммиченным изменениям: если мы на main/master — создай ветку с осмысленным именем; сделай коммит(ы) с внятными сообщениями; запушь и открой PR через `gh pr create --fill` (если gh недоступен — просто запушь и дай ссылку на compare). Перед этим кратко перечисли, что войдёт в PR.",
+      "Подготовь pull/merge request по текущим незакоммиченным изменениям: если мы на main/master — создай ветку с осмысленным именем; сделай коммит(ы) с внятными сообщениями; запушь в origin. Затем открой запрос средствами, доступными в этом окружении: для GitHub — `gh pr create --fill`, для GitLab — `glab mr create --fill` (или push-опция), для остального — просто дай ссылку на страницу создания PR/MR. Используй существующую авторизацию пользователя (gh/glab/git), ничего не хардкодь. Перед этим кратко перечисли, что войдёт в запрос.",
     );
   };
 
@@ -130,17 +134,17 @@ function GitBar({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         </button>
         {prOpen && (
           <div className="menu" style={{ bottom: "100%", top: "auto", right: 0 }} onMouseLeave={() => setPrOpen(false)}>
-            <button onClick={createPrViaAgent}>Через агента (ветка + коммит + PR)</button>
+            <button onClick={createPrViaAgent}>Через агента (ветка + коммит + PR/MR)</button>
             <button
               onClick={() => {
                 setPrOpen(false);
                 void (async () => {
                   const be = await getBackend();
-                  await be.invoke("git_open_pr", { cwd }).catch((e) => window.alert(String(e)));
+                  await be.invoke("git_open_pr", { cwd }).catch((e) => messageDialog(String(e), { kind: "error" }));
                 })();
               }}
             >
-              gh pr create --web
+              Открыть PR/MR в браузере
             </button>
           </div>
         )}
@@ -449,8 +453,10 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
       if (followUp) await sendFollowUp(cwd, t);
       else await sendPrompt(cwd, t, imgs.length ? imgs : undefined);
     } catch (e) {
+      // вернуть текст и attachments, показать причину (напр. агент занят другой сессией)
       setText(t);
-      console.error(e);
+      setAttachments(imgs);
+      notifyChat(cwd, "warning", e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -1001,7 +1007,7 @@ export default function ChatView() {
 
   useEffect(() => {
     // lazily start the agent when a workspace chat is opened with no history
-    if (cwd && !ws.alive && !ws.agentId && ws.chat.items.length === 0) {
+    if (cwd && !ws.alive && !ws.agentId && ws.chat.items.length === 0 && !ws.sessionPath) {
       void ensureAgent(cwd)
         .then(() => loadModelsAndCommands(cwd))
         .catch(() => {});
@@ -1051,6 +1057,7 @@ export default function ChatView() {
   }
 
   const sessionName = ws.agentState?.sessionName ?? (ws.sessionPath ? "Сессия" : "Новая сессия");
+  const browsing = isBrowsingAway(ws);
 
   return (
     <div className="chat">
@@ -1062,6 +1069,18 @@ export default function ChatView() {
           <PlusIcon size={13} /> Новая сессия
         </button>
       </div>
+      {browsing && (
+        <div className="browse-banner">
+          <span className="spinner" />
+          <span>
+            Просмотр другой сессии{ws.liveStreaming ? " — агент работает в фоне" : " — фоновая сессия простаивает"}
+          </span>
+          <div className="grow" />
+          <button className="chip" onClick={() => void returnToLiveSession(cwd)}>
+            Вернуться к активной
+          </button>
+        </div>
+      )}
       <MessageList cwd={cwd} ws={ws} />
       <Composer cwd={cwd} ws={ws} />
       <Toasts cwd={cwd} />

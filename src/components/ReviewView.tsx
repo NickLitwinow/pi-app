@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getBackend } from "../lib/backend";
+import { confirmDialog, messageDialog } from "../lib/dialog";
 import { firstChangedLine, parseUnifiedDiff, type DiffFile } from "../lib/diff";
 import type { BranchInfo, CommitInfo, GitSummary, StatusEntry } from "../lib/types";
 import { sendPrompt, useStore } from "../state/store";
@@ -65,7 +66,7 @@ function BranchPicker({
       await load();
       onChanged();
     } catch (e) {
-      window.alert(String(e));
+      void messageDialog(String(e), { kind: "error" });
     } finally {
       setBusy(false);
     }
@@ -89,14 +90,14 @@ function BranchPicker({
       setOpen(false);
     });
 
-  const deleteBranch = (b: BranchInfo) => {
-    if (!window.confirm(`Удалить ветку «${b.name}»?`)) return;
+  const deleteBranch = async (b: BranchInfo) => {
+    if (!(await confirmDialog(`Удалить ветку «${b.name}»?`))) return;
     void act(async () => {
       const be = await getBackend();
       try {
         await be.invoke("git_delete_branch", { cwd, name: b.name, force: false });
       } catch (e) {
-        if (String(e).includes("not fully merged") && window.confirm(`Ветка «${b.name}» не слита. Удалить принудительно?`)) {
+        if (String(e).includes("not fully merged") && (await confirmDialog(`Ветка «${b.name}» не слита. Удалить принудительно?`, { kind: "warning" }))) {
           await be.invoke("git_delete_branch", { cwd, name: b.name, force: true });
         } else {
           throw e;
@@ -136,7 +137,7 @@ function BranchPicker({
                     title="Удалить ветку"
                     onClick={(e) => {
                       e.stopPropagation();
-                      deleteBranch(b);
+                      void deleteBranch(b);
                     }}
                   >
                     <TrashIcon size={12} />
@@ -190,7 +191,7 @@ function RemoteActions({ cwd, summary, onChanged }: { cwd: string; summary: GitS
       if (typeof out === "string" && out.trim()) setNote(out.trim().split("\n").pop() ?? null);
       onChanged();
     } catch (e) {
-      window.alert(String(e));
+      void messageDialog(String(e), { kind: "error" });
     } finally {
       setBusy(null);
     }
@@ -396,7 +397,7 @@ function ChangesTab({
       await refresh();
       onChanged();
     } catch (e) {
-      window.alert(String(e));
+      void messageDialog(String(e), { kind: "error" });
     } finally {
       setBusy(false);
     }
@@ -407,8 +408,9 @@ function ChangesTab({
   const unstage = (paths: string[]) =>
     act(async () => (await getBackend()).invoke("git_unstage", { cwd, paths }));
   const discard = (paths: string[]) => {
-    if (!window.confirm(`Отменить изменения безвозвратно?\n${paths.join("\n")}`)) return;
-    void act(async () => (await getBackend()).invoke("git_discard", { cwd, paths }));
+    void confirmDialog(`Отменить изменения безвозвратно?\n${paths.join("\n")}`, { kind: "warning" }).then((ok) => {
+      if (ok) void act(async () => (await getBackend()).invoke("git_discard", { cwd, paths }));
+    });
   };
   const commit = () =>
     act(async () => {
@@ -640,9 +642,9 @@ function CheckpointsTab({ cwd, onComment, onChanged }: { cwd: string; onComment:
   const current = files.find((f) => f.newPath === selectedFile) ?? files[0] ?? null;
 
   const revertFile = async (file: DiffFile) => {
-    if (!window.confirm(`Откатить ${file.newPath} к состоянию базы?`)) return;
+    if (!(await confirmDialog(`Откатить ${file.newPath} к состоянию базы?`, { kind: "warning" }))) return;
     const be = await getBackend();
-    await be.invoke("git_checkout_file", { cwd, gitref: base === "HEAD" ? "HEAD" : base, path: file.newPath }).catch((e) => window.alert(String(e)));
+    await be.invoke("git_checkout_file", { cwd, gitref: base === "HEAD" ? "HEAD" : base, path: file.newPath }).catch((e) => void messageDialog(String(e), { kind: "error" }));
     await refresh();
     onChanged();
   };

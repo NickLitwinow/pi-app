@@ -1,3 +1,4 @@
+pub mod app_update;
 pub mod config;
 pub mod editor;
 pub mod gitops;
@@ -56,7 +57,7 @@ pub fn run() {
             sessions::list_sessions,
             sessions::list_sessions_for_cwd,
             sessions::fork_session,
-            sessions::read_session,
+            sessions::read_session_thread,
             sessions::delete_session,
             sessions::rename_session,
             sessions::search_sessions,
@@ -96,7 +97,11 @@ pub fn run() {
             gitops::git_file_diff,
             editor::open_in_editor,
             editor::open_external,
+            editor::reveal_in_finder,
             editor::read_file_base64,
+            app_update::check_app_update,
+            app_update::app_update_run,
+            app_update::relaunch_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

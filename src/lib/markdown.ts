@@ -95,7 +95,7 @@ export async function highlightCode(code: string, lang: string, dark: boolean): 
   try {
     const html = hl.codeToHtml(code, { lang: effLang, theme });
     // жёсткий кап кэша подсветки: highlight-HTML в разы больше исходника
-    if (hlCache.size > 150) hlCache.clear();
+    if (hlCache.size > 80) hlCache.clear();
     hlCache.set(key, html);
     return html;
   } catch {

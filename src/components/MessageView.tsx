@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import { getBackend } from "../lib/backend";
+import { messageDialog } from "../lib/dialog";
 import { stripAnsi } from "../lib/markdown";
 import { contentText } from "../lib/reducer";
 import type { ChatMessage, ContentBlock, ToolExec } from "../lib/types";
@@ -188,7 +189,7 @@ function UserMessageActions({
   const run = (fn: () => Promise<void>) => {
     setWorking(true);
     void fn()
-      .catch((e) => window.alert(String(e)))
+      .catch((e) => messageDialog(String(e), { kind: "error" }))
       .finally(() => setWorking(false));
   };
 

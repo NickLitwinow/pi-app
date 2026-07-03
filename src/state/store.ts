@@ -25,10 +25,11 @@ export interface SessionFlags {
   groups: SessionGroup[];
   groupOf: Record<string, string>;
   pinnedMessages: Record<string, PinnedMessage[]>;
+  hiddenProjects: string[];
 }
 
 export function emptySessionFlags(): SessionFlags {
-  return { pinned: [], archived: [], groups: [], groupOf: {}, pinnedMessages: {} };
+  return { pinned: [], archived: [], groups: [], groupOf: {}, pinnedMessages: {}, hiddenProjects: [] };
 }
 
 /** Нормализация flags из конфига (старые файлы без новых полей). */
@@ -46,10 +47,22 @@ export interface WorkspaceChat {
   models: ModelInfo[];
   commands: { name: string; description?: string }[];
   stats: SessionStats | null;
+  /** Отображаемая сейчас сессия (может отличаться от той, где работает агент). */
   sessionPath: string | null;
+  /** Сессия, в которой реально открыт живой процесс агента. */
+  liveSessionPath: string | null;
+  /** Агент сейчас стримит — трекается всегда, даже когда смотрим другую сессию. */
+  liveStreaming: boolean;
   checkpoints: Checkpoint[];
   stderrLog: string[];
   mode: AgentMode;
+}
+
+/** Просматриваем ли мы сессию, отличную от той, где занят живой агент.
+ *  null-путь = ещё не сохранённая новая сессия (агент только что стартовал) —
+ *  это НЕ browse, такой вид усыновляет live-файл. */
+export function isBrowsingAway(ws: WorkspaceChat): boolean {
+  return Boolean(ws.alive && ws.liveSessionPath && ws.sessionPath && ws.sessionPath !== ws.liveSessionPath);
 }
 
 export function emptyWorkspaceChat(): WorkspaceChat {
@@ -62,6 +75,8 @@ export function emptyWorkspaceChat(): WorkspaceChat {
     commands: [],
     stats: null,
     sessionPath: null,
+    liveSessionPath: null,
+    liveStreaming: false,
     checkpoints: [],
     stderrLog: [],
     mode: "ask",
@@ -115,6 +130,12 @@ export function insertIntoComposer(text: string): void {
   useStore.setState({ pendingInsert: text });
 }
 
+/** Открыть URL в системном браузере (не в webview приложения). */
+export async function openExternalUrl(url: string): Promise<void> {
+  const be = await getBackend();
+  await be.invoke("open_external", { url }).catch(() => {});
+}
+
 // ---------- module-level plumbing ----------
 
 const agentToCwd = new Map<string, string>();
@@ -166,18 +187,39 @@ function flushAgentEvents() {
   let newDialog = false;
   for (const [cwd, events] of eventQueue) {
     const ws = nextChats[cwd] ?? emptyWorkspaceChat();
-    let chat = { ...ws.chat };
+    // Гейт: когда пользователь смотрит другую сессию (browse), богатые события
+    // живого агента НЕ применяем к отображаемому чату — иначе фоновая сессия
+    // затирает просматриваемую. Но lifecycle (стрим on/off) трекаем всегда,
+    // чтобы сайдбар показывал занятость фонового агента.
+    const applyToView = !isBrowsingAway(ws);
+    let chat = ws.chat;
+    let applied = false;
+    let liveStreaming = ws.liveStreaming;
     for (const ev of events) {
-      chat = applyAgentEvent(chat, ev);
       const t = ev.type as string;
-      // agent_start: сразу узнаём sessionFile новой сессии (live-точка в сайдбаре);
-      // *_end: свежие stats и путь после хода/компакции
-      if (t === "agent_start" || t === "agent_end" || t === "turn_end" || t === "compaction_end") {
+      if (t === "agent_start") liveStreaming = true;
+      else if (t === "agent_end") liveStreaming = false;
+      // Разрешительные диалоги/уведомления применяем всегда — иначе фоновый
+      // агент зависнет в ожидании ответа, пока смотрим другую сессию.
+      const isActionable = t === "extension_ui_request" || t === "error";
+      if (applyToView || isActionable) {
+        if (!applied) {
+          chat = { ...ws.chat };
+          applied = true;
+        }
+        chat = applyAgentEvent(chat, ev);
+        if (applyToView && (t === "agent_start" || t === "agent_end" || t === "turn_end" || t === "compaction_end")) {
+          if (!finishedRuns.includes(cwd)) finishedRuns.push(cwd);
+        }
+        if (t === "extension_ui_request" && DIALOG_METHODS.has(String(ev.method))) newDialog = true;
+      } else if (t === "agent_end" || t === "turn_end" || t === "compaction_end") {
+        // фоновая сессия завершила ход — обновим её стату (без изменения вида)
         if (!finishedRuns.includes(cwd)) finishedRuns.push(cwd);
       }
-      if (t === "extension_ui_request" && DIALOG_METHODS.has(String(ev.method))) newDialog = true;
     }
-    nextChats[cwd] = { ...ws, chat };
+    if (applied || liveStreaming !== ws.liveStreaming) {
+      nextChats[cwd] = { ...ws, chat, liveStreaming };
+    }
   }
   eventQueue.clear();
   // новый диалоговый запрос разворачивает свёрнутую панель разрешений
@@ -237,7 +279,7 @@ export async function initApp(): Promise<void> {
     const reason = String(payload.reason ?? "");
     updateChat(cwd, (ws) => {
       if (ws.agentId !== agentId) return ws;
-      const next = { ...ws, agentId: null, alive: false };
+      const next = { ...ws, agentId: null, alive: false, liveStreaming: false, liveSessionPath: null };
       // о явном kill не уведомляем; о простое/вытеснении/падении — да
       if (reason !== "killed") {
         const text =
@@ -323,11 +365,13 @@ export async function ensureAgent(cwd: string, sessionPath?: string | null): Pro
       await be.invoke("kill_agent", { agentId: ws.agentId }).catch(() => {});
       agentToCwd.delete(ws.agentId);
     }
+    const spawnSession = sessionPath ?? ws.sessionPath ?? null;
     const agentId = await be.invoke<string>("spawn_agent", {
-      opts: { cwd, sessionPath: sessionPath ?? ws.sessionPath ?? null, extraArgs: [] },
+      opts: { cwd, sessionPath: spawnSession, extraArgs: [] },
     });
     agentToCwd.set(agentId, cwd);
-    updateChat(cwd, (w) => ({ ...w, agentId, alive: true }));
+    // агент открыт в spawnSession — это и есть live-сессия (для новой узнаем из get_state)
+    updateChat(cwd, (w) => ({ ...w, agentId, alive: true, liveSessionPath: spawnSession ?? w.sessionPath }));
     await refreshAgentMeta(cwd);
     return agentId;
   })();
@@ -373,12 +417,20 @@ export async function rpcSend(cwd: string, command: Record<string, unknown>): Pr
 async function refreshAgentMeta(cwd: string): Promise<void> {
   try {
     const state = (await rpcRequest(cwd, { type: "get_state" }, 10000)) as AgentState;
-    const sessionPath = (state.sessionPath ?? state.sessionFile ?? null) as string | null;
-    updateChat(cwd, (ws) => ({ ...ws, agentState: state, sessionPath: sessionPath ?? ws.sessionPath }));
+    const live = (state.sessionFile ?? state.sessionPath ?? null) as string | null;
+    updateChat(cwd, (ws) => ({
+      ...ws,
+      agentState: state,
+      liveSessionPath: live ?? ws.liveSessionPath,
+      // отображаемый путь двигаем к live только если не смотрим другую сессию
+      sessionPath: isBrowsingAway(ws) ? ws.sessionPath : live ?? ws.sessionPath,
+    }));
   } catch {
     /* agent may be busy or dead */
   }
-  await refreshStats(cwd);
+  // статистику фоновой (не отображаемой) сессии не тянем — она про live-агента,
+  // но покажется неверно для просматриваемой; обновляем только когда вид = live
+  if (!isBrowsingAway(getChat(cwd))) await refreshStats(cwd);
 }
 
 /** Обновить статистику сессии (токены/стоимость/заполнение контекста). */
@@ -424,6 +476,20 @@ export async function loadModelsAndCommands(cwd: string): Promise<void> {
 export async function sendPrompt(cwd: string, text: string, images?: { data: string; mimeType: string }[]): Promise<void> {
   const trimmed = text.trim();
   if (!trimmed) return;
+
+  // отправка в просматриваемую сессию, отличную от той, где занят агент
+  const before = getChat(cwd);
+  if (before.alive && before.agentId && isBrowsingAway(before)) {
+    if (before.liveStreaming) {
+      throw new Error(
+        "Агент занят в другой сессии этой папки. Дождитесь завершения или нажмите «Вернуться к активной».",
+      );
+    }
+    // агент простаивает — переносим его в открытую сессию, затем отправляем
+    await rpcRequest(cwd, { type: "switch_session", sessionPath: before.sessionPath! }, 15000).catch(() => {});
+    updateChat(cwd, (w) => ({ ...w, liveSessionPath: before.sessionPath }));
+  }
+
   await ensureAgent(cwd);
   const ws = getChat(cwd);
   const streaming = ws.chat.isStreaming;
@@ -467,13 +533,29 @@ export async function compactContext(cwd: string): Promise<void> {
 
 export async function newSession(cwd: string): Promise<void> {
   const ws = getChat(cwd);
+  useStore.setState({ currentCwd: cwd, view: "chat" });
+  // нельзя увести занятого агента с текущей задачи
+  if (ws.alive && ws.agentId && ws.liveStreaming) {
+    updateChat(cwd, (w) => ({
+      ...w,
+      chat: {
+        ...w.chat,
+        toasts: [
+          ...w.chat.toasts,
+          { id: Date.now(), kind: "warning" as const, text: "Агент занят — дождитесь завершения, чтобы начать новую сессию" },
+        ].slice(-5),
+        seq: w.chat.seq + 1,
+      },
+    }));
+    return;
+  }
   discardQueuedEvents(cwd);
   if (ws.alive && ws.agentId) {
     await rpcRequest(cwd, { type: "new_session" }).catch(() => {});
-    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, checkpoints: [], stats: null }));
+    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, checkpoints: [], stats: null }));
     await refreshAgentMeta(cwd);
   } else {
-    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, checkpoints: [], stats: null }));
+    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, checkpoints: [], stats: null }));
     await ensureAgent(cwd, null);
   }
   void loadModelsAndCommands(cwd);
@@ -494,6 +576,18 @@ export function dismissToast(cwd: string, toastId: number): void {
   }));
 }
 
+/** Показать тост в чате workspace (напр. пояснение, почему нельзя отправить). */
+export function notifyChat(cwd: string, kind: "info" | "warning" | "error", text: string): void {
+  updateChat(cwd, (w) => ({
+    ...w,
+    chat: {
+      ...w.chat,
+      toasts: [...w.chat.toasts, { id: Date.now() + Math.random(), kind, text }].slice(-5),
+      seq: w.chat.seq + 1,
+    },
+  }));
+}
+
 // ---------- sessions / workspaces ----------
 
 export async function refreshProjects(): Promise<void> {
@@ -510,10 +604,47 @@ export async function refreshSessions(cwd: string): Promise<void> {
   useStore.setState({ sessions: { ...useStore.getState().sessions, [cwd]: sessions } });
 }
 
+/**
+ * Освободить память фоновых workspace: у не-текущих БЕЗ живого агента
+ * сбрасываем тяжёлую историю (items/toolExecs/streaming/stderr) до лёгкого
+ * состояния. Полная история вернётся из файла при повторном открытии сессии.
+ * Живые агенты (в т.ч. фоновые стримящие) не трогаем.
+ */
+function evictBackgroundWorkspaces(keepCwd: string): void {
+  const s = useStore.getState();
+  let mutated = false;
+  const chats = { ...s.chats };
+  for (const [cwd, ws] of Object.entries(s.chats)) {
+    if (cwd === keepCwd || ws.alive) continue;
+    if (ws.chat.items.length === 0 && ws.stderrLog.length === 0 && !ws.stats) continue; // уже лёгкий
+    chats[cwd] = {
+      ...ws,
+      chat: emptyChatState(),
+      stats: null,
+      stderrLog: [],
+      // sessionPath сохраняем — при возврате перечитаем историю из файла
+    };
+    mutated = true;
+  }
+  if (mutated) useStore.setState({ chats });
+}
+
 export function selectWorkspace(cwd: string): void {
+  const prev = useStore.getState().currentCwd;
   useStore.setState({ currentCwd: cwd });
+  if (prev && prev !== cwd) evictBackgroundWorkspaces(cwd);
   void refreshSessions(cwd);
   void loadPermissionMode(cwd);
+  // если историю этого workspace ранее выгрузили — вернуть её из файла
+  const ws = getChat(cwd);
+  if (ws.sessionPath && ws.chat.items.length === 0 && !ws.liveStreaming) {
+    void loadSessionFromFile(ws.sessionPath).then((chat) => {
+      const cur = getChat(cwd);
+      if (cur.sessionPath === ws.sessionPath && cur.chat.items.length === 0) {
+        updateChat(cwd, (w) => ({ ...w, chat }));
+      }
+    });
+  }
   void (async () => {
     const be = await getBackend();
     await be.invoke("migrate_permission_configs", { cwd }).catch(() => {});
@@ -554,7 +685,7 @@ export async function setAgentMode(cwd: string, mode: AgentMode): Promise<void> 
   if (ws.alive && ws.agentId) {
     await be.invoke("kill_agent", { agentId: ws.agentId }).catch(() => {});
     agentToCwd.delete(ws.agentId);
-    updateChat(cwd, (w) => ({ ...w, agentId: null, alive: false }));
+    updateChat(cwd, (w) => ({ ...w, agentId: null, alive: false, liveStreaming: false, liveSessionPath: null }));
     await ensureAgent(cwd, ws.sessionPath);
     void loadModelsAndCommands(cwd);
   }
@@ -562,49 +693,132 @@ export async function setAgentMode(cwd: string, mode: AgentMode): Promise<void> 
 
 export function addWorkspace(cwd: string): void {
   const s = useStore.getState();
+  // повторное добавление ранее скрытой папки — снова показываем её
+  const flags = s.sessionFlags;
+  if (flags.hiddenProjects.includes(cwd)) {
+    void persistFlags({ ...flags, hiddenProjects: flags.hiddenProjects.filter((p) => p !== cwd) });
+  }
   if ([...s.projects, ...s.extraWorkspaces].some((p) => p.cwd === cwd)) {
-    useStore.setState({ currentCwd: cwd });
+    useStore.setState({ currentCwd: cwd, view: "chat" });
     return;
   }
   const name = cwd.split("/").filter(Boolean).pop() ?? cwd;
   const ws: ProjectInfo = { dir: "(new)", cwd, name, sessionCount: 0, lastModifiedMs: Date.now() };
-  useStore.setState({ extraWorkspaces: [...s.extraWorkspaces, ws], currentCwd: cwd });
+  useStore.setState({ extraWorkspaces: [...s.extraWorkspaces, ws], currentCwd: cwd, view: "chat" });
+}
+
+/** Убрать проект из сайдбара: гасим его агента, чистим состояние чата,
+ *  для найденных проектов запоминаем как скрытый. Файлы сессий не трогаем. */
+export async function removeWorkspace(cwd: string): Promise<void> {
+  const s = useStore.getState();
+  // остановить живого агента этого workspace
+  const ws = s.chats[cwd];
+  if (ws?.agentId) {
+    const be = await getBackend();
+    await be.invoke("kill_agent", { agentId: ws.agentId }).catch(() => {});
+    agentToCwd.delete(ws.agentId);
+  }
+  discardQueuedEvents(cwd);
+
+  const chats = { ...s.chats };
+  delete chats[cwd];
+  const sessions = { ...s.sessions };
+  delete sessions[cwd];
+  const extraWorkspaces = s.extraWorkspaces.filter((p) => p.cwd !== cwd);
+  const isDiscovered = s.projects.some((p) => p.cwd === cwd);
+
+  // следующий доступный workspace становится активным
+  const remaining = [...extraWorkspaces, ...s.projects.filter((p) => p.cwd !== cwd)];
+  const nextCwd = s.currentCwd === cwd ? (remaining[0]?.cwd ?? null) : s.currentCwd;
+
+  useStore.setState({ chats, sessions, extraWorkspaces, currentCwd: nextCwd });
+
+  if (isDiscovered) {
+    const flags = useStore.getState().sessionFlags;
+    if (!flags.hiddenProjects.includes(cwd)) {
+      await persistFlags({ ...flags, hiddenProjects: [...flags.hiddenProjects, cwd] });
+    }
+  }
+  if (nextCwd) void refreshSessions(nextCwd);
 }
 
 // ---------- session management (sidebar) ----------
 
-/** Открыть сессию в чате: живой агент переключается через switch_session,
- *  мёртвый — просто читаем файл; агент поднимется лениво при первом сообщении. */
-export async function openSession(cwd: string, meta: SessionMeta): Promise<void> {
+/** Прочитать полную историю активной ветки сессии из файла (быстрый путь). */
+async function loadSessionFromFile(path: string): Promise<ChatState> {
   const be = await getBackend();
+  const entries = await be
+    .invoke<Record<string, unknown>[]>("read_session_thread", { path })
+    .catch(() => [] as Record<string, unknown>[]);
+  return entriesToChatState(entries);
+}
+
+/**
+ * Открыть сессию в чате. Всегда сначала мгновенно рендерим полную историю из
+ * файла (активная ветка), затем аккуратно синхронизируемся с живым агентом:
+ *  - вернулись в live-сессию → просто продолжаем показывать её (события снова
+ *    применяются к виду);
+ *  - агент простаивает → переносим его в открытую сессию (switch_session);
+ *  - агент занят другой сессией → показываем открытую read-only (browse),
+ *    живой процесс не трогаем, он продолжает работу в фоне.
+ */
+export async function openSession(cwd: string, meta: SessionMeta): Promise<void> {
+  const prev = useStore.getState().currentCwd;
   useStore.setState({ currentCwd: cwd, view: "chat" });
-
+  if (prev && prev !== cwd) evictBackgroundWorkspaces(cwd);
   const ws = getChat(cwd);
-  discardQueuedEvents(cwd);
-  updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: meta.path, checkpoints: [], stats: null }));
 
-  if (ws.alive && ws.agentId) {
-    try {
-      await rpcRequest(cwd, { type: "switch_session", sessionPath: meta.path }, 15000);
-      const data = await rpcRequest(cwd, { type: "get_messages" }, 20000);
-      const messages = (data.messages ?? data) as { role: string; content: unknown }[];
-      if (Array.isArray(messages)) {
-        const entries = messages.map((m) => ({ type: "message", message: m }));
-        updateChat(cwd, (w) => ({ ...w, chat: entriesToChatState(entries as Record<string, unknown>[]), sessionPath: meta.path }));
-      }
-      await refreshAgentMeta(cwd);
-      return;
-    } catch {
-      /* агент занят/умер — падаем на файловый путь ниже */
-    }
+  // 1) мгновенный рендер полной истории из файла
+  const fileChat = await loadSessionFromFile(meta.path);
+  // если уходим в browse от занятого агента — переносим его pending-диалоги
+  // (разрешения) в новый вид, чтобы на них можно было ответить, не потеряв
+  const willBrowse =
+    ws.alive && Boolean(ws.liveSessionPath) && ws.liveSessionPath !== meta.path && ws.liveStreaming;
+  if (willBrowse && ws.chat.uiRequests.length > 0) {
+    fileChat.uiRequests = ws.chat.uiRequests;
+  }
+  updateChat(cwd, (w) => ({ ...w, chat: fileChat, sessionPath: meta.path, checkpoints: [], stats: null }));
+
+  if (!ws.alive || !ws.agentId) {
+    // живого агента нет — файлового вида достаточно; агент поднимется при отправке
+    return;
   }
 
-  const entries = await be.invoke<Record<string, unknown>[]>("read_session", { path: meta.path }).catch(() => []);
-  updateChat(cwd, (w) => ({
-    ...w,
-    chat: entriesToChatState(entries as Record<string, unknown>[]),
-    sessionPath: meta.path,
-  }));
+  if (ws.liveSessionPath === meta.path) {
+    // вернулись в live-сессию: события снова применяются к виду; освежим мету
+    void refreshAgentMeta(cwd);
+    return;
+  }
+
+  if (!ws.liveStreaming) {
+    // агент простаивает — безопасно перенести его в открытую сессию
+    try {
+      await rpcRequest(cwd, { type: "switch_session", sessionPath: meta.path }, 15000);
+      updateChat(cwd, (w) => ({ ...w, liveSessionPath: meta.path }));
+      // перечитаем из файла после switch — на случай, если pi что-то дописал
+      const after = await loadSessionFromFile(meta.path);
+      updateChat(cwd, (w) => (w.sessionPath === meta.path ? { ...w, chat: after } : w));
+      void refreshAgentMeta(cwd);
+    } catch {
+      /* switch не удался — остаёмся на файловом виде */
+    }
+    return;
+  }
+
+  // агент занят в другой сессии — оставляем его работать, показываем read-only.
+  // (browse-режим: isBrowsingAway(ws) === true, события агента не трогают вид)
+}
+
+/** Вернуться к сессии, в которой сейчас работает живой агент. */
+export async function returnToLiveSession(cwd: string): Promise<void> {
+  const ws = getChat(cwd);
+  if (!ws.liveSessionPath) return;
+  const live = ws.liveSessionPath;
+  const pendingUi = ws.chat.uiRequests; // диалоги живого агента переносим
+  const fileChat = await loadSessionFromFile(live);
+  if (pendingUi.length > 0) fileChat.uiRequests = pendingUi;
+  updateChat(cwd, (w) => ({ ...w, chat: fileChat, sessionPath: live }));
+  void refreshAgentMeta(cwd);
 }
 
 export async function deleteSessionAction(cwd: string, path: string): Promise<void> {
@@ -617,7 +831,7 @@ export async function deleteSessionAction(cwd: string, path: string): Promise<vo
       agentToCwd.delete(ws.agentId);
     }
     discardQueuedEvents(cwd);
-    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, agentId: null, alive: false, checkpoints: [], stats: null }));
+    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, liveStreaming: false, agentId: null, alive: false, checkpoints: [], stats: null }));
   }
   await be.invoke("delete_session", { path });
   // подчистить флаги
@@ -729,6 +943,8 @@ function pickForkEntry(
  *  Текст сообщения попадает в composer для правки и повторной отправки. */
 export async function rewindToMessage(cwd: string, userIndex: number, text: string): Promise<void> {
   const ws = getChat(cwd);
+  if (ws.liveStreaming) throw new Error("Агент занят — дождитесь завершения перед откатом");
+  if (isBrowsingAway(ws)) throw new Error("Сначала вернитесь к активной сессии");
   await ensureAgent(cwd, ws.sessionPath);
   const data = await rpcRequest(cwd, { type: "get_fork_messages" }, 15000);
   const msgs = (data.messages ?? []) as { entryId: string; text: string }[];
@@ -739,19 +955,12 @@ export async function rewindToMessage(cwd: string, userIndex: number, text: stri
     cancelled?: boolean;
   };
   if (res.cancelled) return;
-  const md = await rpcRequest(cwd, { type: "get_messages" }, 20000);
-  const messages = (md.messages ?? md) as { role: string; content: unknown }[];
   discardQueuedEvents(cwd);
-  updateChat(cwd, (w) => {
-    const chat = entriesToChatState(
-      (Array.isArray(messages) ? messages : []).map((m) => ({ type: "message", message: m })) as Record<
-        string,
-        unknown
-      >[],
-    );
-    chat.editorPrefill = res.text ?? target.text;
-    return { ...w, chat };
-  });
+  // полная история новой активной ветки — из файла живого агента
+  const live = getChat(cwd).liveSessionPath ?? ws.sessionPath;
+  const chat = live ? await loadSessionFromFile(live) : emptyChatState();
+  chat.editorPrefill = res.text ?? target.text;
+  updateChat(cwd, (w) => ({ ...w, chat }));
   await refreshAgentMeta(cwd);
 }
 
@@ -760,6 +969,8 @@ export async function rewindToMessage(cwd: string, userIndex: number, text: stri
 export async function forkFromMessage(cwd: string, userIndex: number, text: string): Promise<void> {
   const ws = getChat(cwd);
   if (!ws.sessionPath) throw new Error("Сессия ещё не сохранена на диск");
+  if (ws.liveStreaming) throw new Error("Агент занят — дождитесь завершения перед форком");
+  if (isBrowsingAway(ws)) throw new Error("Сначала вернитесь к активной сессии");
   await ensureAgent(cwd, ws.sessionPath);
   const data = await rpcRequest(cwd, { type: "get_fork_messages" }, 15000);
   const msgs = (data.messages ?? []) as { entryId: string; text: string }[];

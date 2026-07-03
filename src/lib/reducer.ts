@@ -51,11 +51,35 @@ function pushToast(chat: ChatState, kind: "info" | "error" | "success" | "warnin
 
 /** Кап накопленного вывода инструмента: голова + хвост, середина заменяется
  *  маркером. Экономит память на мегабайтных выводах bash/read. */
-const TOOL_OUTPUT_CAP = 120_000;
+const TOOL_OUTPUT_CAP = 60_000;
 function capOutput(s: string): string {
   if (s.length <= TOOL_OUTPUT_CAP) return s;
   const half = TOOL_OUTPUT_CAP / 2;
   return `${s.slice(0, half)}\n… [вывод усечён: ${s.length.toLocaleString("ru-RU")} символов] …\n${s.slice(-half)}`;
+}
+
+/** Сколько завершённых tool-выводов держим в памяти целиком. При длинной задаче
+ *  (тысячи вызовов) старые «сдуваются» до маркера — полный вывод есть в файле
+ *  сессии и вернётся при переоткрытии. Ограничивает рост RAM, не теряя данные. */
+const MAX_LIVE_TOOL_OUTPUTS = 300;
+const DROPPED_MARKER = "[вывод выгружен для экономии памяти — переоткройте сессию, чтобы загрузить из файла]";
+
+function pruneToolExecs(chat: ChatState) {
+  const keys = Object.keys(chat.toolExecs);
+  if (keys.length <= MAX_LIVE_TOOL_OUTPUTS) return;
+  // объектные ключи хранят порядок вставки — старые идут первыми
+  const dropCount = keys.length - MAX_LIVE_TOOL_OUTPUTS;
+  let mutated = false;
+  const next = { ...chat.toolExecs };
+  for (let i = 0; i < dropCount; i++) {
+    const k = keys[i];
+    const e = next[k];
+    if (e && e.done && e.output && e.output !== DROPPED_MARKER && e.output.length > 200) {
+      next[k] = { ...e, output: DROPPED_MARKER };
+      mutated = true;
+    }
+  }
+  if (mutated) chat.toolExecs = next;
 }
 
 function upsertExec(chat: ChatState, callId: string, patch: Partial<ToolExec>) {
@@ -69,6 +93,7 @@ function upsertExec(chat: ChatState, callId: string, patch: Partial<ToolExec>) {
   };
   if (typeof patch.output === "string") patch.output = capOutput(patch.output);
   chat.toolExecs = { ...chat.toolExecs, [callId]: { ...prev, ...patch } };
+  if (patch.done) pruneToolExecs(chat);
 }
 
 function resultText(v: unknown): string {
