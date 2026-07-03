@@ -1,10 +1,23 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { getBackend } from "../lib/backend";
 import { stripAnsi } from "../lib/markdown";
 import { contentText } from "../lib/reducer";
 import type { ChatMessage, ContentBlock, ToolExec } from "../lib/types";
-import { useStore } from "../state/store";
-import { CheckIcon, ChevronIcon, CopyIcon, ErrorIcon, ExternalIcon, InfoIcon, SuccessIcon, WarnIcon } from "./icons";
+import { forkFromMessage, msgPinId, rewindToMessage, toggleMessagePin, useStore } from "../state/store";
+import {
+  CheckIcon,
+  ChevronIcon,
+  CopyIcon,
+  ErrorIcon,
+  ExternalIcon,
+  ForkIcon,
+  InfoIcon,
+  PinIcon,
+  PinOffIcon,
+  RewindIcon,
+  SuccessIcon,
+  WarnIcon,
+} from "./icons";
 import { Markdown } from "./Markdown";
 
 // ---------- thinking ----------
@@ -141,7 +154,7 @@ function CopyMessageButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   return (
     <button
-      className="copy-btn"
+      className="tool-btn"
       title="Скопировать ответ"
       onClick={() => {
         void navigator.clipboard.writeText(text).then(() => {
@@ -155,20 +168,104 @@ function CopyMessageButton({ text }: { text: string }) {
   );
 }
 
+// ---------- per-message actions (Copy / Rewind / Fork / Pin) ----------
+
+function UserMessageActions({
+  cwd,
+  msg,
+  userIndex,
+  busy,
+}: {
+  cwd: string;
+  msg: ChatMessage;
+  userIndex: number;
+  busy: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  const [working, setWorking] = useState(false);
+  const text = contentText(msg.content);
+
+  const run = (fn: () => Promise<void>) => {
+    setWorking(true);
+    void fn()
+      .catch((e) => window.alert(String(e)))
+      .finally(() => setWorking(false));
+  };
+
+  return (
+    <div className="msg-actions">
+      <button
+        title="Скопировать сообщение"
+        onClick={() => {
+          void navigator.clipboard.writeText(text).then(() => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          });
+        }}
+      >
+        {copied ? <CheckIcon size={12} /> : <CopyIcon size={12} />}
+      </button>
+      <button
+        title="Откатить сюда: сессия вернётся к этому сообщению (rewind)"
+        disabled={busy || working}
+        onClick={() => run(() => rewindToMessage(cwd, userIndex, text))}
+      >
+        <RewindIcon size={12} />
+      </button>
+      <button
+        title="Форк отсюда: новая сессия с историей до этого сообщения"
+        disabled={busy || working}
+        onClick={() => run(() => forkFromMessage(cwd, userIndex, text))}
+      >
+        <ForkIcon size={12} />
+      </button>
+    </div>
+  );
+}
+
+function PinMessageButton({ cwd, msg }: { cwd: string; msg: ChatMessage }) {
+  const sessionPath = useStore((s) => s.chats[cwd]?.sessionPath ?? null);
+  const pins = useStore((s) => (sessionPath ? s.sessionFlags.pinnedMessages[sessionPath] : undefined));
+  const id = useMemo(() => msgPinId(msg), [msg]);
+  if (!sessionPath) return null;
+  const pinned = pins?.some((p) => p.id === id) ?? false;
+  return (
+    <button
+      className="tool-btn"
+      title={pinned ? "Открепить сообщение" : "Закрепить сообщение (виджет слева сверху)"}
+      style={pinned ? { color: "var(--accent)" } : undefined}
+      onClick={() => void toggleMessagePin(cwd, msg)}
+    >
+      {pinned ? <PinOffIcon size={12} /> : <PinIcon size={12} />}
+    </button>
+  );
+}
+
 export const MessageView = memo(function MessageView({
   msg,
   execs,
   streaming,
   cwd,
+  userIndex,
+  busy,
 }: {
   msg: ChatMessage;
   execs: Record<string, ToolExec>;
   streaming?: boolean;
   cwd?: string;
+  /** Порядковый номер среди пользовательских сообщений (для rewind/fork). */
+  userIndex?: number;
+  /** Агент занят — деструктивные действия недоступны. */
+  busy?: boolean;
 }) {
+  const pinId = useMemo(() => msgPinId(msg), [msg]);
+
   if (msg.role === "user") {
     return (
-      <div className="msg user">
+      <div className="msg user" data-pin={pinId}>
+        {cwd != null && userIndex != null && (
+          <UserMessageActions cwd={cwd} msg={msg} userIndex={userIndex} busy={busy ?? false} />
+        )}
         <div className="bubble">
           <Markdown source={contentText(msg.content)} final />
         </div>
@@ -183,8 +280,13 @@ export const MessageView = memo(function MessageView({
   const fullText = contentText(msg.content);
 
   return (
-    <div className="msg assistant">
-      {!streaming && fullText.trim() && <CopyMessageButton text={stripAnsi(fullText)} />}
+    <div className="msg assistant" data-pin={pinId}>
+      {!streaming && fullText.trim() && (
+        <div className="msg-tools">
+          {cwd != null && <PinMessageButton cwd={cwd} msg={msg} />}
+          <CopyMessageButton text={stripAnsi(fullText)} />
+        </div>
+      )}
       {blocks.map((b, i) => {
         if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim()) {
           return <ThinkingBlock key={i} text={b.thinking} streaming={streaming && i === blocks.length - 1} />;

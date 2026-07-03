@@ -1,20 +1,36 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import { getBackend } from "../lib/backend";
-import type { SearchHit, SessionMeta } from "../lib/types";
+import type { SearchHit, SessionGroup, SessionMeta } from "../lib/types";
 import {
   addWorkspace,
+  createGroup,
+  deleteGroup,
   deleteSessionAction,
+  forkSessionAction,
+  moveSessionToGroup,
   newSession,
   openSession,
   refreshSessions,
+  renameGroup,
   renameSessionAction,
   selectWorkspace,
   toggleArchived,
   togglePinned,
+  updateAppConfig,
   useStore,
   type View,
 } from "../state/store";
-import { ChartIcon, ChatIcon, ChevronIcon, FolderIcon, GearIcon, PlusIcon, ReviewIcon } from "./icons";
+import {
+  ChartIcon,
+  ChatIcon,
+  ChevronIcon,
+  FolderIcon,
+  GearIcon,
+  GroupIcon,
+  PlusIcon,
+  ReviewIcon,
+  SidebarIcon,
+} from "./icons";
 
 const NAV: { view: View; label: string; icon: (p: { size?: number }) => ReactElement }[] = [
   { view: "chat", label: "Чат", icon: ChatIcon },
@@ -57,6 +73,8 @@ function SessionRow({
   live,
   pinned,
   archived,
+  groups,
+  groupId,
 }: {
   cwd: string;
   s: SessionMeta;
@@ -64,14 +82,19 @@ function SessionRow({
   live: boolean;
   pinned: boolean;
   archived: boolean;
+  groups: SessionGroup[];
+  groupId: string | null;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [menuView, setMenuView] = useState<"main" | "group">("main");
+  const [newGroupName, setNewGroupName] = useState("");
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState("");
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!menuOpen) return;
+    setMenuView("main");
     const close = (e: MouseEvent) => {
       if (!menuRef.current?.contains(e.target as Node)) setMenuOpen(false);
     };
@@ -103,6 +126,15 @@ function SessionRow({
     );
   }
 
+  const submitNewGroup = async () => {
+    const name = newGroupName.trim();
+    if (!name) return;
+    const id = await createGroup(cwd, name);
+    await moveSessionToGroup(s.path, id);
+    setNewGroupName("");
+    setMenuOpen(false);
+  };
+
   return (
     <div
       className={`sess-row ${active ? "active" : ""}`}
@@ -127,44 +159,170 @@ function SessionRow({
       </button>
       {menuOpen && (
         <div className="menu" ref={menuRef} onClick={(e) => e.stopPropagation()}>
-          <button
-            onClick={() => {
-              setMenuOpen(false);
-              void togglePinned(s.path);
-            }}
-          >
-            {pinned ? "Открепить" : "Закрепить"}
-          </button>
-          <button
-            onClick={() => {
-              setMenuOpen(false);
-              setDraft(s.name ?? "");
-              setRenaming(true);
-            }}
-          >
-            Переименовать
-          </button>
-          <button
-            onClick={() => {
-              setMenuOpen(false);
-              void toggleArchived(s.path);
-            }}
-          >
-            {archived ? "Разархивировать" : "Архивировать"}
-          </button>
-          <button
-            className="danger"
-            onClick={() => {
-              setMenuOpen(false);
-              if (window.confirm(`Удалить сессию «${sessionTitle(s)}» безвозвратно?`)) {
-                void deleteSessionAction(cwd, s.path);
-              }
-            }}
-          >
-            Удалить
-          </button>
+          {menuView === "main" ? (
+            <>
+              <button
+                onClick={() => {
+                  setMenuOpen(false);
+                  void togglePinned(s.path);
+                }}
+              >
+                {pinned ? "Открепить" : "Закрепить"}
+              </button>
+              <button
+                onClick={() => {
+                  setMenuOpen(false);
+                  setDraft(s.name ?? "");
+                  setRenaming(true);
+                }}
+              >
+                Переименовать
+              </button>
+              <button
+                onClick={() => {
+                  setMenuOpen(false);
+                  void forkSessionAction(cwd, s).catch((e) => window.alert(String(e)));
+                }}
+              >
+                Форк сессии
+              </button>
+              <button onClick={() => setMenuView("group")}>В группу… {groupId ? "›" : "›"}</button>
+              <button
+                onClick={() => {
+                  setMenuOpen(false);
+                  void toggleArchived(s.path);
+                }}
+              >
+                {archived ? "Разархивировать" : "Архивировать"}
+              </button>
+              <button
+                className="danger"
+                onClick={() => {
+                  setMenuOpen(false);
+                  if (window.confirm(`Удалить сессию «${sessionTitle(s)}» безвозвратно?`)) {
+                    void deleteSessionAction(cwd, s.path);
+                  }
+                }}
+              >
+                Удалить
+              </button>
+            </>
+          ) : (
+            <>
+              <button onClick={() => setMenuView("main")}>‹ Назад</button>
+              {groups.map((g) => (
+                <button
+                  key={g.id}
+                  onClick={() => {
+                    setMenuOpen(false);
+                    void moveSessionToGroup(s.path, g.id);
+                  }}
+                >
+                  {groupId === g.id ? "✓ " : ""}
+                  {g.name}
+                </button>
+              ))}
+              {groupId && (
+                <button
+                  onClick={() => {
+                    setMenuOpen(false);
+                    void moveSessionToGroup(s.path, null);
+                  }}
+                >
+                  Убрать из группы
+                </button>
+              )}
+              <div className="menu-input">
+                <input
+                  autoFocus={groups.length === 0}
+                  placeholder="Новая группа…"
+                  value={newGroupName}
+                  onChange={(e) => setNewGroupName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void submitNewGroup();
+                  }}
+                />
+                <button disabled={!newGroupName.trim()} onClick={() => void submitNewGroup()}>
+                  +
+                </button>
+              </div>
+            </>
+          )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------- group section ----------
+
+function GroupSection({
+  cwd,
+  group,
+  sessions,
+  render,
+}: {
+  cwd: string;
+  group: SessionGroup;
+  sessions: SessionMeta[];
+  render: (s: SessionMeta) => ReactElement;
+}) {
+  const [open, setOpen] = useState(true);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  void cwd;
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = (e: MouseEvent) => {
+      if (!menuRef.current?.contains(e.target as Node)) setMenuOpen(false);
+    };
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [menuOpen]);
+
+  return (
+    <div className="sess-group">
+      <div className="sess-row group-head" onClick={() => setOpen(!open)}>
+        <ChevronIcon open={open} size={11} />
+        <GroupIcon size={12} />
+        <span className="sess-title">{group.name}</span>
+        <span className="sess-when">{sessions.length}</span>
+        <button
+          className="sess-more"
+          onClick={(e) => {
+            e.stopPropagation();
+            setMenuOpen(!menuOpen);
+          }}
+        >
+          ⋯
+        </button>
+        {menuOpen && (
+          <div className="menu" ref={menuRef} onClick={(e) => e.stopPropagation()}>
+            <button
+              onClick={() => {
+                setMenuOpen(false);
+                const name = window.prompt("Название группы:", group.name);
+                if (name?.trim()) void renameGroup(group.id, name);
+              }}
+            >
+              Переименовать группу
+            </button>
+            <button
+              className="danger"
+              onClick={() => {
+                setMenuOpen(false);
+                if (window.confirm(`Удалить группу «${group.name}»? Сессии останутся в проекте.`)) {
+                  void deleteGroup(group.id);
+                }
+              }}
+            >
+              Удалить группу
+            </button>
+          </div>
+        )}
+      </div>
+      {open && <div className="group-body">{sessions.map(render)}</div>}
     </div>
   );
 }
@@ -187,12 +345,34 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
 
   const pinnedSet = new Set(flags.pinned);
   const archivedSet = new Set(flags.archived);
+  const groups = flags.groups.filter((g) => g.cwd === cwd);
+  const groupIds = new Set(groups.map((g) => g.id));
+  const groupOf = (s: SessionMeta): string | null => {
+    const g = flags.groupOf[s.path];
+    return g && groupIds.has(g) ? g : null;
+  };
+
   const visible = sessions.filter((s) => !archivedSet.has(s.path));
   const archived = sessions.filter((s) => archivedSet.has(s.path));
   const sorted = [
     ...visible.filter((s) => pinnedSet.has(s.path)),
     ...visible.filter((s) => !pinnedSet.has(s.path)),
   ];
+  const ungrouped = sorted.filter((s) => groupOf(s) == null);
+
+  const renderRow = (s: SessionMeta) => (
+    <SessionRow
+      key={s.path}
+      cwd={cwd}
+      s={s}
+      active={isCurrent && ws?.sessionPath === s.path}
+      live={Boolean(ws?.alive && ws?.sessionPath === s.path)}
+      pinned={pinnedSet.has(s.path)}
+      archived={false}
+      groups={groups}
+      groupId={groupOf(s)}
+    />
+  );
 
   return (
     <div className="proj">
@@ -222,17 +402,16 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
             <PlusIcon size={12} />
             <span className="sess-title">Новая сессия</span>
           </button>
-          {sorted.map((s) => (
-            <SessionRow
-              key={s.path}
+          {groups.map((g) => (
+            <GroupSection
+              key={g.id}
               cwd={cwd}
-              s={s}
-              active={isCurrent && ws?.sessionPath === s.path}
-              live={Boolean(ws?.alive && ws?.sessionPath === s.path)}
-              pinned={pinnedSet.has(s.path)}
-              archived={false}
+              group={g}
+              sessions={sorted.filter((s) => groupOf(s) === g.id)}
+              render={renderRow}
             />
           ))}
+          {ungrouped.map(renderRow)}
           {archived.length > 0 && (
             <>
               <button className="sess-row new" onClick={() => setShowArchived(!showArchived)}>
@@ -251,6 +430,8 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
                     live={false}
                     pinned={false}
                     archived
+                    groups={groups}
+                    groupId={groupOf(s)}
                   />
                 ))}
             </>
@@ -314,12 +495,48 @@ export default function Sidebar() {
   const piInfo = useStore((s) => s.piInfo);
   const isMock = useStore((s) => s.isMock);
   const set = useStore((s) => s.set);
+  const width = useStore((s) => s.appConfig.sidebarWidth ?? 240);
+  const uiScale = useStore((s) => s.appConfig.uiScale || 1);
   const [query, setQuery] = useState("");
+  const dragRef = useRef<{ startX: number; startW: number } | null>(null);
 
   const all = [...extra, ...projects.filter((p) => !extra.some((e) => e.cwd === p.cwd))];
 
+  // drag-resize правой кромки (координаты мыши физические → делим на uiScale)
+  const onResizeStart = (e: React.MouseEvent) => {
+    e.preventDefault();
+    dragRef.current = { startX: e.clientX, startW: width };
+    const move = (ev: MouseEvent) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const next = Math.round(Math.min(400, Math.max(190, d.startW + (ev.clientX - d.startX) / uiScale)));
+      document.documentElement.style.setProperty("--sidebar-w", `${next}px`);
+    };
+    const up = (ev: MouseEvent) => {
+      const d = dragRef.current;
+      dragRef.current = null;
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      if (d) {
+        const next = Math.round(Math.min(400, Math.max(190, d.startW + (ev.clientX - d.startX) / uiScale)));
+        void updateAppConfig({ sidebarWidth: next });
+      }
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+
   return (
     <div className="sidebar" data-tauri-drag-region>
+      <div className="side-top" data-tauri-drag-region>
+        <button
+          className="collapse-btn"
+          title="Свернуть боковую панель (⌘B)"
+          onClick={() => void updateAppConfig({ sidebarCollapsed: true })}
+        >
+          <SidebarIcon size={15} />
+        </button>
+      </div>
       <div className="nav">
         {NAV.map((n) => (
           <button
@@ -370,6 +587,7 @@ export default function Sidebar() {
           <span style={{ color: "var(--danger)" }}>pi не найден — установите с pi.dev</span>
         )}
       </div>
+      <div className="side-resize" onMouseDown={onResizeStart} title="Потяните, чтобы изменить ширину" />
     </div>
   );
 }

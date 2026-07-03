@@ -422,7 +422,7 @@ function ChangesTab({
 
   return (
     <div className="split">
-      <div className="left" style={{ width: 300 }}>
+      <div className="left">
         <div className="commit-box">
           <textarea
             placeholder={amend ? "Сообщение (amend последнего коммита)…" : "Сообщение коммита…"}
@@ -571,7 +571,7 @@ function HistoryTab({ cwd, onComment }: { cwd: string; onComment: (c: ReviewComm
 
   return (
     <div className="split">
-      <div className="left" style={{ width: 300 }}>
+      <div className="left">
         {commits.map((c) => (
           <div
             key={c.hash}
@@ -672,7 +672,7 @@ function CheckpointsTab({ cwd, onComment, onChanged }: { cwd: string; onComment:
         </div>
       ) : (
         <div className="split">
-          <div className="left" style={{ width: 280 }}>
+          <div className="left">
             {files.map((f) => (
               <div
                 key={f.newPath}

@@ -40,9 +40,10 @@ class MockBackend implements Backend {
   private uiSeq = 1;
   private pendingUi = new Map<string, (resp: Record<string, unknown>) => void>();
   private steerQueue: string[] = [];
-  private flags = { pinned: [] as string[], archived: [] as string[] };
+  private flags: Record<string, unknown> = { pinned: [], archived: [], groups: [], groupOf: {}, pinnedMessages: {} };
   private deleted = new Set<string>();
   private renamed = new Map<string, string>();
+  private forked: SessionMeta[] = [];
   private permMode: string | null = null;
   private settings = JSON.stringify(
     {
@@ -246,9 +247,21 @@ class MockBackend implements Backend {
             messageCount: 41, userSnippet: "Рефакторинг supervisor", costTotal: 1.2, tokensIn: 500000, tokensOut: 40000,
           },
         ];
-        return base
+        return [...this.forked, ...base]
           .filter((s) => !this.deleted.has(s.path))
           .map((s) => (this.renamed.has(s.path) ? { ...s, name: this.renamed.get(s.path)! } : s)) as T;
+      }
+      case "fork_session": {
+        const src = String(args.path);
+        const id = `fork-${Date.now().toString(36)}`;
+        const meta: SessionMeta = {
+          path: `/mock/a/${id}.jsonl`, id, cwd: "/Users/dev/pi-app",
+          name: `Форк: ${src.split("/").pop()?.replace(".jsonl", "") ?? "сессия"}`,
+          createdAt: new Date().toISOString(), modifiedMs: Date.now(),
+          messageCount: args.upToEntryId ? 1 : 3, userSnippet: "форк (mock)", costTotal: 0, tokensIn: 0, tokensOut: 0,
+        };
+        this.forked.unshift(meta);
+        return meta as T;
       }
       case "delete_session":
         this.deleted.add(String(args.path));
@@ -259,7 +272,7 @@ class MockBackend implements Backend {
       case "read_session_flags":
         return { ...this.flags } as T;
       case "write_session_flags":
-        this.flags = args.flags as { pinned: string[]; archived: string[] };
+        this.flags = args.flags as Record<string, unknown>;
         return undefined as T;
       case "read_session":
         return [
@@ -338,6 +351,13 @@ class MockBackend implements Backend {
                     }
                   : line.type === "set_auto_compaction"
                     ? {}
+                  : line.type === "get_fork_messages"
+                    ? { messages: [
+                        { entryId: "fe1", text: "Восстановленная сессия: что мы делали?" },
+                        { entryId: "fe2", text: "Покажи демо стриминга" },
+                      ] }
+                  : line.type === "fork"
+                    ? { text: "Покажи демо стриминга", cancelled: false }
                   : line.type === "get_commands"
                     ? { commands: [{ name: "plan", description: "Plan mode" }, { name: "review", description: "Review diff" }] }
                     : line.type === "get_messages"

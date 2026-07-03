@@ -14,17 +14,24 @@ import {
   Copy,
   Cpu,
   ExternalLink,
+  Folder,
   FolderOpen,
+  FolderPlus,
   GitBranch,
   GitCommitHorizontal,
+  GitFork,
   Image,
   Info,
   MessageSquare,
   MessageSquarePlus,
   Minus,
+  PanelLeft,
   Paperclip,
+  Pin,
+  PinOff,
   Plus,
   RefreshCw,
+  RotateCcw,
   Settings,
   ShieldQuestion,
   Square,
@@ -68,6 +75,13 @@ export const TrashIcon = ({ size = 15 }: IconProps) => <Trash2 size={size} strok
 export const PullIcon = ({ size = 15 }: IconProps) => <ArrowDown size={size} strokeWidth={SW} />;
 export const PushIcon = ({ size = 15 }: IconProps) => <ArrowUp size={size} strokeWidth={SW} />;
 export const FetchIcon = ({ size = 15 }: IconProps) => <CloudDownload size={size} strokeWidth={SW} />;
+export const ForkIcon = ({ size = 15 }: IconProps) => <GitFork size={size} strokeWidth={SW} />;
+export const RewindIcon = ({ size = 15 }: IconProps) => <RotateCcw size={size} strokeWidth={SW} />;
+export const PinIcon = ({ size = 15 }: IconProps) => <Pin size={size} strokeWidth={SW} />;
+export const PinOffIcon = ({ size = 15 }: IconProps) => <PinOff size={size} strokeWidth={SW} />;
+export const SidebarIcon = ({ size = 15 }: IconProps) => <PanelLeft size={size} strokeWidth={SW} />;
+export const FolderPlusIcon = ({ size = 15 }: IconProps) => <FolderPlus size={size} strokeWidth={SW} />;
+export const GroupIcon = ({ size = 15 }: IconProps) => <Folder size={size} strokeWidth={SW} />;
 
 export const ChevronIcon = ({ size = 13, open }: IconProps & { open?: boolean }) => (
   <ChevronRight

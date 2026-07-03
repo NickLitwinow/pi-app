@@ -17,13 +17,14 @@ import {
   setAutoCompaction,
   setModel,
   setThinkingLevel,
+  toggleMessagePin,
   useStore,
   emptyWorkspaceChat,
   type AgentMode,
   type WorkspaceChat,
 } from "../state/store";
 import { MessageView, Toasts } from "./MessageView";
-import { ImageIcon, MinusIcon, ModelIcon, PaperclipIcon, PlusIcon, SendIcon, ShieldIcon, StopIcon } from "./icons";
+import { ImageIcon, MinusIcon, ModelIcon, PaperclipIcon, PinIcon, PlusIcon, SendIcon, ShieldIcon, StopIcon } from "./icons";
 
 // ---------- agent mode selector ----------
 
@@ -835,6 +836,65 @@ function hasLiveContent(ws: WorkspaceChat): boolean {
   return false;
 }
 
+// ---------- pinned messages widget (компактный, слева сверху — как в Claude for Mac) ----------
+
+function PinnedWidget({
+  cwd,
+  ws,
+  onJump,
+}: {
+  cwd: string;
+  ws: WorkspaceChat;
+  onJump: (pinId: string) => void;
+}) {
+  const sessionPath = ws.sessionPath;
+  const pins = useStore((s) => (sessionPath ? s.sessionFlags.pinnedMessages[sessionPath] : undefined));
+  const [open, setOpen] = useState(false);
+  if (!sessionPath || !pins || pins.length === 0) return null;
+
+  const unpin = (id: string) => {
+    const target = pins.find((p) => p.id === id);
+    if (!target) return;
+    void toggleMessagePin(cwd, { role: target.role, content: [{ type: "text", text: target.text }] });
+  };
+
+  if (!open) {
+    return (
+      <button className="pins-mini" title={`Закреплённые сообщения: ${pins.length}`} onClick={() => setOpen(true)}>
+        {pins.slice(0, 4).map((p) => (
+          <span key={p.id} className="pins-line" style={{ width: 10 + Math.min(14, p.text.length / 20) }} />
+        ))}
+      </button>
+    );
+  }
+  return (
+    <div className="pins-panel">
+      <div className="pins-head">
+        <PinIcon size={12} />
+        <span>Закреплено · {pins.length}</span>
+        <span className="grow" />
+        <button title="Свернуть" onClick={() => setOpen(false)}>
+          <MinusIcon size={12} />
+        </button>
+      </div>
+      {pins.map((p) => (
+        <div key={p.id} className="pins-item" onClick={() => onJump(p.id)} title="Перейти к сообщению">
+          <span className="pins-text">{p.text.slice(0, 140)}</span>
+          <button
+            title="Открепить"
+            onClick={(e) => {
+              e.stopPropagation();
+              unpin(p.id);
+            }}
+          >
+            ×
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ---------- message list ----------
 
 /** Окно рендера: длинные сессии не раздувают DOM (данные остаются в store). */
@@ -858,13 +918,26 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
     setPinned(el.scrollHeight - el.scrollTop - el.clientHeight < 80);
   };
 
+  const jumpToPin = (pinId: string) => {
+    setShowAll(true);
+    setPinned(false);
+    // после setShowAll нужен коммит React — ждём кадр с запасом
+    setTimeout(() => {
+      const el = ref.current?.querySelector(`[data-pin="${pinId}"]`);
+      el?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 60);
+  };
+
   const empty = ws.chat.items.length === 0 && !ws.chat.streaming;
   const items = ws.chat.items;
   const visible = showAll || items.length <= RENDER_WINDOW ? items : items.slice(-RENDER_WINDOW);
   const hiddenCount = items.length - visible.length;
+  // rewind/fork оперируют номером среди ВСЕХ пользовательских сообщений ветки
+  let userCounter = items.slice(0, hiddenCount).filter((it) => it.msg.role === "user").length;
 
   return (
     <div style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}>
+      <PinnedWidget cwd={cwd} ws={ws} onJump={jumpToPin} />
       <div className="msg-scroll" ref={ref} onScroll={onScroll} style={{ flex: 1 }}>
         {empty ? (
           <div className="empty" style={{ height: "100%" }}>
@@ -882,7 +955,14 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
               </button>
             )}
             {visible.map((it) => (
-              <MessageView key={it.key} msg={it.msg} execs={ws.chat.toolExecs} cwd={cwd} />
+              <MessageView
+                key={it.key}
+                msg={it.msg}
+                execs={ws.chat.toolExecs}
+                cwd={cwd}
+                userIndex={it.msg.role === "user" ? userCounter++ : undefined}
+                busy={ws.chat.isStreaming}
+              />
             ))}
             {ws.chat.streaming && (
               <MessageView msg={ws.chat.streaming} execs={ws.chat.toolExecs} streaming cwd={cwd} />

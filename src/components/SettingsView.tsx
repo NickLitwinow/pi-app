@@ -321,6 +321,11 @@ const RECOMMENDED_EXTENSIONS: { pkg: string; name: string; desc: string }[] = [
     name: "plannotator",
     desc: "Plan mode: агент сначала составляет план с аннотациями, затем правит код (/plannotator).",
   },
+  {
+    pkg: "npm:pi-rewind",
+    name: "pi-rewind",
+    desc: "Снапшоты файлов на каждый ход: «Откатить сюда» у сообщений возвращает не только диалог, но и код.",
+  },
 ];
 
 function useRunPi(onDone?: () => void) {

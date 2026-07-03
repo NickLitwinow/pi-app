@@ -317,6 +317,94 @@ pub fn delete_session(path: String) -> Result<(), String> {
     fs::remove_file(p).map_err(|e| e.to_string())
 }
 
+/// uuid v7-style id (time-ordered + random), как генерирует pi.
+fn gen_session_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut rand = [0u8; 10];
+    for chunk in rand.chunks_mut(8) {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(ms);
+        let v = h.finish().to_le_bytes();
+        let n = chunk.len();
+        chunk.copy_from_slice(&v[..n]);
+    }
+    let t = ms.to_be_bytes();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-7{:01x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        t[2], t[3], t[4], t[5], t[6], t[7],
+        rand[0] & 0x0f, rand[1],
+        (rand[2] & 0x3f) | 0x80, rand[3],
+        rand[4], rand[5], rand[6], rand[7], rand[8], rand[9]
+    )
+}
+
+/// Fork a session: копия jsonl с новым id (опционально — только записи строго
+/// до указанного entry id, «форк с этого места»). Возвращает мету новой сессии.
+#[tauri::command]
+pub fn fork_session(path: String, up_to_entry_id: Option<String>) -> Result<SessionMeta, String> {
+    let src = Path::new(&path);
+    assert_session_file(src)?;
+    let content = fs::read_to_string(src).map_err(|e| e.to_string())?;
+    let new_id = gen_session_id();
+
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut last_entry_id: Option<String> = None;
+    let mut orig_name: Option<String> = None;
+    for (i, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(mut v) = serde_json::from_str::<Value>(line) else { continue };
+        if i == 0 {
+            // header: новая идентичность сессии
+            v["id"] = Value::String(new_id.clone());
+            v["timestamp"] = Value::String(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+            out_lines.push(v.to_string());
+            continue;
+        }
+        if let Some(stop) = &up_to_entry_id {
+            if v.get("id").and_then(|x| x.as_str()) == Some(stop.as_str()) {
+                break;
+            }
+        }
+        if v.get("type").and_then(|t| t.as_str()) == Some("session_info") {
+            orig_name = v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+        }
+        if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+            last_entry_id = Some(id.to_string());
+        }
+        out_lines.push(line.to_string());
+    }
+
+    // имя-подсказка, чтобы форк был отличим в списке
+    let fork_name = match orig_name {
+        Some(n) if !n.is_empty() => format!("Форк: {n}"),
+        _ => "Форк".to_string(),
+    };
+    let name_entry = serde_json::json!({
+        "type": "session_info",
+        "id": format!("{:08x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u32).unwrap_or(0)),
+        "parentId": last_entry_id,
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "name": fork_name,
+    });
+    out_lines.push(name_entry.to_string());
+
+    let file_ts = chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        .replace([':', '.'], "-");
+    let dst = src
+        .parent()
+        .ok_or("bad path")?
+        .join(format!("{file_ts}_{new_id}.jsonl"));
+    fs::write(&dst, out_lines.join("\n") + "\n").map_err(|e| e.to_string())?;
+    parse_session_meta(&dst).ok_or_else(|| "не удалось прочитать созданный форк".into())
+}
+
 /// Rename a session that has no live agent by appending a `session_info` entry —
 /// the same format pi itself writes (name changes are append-only events).
 #[tauri::command]
@@ -745,6 +833,42 @@ mod tests {
 #[cfg(test)]
 mod session_ops_tests {
     use super::*;
+
+    #[test]
+    fn forks_full_and_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("--p--");
+        fs::create_dir_all(&proj).unwrap();
+        let file = proj.join("2026-07-01T00-00-00-000Z_orig01.jsonl");
+        fs::write(
+            &file,
+            concat!(
+                "{\"type\":\"session\",\"version\":3,\"id\":\"orig01\",\"timestamp\":\"2026-07-01T00:00:00.000Z\",\"cwd\":\"/tmp/p\"}\n",
+                "{\"type\":\"session_info\",\"id\":\"e0\",\"parentId\":null,\"timestamp\":\"2026-07-01T00:00:00.500Z\",\"name\":\"Orig\"}\n",
+                "{\"type\":\"message\",\"id\":\"e1\",\"parentId\":\"e0\",\"timestamp\":\"2026-07-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}}\n",
+                "{\"type\":\"message\",\"id\":\"e2\",\"parentId\":\"e1\",\"timestamp\":\"2026-07-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]}}\n",
+                "{\"type\":\"message\",\"id\":\"e3\",\"parentId\":\"e2\",\"timestamp\":\"2026-07-01T00:00:03.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"second\"}]}}\n",
+            ),
+        )
+        .unwrap();
+
+        // полный форк
+        let meta = fork_session(file.to_string_lossy().into_owned(), None).unwrap();
+        assert_ne!(meta.id, "orig01");
+        assert_eq!(meta.message_count, 3);
+        assert_eq!(meta.name.as_deref(), Some("Форк: Orig"));
+        assert!(meta.id.len() == 36 && meta.id.chars().nth(14) == Some('7'), "uuid v7-style: {}", meta.id);
+
+        // частичный форк: всё строго до e3 (второго сообщения пользователя)
+        let meta2 = fork_session(file.to_string_lossy().into_owned(), Some("e3".into())).unwrap();
+        assert_eq!(meta2.message_count, 2);
+        let content = fs::read_to_string(Path::new(&meta2.path)).unwrap();
+        assert!(!content.contains("second"));
+        assert!(content.contains("first") && content.contains("answer"));
+
+        // оригинал не тронут
+        assert_eq!(parse_session_meta(&file).unwrap().message_count, 3);
+    }
 
     #[test]
     fn rename_appends_session_info_and_delete_removes() {
