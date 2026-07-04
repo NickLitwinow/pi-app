@@ -205,6 +205,7 @@ export interface AppConfig {
   sidebarWidth?: number;
   sourceRepoPath?: string | null;
   displayName?: string | null;
+  piRetryStallTimeoutMs?: number;
 }
 
 export interface AppUpdateInfo {

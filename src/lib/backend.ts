@@ -245,7 +245,7 @@ class MockBackend implements Backend {
       case "resolve_pi":
         return { path: "/opt/homebrew/bin/pi", version: "0.80.3 (mock)", agentDir: "~/.pi/agent" } satisfies PiInfo as T;
       case "read_app_config":
-        return { editor: "code", processLimit: 2, idleKillSecs: 900, theme: "system", uiScale: 1, displayName: "Nikita" } satisfies AppConfig as T;
+        return { editor: "code", processLimit: 2, idleKillSecs: 900, theme: "system", uiScale: 1, displayName: "Nikita", piRetryStallTimeoutMs: 0 } satisfies AppConfig as T;
       case "write_app_config":
         return undefined as T;
       case "list_projects":

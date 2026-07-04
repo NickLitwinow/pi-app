@@ -85,6 +85,14 @@ pub struct AppConfig {
     pub source_repo_path: Option<String>,
     /// Имя для приветствия на стартовом экране (как в Claude for Mac).
     pub display_name: Option<String>,
+    /// Таймаут «сторожа зависаний» провайдера (@narumitw/pi-retry), мс.
+    /// 0 (по умолчанию) — сторож ВЫКЛЮЧЕН: локальные reasoning-модели думают
+    /// непредсказуемо долго, и любой конечный таймаут рано или поздно ложно
+    /// оборвёт долгое размышление. Отключение снимает только stall-abort —
+    /// прочие ретраи расширения (empty-detail, websocket-limit) продолжают
+    /// работать. Ненулевое значение осмысленно для облачных провайдеров.
+    /// Прокидывается в pi как PI_RETRY_STALL_TIMEOUT_MS.
+    pub pi_retry_stall_timeout_ms: u64,
 }
 
 impl Default for AppConfig {
@@ -100,6 +108,7 @@ impl Default for AppConfig {
             sidebar_width: 240,
             source_repo_path: None,
             display_name: None,
+            pi_retry_stall_timeout_ms: 0, // сторож зависаний выключен по умолчанию
         }
     }
 }
