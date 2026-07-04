@@ -79,7 +79,8 @@ fn parse_object(o: &Value) -> Option<PiPackage> {
         .unwrap_or(0);
     Some(PiPackage {
         npm_url: as_str(pkg, "/links/npm").unwrap_or_else(|| format!("https://www.npmjs.com/package/{name}")),
-        repo_url: as_str(pkg, "/links/repository"),
+        // npm отдаёт repository как git+https://…​.git — нормализуем, иначе open не откроет
+        repo_url: as_str(pkg, "/links/repository").and_then(|s| clean_git_url(&s)),
         homepage: as_str(pkg, "/links/homepage"),
         version: pkg.get("version").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         description: pkg.get("description").and_then(|x| x.as_str()).unwrap_or("").to_string(),
@@ -135,20 +136,33 @@ pub async fn search_pi_packages(
     Ok(PackageSearch { total, objects })
 }
 
-/// Repository/homepage URL из документа версии npm (может быть строкой или
-/// объектом `{ "url": "git+https://…​.git" }`).
+/// Привести git-URL пакета к открываемому в браузере https-виду. npm отдаёт
+/// `repository` как `git+https://…​.git`, `git://…`, `git@github.com:…` — такие
+/// схемы система open/браузер не откроют, поэтому нормализуем в https.
+fn clean_git_url(raw: &str) -> Option<String> {
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("git+")
+        .trim_end_matches(".git")
+        .replace("git://", "https://")
+        .replace("git@github.com:", "https://github.com/")
+        .replace("ssh://git@github.com/", "https://github.com/");
+    // открываем только http(s) — прочие схемы (напр. нераспарсенный git@) отбрасываем
+    if cleaned.starts_with("http://") || cleaned.starts_with("https://") {
+        Some(cleaned)
+    } else {
+        None
+    }
+}
+
+/// Repository URL из документа версии npm (строка или `{ "url": "git+https://…" }`).
 fn clean_repo(v: &Value, key: &str) -> Option<String> {
     let raw = match v.get(key) {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Object(o)) => o.get("url").and_then(|u| u.as_str())?.to_string(),
         _ => return None,
     };
-    let cleaned = raw
-        .trim_start_matches("git+")
-        .trim_end_matches(".git")
-        .replace("git://", "https://")
-        .replace("git@github.com:", "https://github.com/");
-    Some(cleaned)
+    clean_git_url(&raw)
 }
 
 /// Fetch metadata for one installed package spec (npm:name / bare name; git specs
@@ -212,4 +226,45 @@ pub async fn pi_packages_meta(names: Vec<String>) -> Vec<PiPackage> {
     }
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_git_repo_urls() {
+        // именно такой вид отдаёт npm search в links.repository — раньше open его не открывал
+        assert_eq!(
+            clean_git_url("git+https://github.com/tintinweb/pi-subagents.git").as_deref(),
+            Some("https://github.com/tintinweb/pi-subagents"),
+        );
+        assert_eq!(
+            clean_git_url("git://github.com/foo/bar.git").as_deref(),
+            Some("https://github.com/foo/bar"),
+        );
+        assert_eq!(
+            clean_git_url("git@github.com:foo/bar.git").as_deref(),
+            Some("https://github.com/foo/bar"),
+        );
+        assert_eq!(
+            clean_git_url("https://gitlab.com/x/y").as_deref(),
+            Some("https://gitlab.com/x/y"),
+        );
+        // нераспознанные схемы не открываем
+        assert_eq!(clean_git_url("git@bitbucket.org:foo/bar.git"), None);
+    }
+
+    #[test]
+    fn parse_object_cleans_repository_link() {
+        let o = serde_json::json!({
+            "package": {
+                "name": "pi-x",
+                "version": "1.0.0",
+                "links": { "repository": "git+https://github.com/u/pi-x.git" }
+            }
+        });
+        let p = parse_object(&o).unwrap();
+        assert_eq!(p.repo_url.as_deref(), Some("https://github.com/u/pi-x"));
+    }
 }
