@@ -1,10 +1,9 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import { getBackend } from "../lib/backend";
-import { messageDialog } from "../lib/dialog";
 import { stripAnsi } from "../lib/markdown";
 import { contentText } from "../lib/reducer";
 import type { ChatMessage, ContentBlock, ToolExec } from "../lib/types";
-import { forkFromMessage, msgPinId, rewindToMessage, toggleMessagePin, useStore } from "../state/store";
+import { forkFromMessage, msgPinId, notifyChat, rewindToMessage, toggleMessagePin, useStore } from "../state/store";
 import {
   CheckIcon,
   ChevronIcon,
@@ -189,7 +188,15 @@ function UserMessageActions({
   const run = (fn: () => Promise<void>) => {
     setWorking(true);
     void fn()
-      .catch((e) => messageDialog(String(e), { kind: "error" }))
+      .catch((e) => {
+        const raw = e instanceof Error ? e.message : String(e);
+        // таймаут — не жёсткая ошибка: медленная модель/занятый агент; операция
+        // могла продолжиться в фоне. Показываем ненавязчивый тост, не модалку.
+        const msg = /RPC timeout/i.test(raw)
+          ? "Операция не завершилась вовремя (медленная модель или агент занят). Дождитесь простоя агента и повторите."
+          : raw;
+        notifyChat(cwd, "warning", msg);
+      })
       .finally(() => setWorking(false));
   };
 

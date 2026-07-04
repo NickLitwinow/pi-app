@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Sparkles } from "lucide-react";
 import { getBackend } from "../lib/backend";
 import type { AnalyticsOverview, DayStat } from "../lib/types";
@@ -51,25 +51,40 @@ function shortModel(id: string): string {
   return base.length > 22 ? base.slice(0, 21) + "…" : base;
 }
 
-const WEEKS = 26;
+const CELL_STEP = 14; // ячейка 11px + gap 3px
 
 function Heatmap({ perDay }: { perDay: DayStat[] }) {
+  const ref = useRef<HTMLDivElement>(null);
+  // недель ровно столько, сколько влезает по ширине карточки — heatmap заполняет
+  // строку целиком (без пустого поля сбоку) и сжимается на узкой панели без обрезки
+  const [weeks, setWeeks] = useState(26);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      const w = el.clientWidth;
+      if (w > 0) setWeeks(Math.max(8, Math.min(53, Math.floor((w + 3) / CELL_STEP))));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   const cells = useMemo(() => {
     const byDate = new Map(perDay.map((d) => [d.date, d]));
     const out: { date: string; messages: number }[] = [];
     const today = new Date();
-    const total = WEEKS * 7;
+    const total = weeks * 7;
     for (let i = total - 1; i >= 0; i--) {
       const d = new Date(today.getTime() - i * 86400e3);
       const key = d.toISOString().slice(0, 10);
       out.push({ date: key, messages: byDate.get(key)?.messages ?? 0 });
     }
     return out;
-  }, [perDay]);
+  }, [perDay, weeks]);
 
   const max = Math.max(1, ...cells.map((c) => c.messages));
   return (
-    <div className="heatmap">
+    <div className="heatmap" ref={ref}>
       {cells.map((c) => {
         const ratio = c.messages / max;
         const bg =

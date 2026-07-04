@@ -402,7 +402,9 @@ export async function ensureAgent(cwd: string, sessionPath?: string | null): Pro
 export async function rpcRequest(
   cwd: string,
   command: Record<string, unknown>,
-  timeoutMs = 30000,
+  // Дефолт щедрый: локальные модели медленны, а часть RPC (set_model, new_session,
+  // fork) обслуживается агентом между ходами — короткий таймаут даёт ложные «RPC timeout».
+  timeoutMs = 60000,
 ): Promise<Record<string, unknown>> {
   const ws = getChat(cwd);
   const agentId = ws.agentId;
@@ -1015,11 +1017,13 @@ export async function rewindToMessage(cwd: string, userIndex: number, text: stri
   if (ws.liveStreaming) throw new Error("Агент занят — дождитесь завершения перед откатом");
   if (isBrowsingAway(ws)) throw new Error("Сначала вернитесь к активной сессии");
   await ensureAgent(cwd, ws.sessionPath);
-  const data = await rpcRequest(cwd, { type: "get_fork_messages" }, 15000);
+  const data = await rpcRequest(cwd, { type: "get_fork_messages" }, 45000);
   const msgs = (data.messages ?? []) as { entryId: string; text: string }[];
   const target = pickForkEntry(msgs, userIndex, text);
   if (!target) throw new Error("Сообщение для отката не найдено");
-  const res = (await rpcRequest(cwd, { type: "fork", entryId: target.entryId }, 60000)) as {
+  // fork с pi-rewind восстанавливает файлы + может ждать подтверждения — на
+  // медленной модели/большой сессии это долго, поэтому таймаут щедрый.
+  const res = (await rpcRequest(cwd, { type: "fork", entryId: target.entryId }, 180000)) as {
     text?: string;
     cancelled?: boolean;
   };
@@ -1041,7 +1045,7 @@ export async function forkFromMessage(cwd: string, userIndex: number, text: stri
   if (ws.liveStreaming) throw new Error("Агент занят — дождитесь завершения перед форком");
   if (isBrowsingAway(ws)) throw new Error("Сначала вернитесь к активной сессии");
   await ensureAgent(cwd, ws.sessionPath);
-  const data = await rpcRequest(cwd, { type: "get_fork_messages" }, 15000);
+  const data = await rpcRequest(cwd, { type: "get_fork_messages" }, 45000);
   const msgs = (data.messages ?? []) as { entryId: string; text: string }[];
   const target = pickForkEntry(msgs, userIndex, text);
   if (!target) throw new Error("Сообщение для форка не найдено");

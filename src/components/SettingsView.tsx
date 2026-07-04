@@ -707,6 +707,25 @@ function AppTab() {
         />
       </div>
       <div className="form-row">
+        <label>Сторож зависаний провайдера, сек (0 — выкл)</label>
+        <input
+          type="number"
+          min={0}
+          step={30}
+          value={Math.round((appConfig.piRetryStallTimeoutMs ?? 0) / 1000)}
+          onChange={(e) =>
+            void updateAppConfig({ piRetryStallTimeoutMs: Math.max(0, Number(e.target.value) || 0) * 1000 })
+          }
+        />
+      </div>
+      <div className="hint">
+        Расширение <code>@narumitw/pi-retry</code> обрывает и повторяет запрос, если поток от провайдера молчит дольше
+        этого времени (в самом pi — 90с). Локальные reasoning-модели думают непредсказуемо долго, поэтому любой
+        конечный таймаут рано или поздно ложно оборвёт размышление («Повтор после ошибки провайдера»). Поэтому по
+        умолчанию <b>0 (выкл)</b> — снимается только stall-обрыв, прочие ретраи расширения работают. Ненулевое значение
+        (напр. 300–600с) осмысленно для облачных провайдеров, где зависший стрим — обычно реальная сетевая проблема.
+      </div>
+      <div className="form-row">
         <label>Тема приложения</label>
         <select value={appConfig.theme} onChange={(e) => void updateAppConfig({ theme: e.target.value })}>
           <option value="system">Как в системе</option>
