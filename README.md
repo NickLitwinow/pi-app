@@ -1,5 +1,7 @@
 # Pi — Native macOS Client for [pi.dev](https://pi.dev)
 
+> **🌐 Language:** **English** | [Русский](README.ru.md)
+
 <div align="center">
 
 [![macOS](https://img.shields.io/badge/macOS-13+-000000?logo=apple)](https://www.apple.com/macos/)
