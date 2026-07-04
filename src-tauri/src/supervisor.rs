@@ -363,10 +363,19 @@ pub async fn spawn_agent_impl<R: Runtime>(
     }
     args.extend(opts.extra_args.iter().cloned());
 
+    // Сторож зависаний @narumitw/pi-retry по умолчанию рвёт стрим после 90с
+    // молчания — но локальные reasoning-модели думают непредсказуемо долго, и
+    // фиксированный таймаут ложно оборвёт долгое размышление («Повтор после
+    // ошибки провайдера»). Задаём порог из конфига (по умолчанию 0 = выкл); 0
+    // снимает только stall-abort, прочие ретраи расширения остаются. GUI из
+    // Finder не наследует env шелла, поэтому задаём явно.
+    let stall_timeout = crate::config::load_app_config().pi_retry_stall_timeout_ms;
+
     let mut child = Command::new(&pi)
         .args(&args)
         .current_dir(&opts.cwd)
         .env("PATH", child_path())
+        .env("PI_RETRY_STALL_TIMEOUT_MS", stall_timeout.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

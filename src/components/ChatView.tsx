@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { getBackend } from "../lib/backend";
 import { messageDialog } from "../lib/dialog";
 import { stripAnsi } from "../lib/markdown";
@@ -666,6 +666,19 @@ function ContextRing({ pct, size = 15 }: { pct: number; size?: number }) {
 
 function ContextGauge({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const [open, setOpen] = useState(false);
+  // popover позиционируем fixed по координатам чипа: строка статуса обрезает
+  // overflow (иначе длинные статусы расширений вылезают на превью), поэтому
+  // абсолютный popover внутри неё клипался. fixed не зависит от overflow предков.
+  const chipRef = useRef<HTMLButtonElement>(null);
+  const [popStyle, setPopStyle] = useState<React.CSSProperties>({});
+  useLayoutEffect(() => {
+    if (!open || !chipRef.current) return;
+    const r = chipRef.current.getBoundingClientRect();
+    setPopStyle({
+      right: Math.max(8, Math.round(window.innerWidth - r.right)),
+      bottom: Math.round(window.innerHeight - r.top + 8),
+    });
+  }, [open]);
   const stats = ws.stats;
   const usage = stats?.contextUsage;
   const alive = ws.alive;
@@ -691,6 +704,7 @@ function ContextGauge({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   return (
     <div style={{ position: "relative", display: "flex" }}>
       <button
+        ref={chipRef}
         className="ctx-chip"
         title={`Контекст: ${pct}%${tokens != null && window_ ? ` (${fmtNum(tokens)} из ${fmtNum(window_)})` : ""}`}
         onClick={() => setOpen(!open)}
@@ -699,7 +713,7 @@ function ContextGauge({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         <span>{pct}%</span>
       </button>
       {open && (
-        <div className="ctx-pop" onMouseLeave={() => setOpen(false)}>
+        <div className="ctx-pop" style={popStyle} onMouseLeave={() => setOpen(false)}>
           <div className="cp-row cp-head">
             <ContextRing pct={pct} size={22} />
             <div>
@@ -1010,11 +1024,15 @@ export default function ChatView() {
   // drag-resize границы сплита чат/превью (физические координаты → делим на uiScale)
   const onSplitResize = (e: React.MouseEvent) => {
     e.preventDefault();
+    // предел считаем по ширине области чата (не окна!), чтобы всегда оставить
+    // панели чата ≥360px — иначе при открытом сайдбаре она схлопывается в кашу
+    const body = (e.currentTarget as HTMLElement).parentElement;
+    const avail = body?.clientWidth ?? window.innerWidth;
+    const maxPreview = Math.max(320, avail - 360 - 6);
     const startX = e.clientX;
     const startW = previewWidth;
     const move = (ev: MouseEvent) => {
-      const max = Math.max(380, window.innerWidth * 0.75);
-      const next = Math.round(Math.min(max, Math.max(360, startW - (ev.clientX - startX) / uiScale)));
+      const next = Math.round(Math.min(maxPreview, Math.max(320, startW - (ev.clientX - startX) / uiScale)));
       setPreviewWidth(next);
     };
     const up = () => {
