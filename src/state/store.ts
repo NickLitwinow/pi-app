@@ -17,7 +17,7 @@ import {
   type SessionStats,
 } from "../lib/types";
 
-export type View = "chat" | "review" | "analytics" | "settings";
+export type View = "chat" | "review" | "settings";
 
 export interface SessionFlags {
   pinned: string[];
@@ -112,6 +112,8 @@ interface Store {
   sessionFlags: SessionFlags;
   /** Панель permission-запроса свёрнута в чип (чат остаётся читаемым). */
   permCollapsed: boolean;
+  /** Сплит-скрин: панель live-превью открыта рядом с чатом. */
+  previewOpen: boolean;
   set: (patch: Partial<Store>) => void;
 }
 
@@ -129,6 +131,7 @@ export const useStore = create<Store>((set) => ({
   pendingInsert: null,
   sessionFlags: emptySessionFlags(),
   permCollapsed: false,
+  previewOpen: false,
   set: (patch) => set(patch),
 }));
 

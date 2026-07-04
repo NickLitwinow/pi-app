@@ -647,6 +647,10 @@ pub struct DayStat {
     pub date: String,
     pub cost: f64,
     pub messages: usize,
+    pub input: u64,
+    pub output: u64,
+    /// Сессии, стартовавшие в этот день (по первому сообщению файла).
+    pub sessions: usize,
 }
 
 #[derive(Serialize)]
@@ -665,6 +669,8 @@ pub struct AnalyticsOverview {
     pub totals: AnalyticsTotals,
     pub per_day: Vec<DayStat>,
     pub per_model: Vec<ModelStat>,
+    /// Сообщения по часу суток (0..23) — для «пикового часа» на стартовом экране.
+    pub per_hour: Vec<u64>,
 }
 
 /// Per-file aggregate (кэшируется по mtime+size: аналитика не перечитывает
@@ -677,8 +683,11 @@ struct FileAgg {
     cache_read: u64,
     cache_write: u64,
     messages: usize,
-    per_day: Vec<(String, f64, usize)>,
+    /// (date, cost, messages, input, output)
+    per_day: Vec<(String, f64, usize, u64, u64)>,
     per_model: Vec<(String, f64, u64, u64, usize)>,
+    /// сообщения по часу суток (индекс 0..23)
+    per_hour: [u64; 24],
 }
 
 type AnalyticsCache = HashMap<String, (i64, u64, FileAgg)>;
@@ -686,7 +695,8 @@ static ANALYTICS_CACHE: Mutex<Option<AnalyticsCache>> = Mutex::new(None);
 
 fn analyze_session_file(p: &Path) -> FileAgg {
     let mut agg = FileAgg::default();
-    let mut per_day: BTreeMap<String, (f64, usize)> = BTreeMap::new();
+    // (cost, messages, input, output)
+    let mut per_day: BTreeMap<String, (f64, usize, u64, u64)> = BTreeMap::new();
     let mut per_model: BTreeMap<String, (f64, u64, u64, usize)> = BTreeMap::new();
     let Ok(file) = fs::File::open(p) else { return agg };
     for line in BufReader::new(file).lines() {
@@ -700,12 +710,15 @@ fn analyze_session_file(p: &Path) -> FileAgg {
             continue;
         }
         agg.messages += 1;
-        let day = v
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .map(|s| s.chars().take(10).collect::<String>())
-            .unwrap_or_default();
-        let e = per_day.entry(day).or_insert((0.0, 0));
+        let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or_default();
+        let day: String = ts.chars().take(10).collect();
+        // час суток из ISO-таймстампа: "YYYY-MM-DDTHH:..." → байты 11..13
+        if let Ok(hour) = ts.chars().skip(11).take(2).collect::<String>().parse::<usize>() {
+            if hour < 24 {
+                agg.per_hour[hour] += 1;
+            }
+        }
+        let e = per_day.entry(day).or_insert((0.0, 0, 0, 0));
         e.1 += 1;
         if v.pointer("/message/role").and_then(|r| r.as_str()) == Some("assistant") {
             let cost = v.pointer("/message/usage/cost/total").and_then(|x| x.as_f64()).unwrap_or(0.0);
@@ -717,6 +730,8 @@ fn analyze_session_file(p: &Path) -> FileAgg {
             agg.cache_read += v.pointer("/message/usage/cacheRead").and_then(|x| x.as_u64()).unwrap_or(0);
             agg.cache_write += v.pointer("/message/usage/cacheWrite").and_then(|x| x.as_u64()).unwrap_or(0);
             e.0 += cost;
+            e.2 += input;
+            e.3 += output;
             let model = v.pointer("/message/model").and_then(|m| m.as_str()).unwrap_or("unknown").to_string();
             let m = per_model.entry(model).or_insert((0.0, 0, 0, 0));
             m.0 += cost;
@@ -725,7 +740,7 @@ fn analyze_session_file(p: &Path) -> FileAgg {
             m.3 += 1;
         }
     }
-    agg.per_day = per_day.into_iter().map(|(d, (c, n))| (d, c, n)).collect();
+    agg.per_day = per_day.into_iter().map(|(d, (c, n, i, o))| (d, c, n, i, o)).collect();
     agg.per_model = per_model.into_iter().map(|(m, (c, i, o, n))| (m, c, i, o, n)).collect();
     agg
 }
@@ -761,8 +776,10 @@ fn analyze_session_file_cached(p: &Path) -> FileAgg {
 
 pub fn analytics_in(root: &Path) -> AnalyticsOverview {
     let mut totals = AnalyticsTotals::default();
-    let mut per_day: BTreeMap<String, (f64, usize)> = BTreeMap::new();
+    // (cost, messages, input, output, sessions_started)
+    let mut per_day: BTreeMap<String, (f64, usize, u64, u64, usize)> = BTreeMap::new();
     let mut per_model: BTreeMap<String, (f64, u64, u64, usize)> = BTreeMap::new();
+    let mut per_hour = [0u64; 24];
 
     if let Ok(projects) = fs::read_dir(root) {
         for proj in projects.flatten() {
@@ -784,10 +801,20 @@ pub fn analytics_in(root: &Path) -> AnalyticsOverview {
                 totals.output += agg.output;
                 totals.cache_read += agg.cache_read;
                 totals.cache_write += agg.cache_write;
-                for (d, c, n) in agg.per_day {
-                    let e = per_day.entry(d).or_insert((0.0, 0));
+                for (h, n) in agg.per_hour.iter().enumerate() {
+                    per_hour[h] += n;
+                }
+                // день старта сессии = самый ранний день с активностью в файле
+                let first_day = agg.per_day.first().map(|(d, ..)| d.clone());
+                for (d, c, n, i, o) in agg.per_day {
+                    let e = per_day.entry(d).or_insert((0.0, 0, 0, 0, 0));
                     e.0 += c;
                     e.1 += n;
+                    e.2 += i;
+                    e.3 += o;
+                }
+                if let Some(fd) = first_day {
+                    per_day.entry(fd).or_insert((0.0, 0, 0, 0, 0)).4 += 1;
                 }
                 for (model, c, i, o, n) in agg.per_model {
                     let m = per_model.entry(model).or_insert((0.0, 0, 0, 0));
@@ -802,7 +829,14 @@ pub fn analytics_in(root: &Path) -> AnalyticsOverview {
 
     let per_day = per_day
         .into_iter()
-        .map(|(date, (cost, messages))| DayStat { date, cost, messages })
+        .map(|(date, (cost, messages, input, output, sessions))| DayStat {
+            date,
+            cost,
+            messages,
+            input,
+            output,
+            sessions,
+        })
         .collect();
     let mut per_model: Vec<ModelStat> = per_model
         .into_iter()
@@ -810,7 +844,7 @@ pub fn analytics_in(root: &Path) -> AnalyticsOverview {
         .collect();
     per_model.sort_by_key(|m| std::cmp::Reverse(m.messages));
 
-    AnalyticsOverview { totals, per_day, per_model }
+    AnalyticsOverview { totals, per_day, per_model, per_hour: per_hour.to_vec() }
 }
 
 #[tauri::command]

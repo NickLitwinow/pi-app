@@ -24,7 +24,6 @@ import {
   type View,
 } from "../state/store";
 import {
-  ChartIcon,
   ChatIcon,
   ChevronIcon,
   FolderIcon,
@@ -40,7 +39,6 @@ import UpdateModal from "./UpdateModal";
 const NAV: { view: View; label: string; icon: (p: { size?: number }) => ReactElement }[] = [
   { view: "chat", label: "Чат", icon: ChatIcon },
   { view: "review", label: "Code Review", icon: ReviewIcon },
-  { view: "analytics", label: "Аналитика", icon: ChartIcon },
   { view: "settings", label: "Настройки", icon: GearIcon },
 ];
 

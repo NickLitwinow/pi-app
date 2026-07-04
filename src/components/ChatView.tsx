@@ -28,7 +28,9 @@ import {
   type WorkspaceChat,
 } from "../state/store";
 import { MessageView, Toasts } from "./MessageView";
-import { ImageIcon, MinusIcon, ModelIcon, PaperclipIcon, PinIcon, PlusIcon, SendIcon, ShieldIcon, StopIcon } from "./icons";
+import StartScreen from "./StartScreen";
+import PreviewPane from "./PreviewView";
+import { ImageIcon, MinusIcon, ModelIcon, PaperclipIcon, PinIcon, PlusIcon, PreviewIcon, SendIcon, ShieldIcon, StopIcon } from "./icons";
 
 // ---------- agent mode selector ----------
 
@@ -948,13 +950,7 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
       <PinnedWidget cwd={cwd} ws={ws} onJump={jumpToPin} />
       <div className="msg-scroll" ref={ref} onScroll={onScroll} style={{ flex: 1 }}>
         {empty ? (
-          <div className="empty" style={{ height: "100%" }}>
-            <div className="e-icon">π</div>
-            <div style={{ fontSize: 17, fontWeight: 600, color: "var(--text)" }}>
-              Чем помочь в {cwd.split("/").pop()}?
-            </div>
-            <div>pi возьмёт на себя код — вы управляете.</div>
-          </div>
+          <StartScreen />
         ) : (
           <div className="msg-col">
             {hiddenCount > 0 && (
@@ -1006,6 +1002,28 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
 export default function ChatView() {
   const cwd = useStore((s) => s.currentCwd);
   const ws = useWorkspace(cwd);
+  const previewOpen = useStore((s) => s.previewOpen);
+  const set = useStore((s) => s.set);
+  const uiScale = useStore((s) => s.appConfig.uiScale || 1);
+  const [previewWidth, setPreviewWidth] = useState(560);
+
+  // drag-resize границы сплита чат/превью (физические координаты → делим на uiScale)
+  const onSplitResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = previewWidth;
+    const move = (ev: MouseEvent) => {
+      const max = Math.max(380, window.innerWidth * 0.75);
+      const next = Math.round(Math.min(max, Math.max(360, startW - (ev.clientX - startX) / uiScale)));
+      setPreviewWidth(next);
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
 
   useEffect(() => {
     // lazily start the agent when a workspace chat is opened with no history
@@ -1067,6 +1085,13 @@ export default function ChatView() {
         <span className="title">{cwd.split("/").pop()}</span>
         <span className="sub">{String(sessionName)}</span>
         <div className="spacer" data-tauri-drag-region />
+        <button
+          className={`chip ${previewOpen ? "active" : ""}`}
+          onClick={() => set({ previewOpen: !previewOpen })}
+          title="Live-превью рядом с чатом (сплит-скрин)"
+        >
+          <PreviewIcon size={13} /> Превью
+        </button>
         <button className="chip" onClick={() => void newSession(cwd)} title="Новая сессия">
           <PlusIcon size={13} /> Новая сессия
         </button>
@@ -1083,9 +1108,21 @@ export default function ChatView() {
           </button>
         </div>
       )}
-      <MessageList cwd={cwd} ws={ws} />
-      <Composer cwd={cwd} ws={ws} />
-      <Toasts cwd={cwd} />
+      <div className="chat-body">
+        <div className="chat-pane">
+          <MessageList cwd={cwd} ws={ws} />
+          <Composer cwd={cwd} ws={ws} />
+          <Toasts cwd={cwd} />
+        </div>
+        {previewOpen && (
+          <>
+            <div className="chat-vresize" onMouseDown={onSplitResize} title="Потяните, чтобы изменить ширину превью" />
+            <div className="preview-col" style={{ width: previewWidth }}>
+              <PreviewPane onClose={() => set({ previewOpen: false })} />
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }
