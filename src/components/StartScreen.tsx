@@ -130,14 +130,6 @@ export default function StartScreen() {
 
   const greeting = displayName ? `Чем займёмся, ${displayName}?` : "Чем займёмся дальше?";
 
-  // забавное сравнение объёма токенов с эталоном (роман «Дюна» ≈ 250k токенов)
-  const funLine = useMemo(() => {
-    if (!data) return null;
-    const ratio = Math.round((data.totals.input + data.totals.output) / 250_000);
-    if (ratio < 2) return null;
-    return `Вы обработали ~${ratio.toLocaleString("ru-RU")}× больше токенов, чем в романе «Дюна».`;
-  }, [data]);
-
   return (
     <div className="startscreen">
       <div className="ss-greeting">
@@ -181,7 +173,6 @@ export default function StartScreen() {
               <Stat label="Любимая модель" value={derived.favorite} />
             </div>
             <Heatmap perDay={data.perDay} />
-            {funLine && <div className="ss-fun">{funLine}</div>}
           </>
         ) : (
           <table className="data ss-models">
