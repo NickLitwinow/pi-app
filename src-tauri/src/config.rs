@@ -83,6 +83,8 @@ pub struct AppConfig {
     pub sidebar_width: u32,
     /// Каталог исходников pi-app для локального самообновления (ребилд из исходников).
     pub source_repo_path: Option<String>,
+    /// Имя для приветствия на стартовом экране (как в Claude for Mac).
+    pub display_name: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -97,8 +99,21 @@ impl Default for AppConfig {
             sidebar_collapsed: false,
             sidebar_width: 240,
             source_repo_path: None,
+            display_name: None,
         }
     }
+}
+
+/// Имя пользователя ОС с заглавной буквы — дефолт для приветствия.
+fn os_display_name() -> Option<String> {
+    let raw = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut chars = raw.chars();
+    let first = chars.next()?.to_uppercase().to_string();
+    Some(first + chars.as_str())
 }
 
 fn app_config_path() -> PathBuf {
@@ -109,10 +124,15 @@ fn app_config_path() -> PathBuf {
 }
 
 pub fn load_app_config() -> AppConfig {
-    fs::read_to_string(app_config_path())
+    let mut cfg: AppConfig = fs::read_to_string(app_config_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // приветствие по умолчанию — имя пользователя ОС (пока не задано вручную)
+    if cfg.display_name.as_deref().unwrap_or("").trim().is_empty() {
+        cfg.display_name = os_display_name();
+    }
+    cfg
 }
 
 #[tauri::command]

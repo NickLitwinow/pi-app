@@ -5,7 +5,6 @@ import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import ReviewView from "./components/ReviewView";
 import SettingsView from "./components/SettingsView";
-import AnalyticsView from "./components/AnalyticsView";
 import { SidebarIcon } from "./components/icons";
 
 function toggleSidebar() {
@@ -123,7 +122,13 @@ export default function App() {
         s.set({ view: "settings" });
         return;
       }
-      const views = { "1": "chat", "2": "review", "3": "analytics", "4": "settings" } as const;
+      if (e.key === "3") {
+        // ⌘3 — переключить сплит-скрин live-превью рядом с чатом
+        e.preventDefault();
+        s.set({ view: "chat", previewOpen: !s.previewOpen });
+        return;
+      }
+      const views = { "1": "chat", "2": "review", "4": "settings" } as const;
       const v = views[e.key as keyof typeof views];
       if (v) {
         e.preventDefault();
@@ -154,7 +159,6 @@ export default function App() {
       <div className="main">
         {view === "chat" && <ChatView />}
         {view === "review" && <ReviewView />}
-        {view === "analytics" && <AnalyticsView />}
         {view === "settings" && <SettingsView />}
       </div>
     </div>

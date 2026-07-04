@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { getBackend } from "../lib/backend";
 import type { ConfigFile, PiInfo, SkillInfo } from "../lib/types";
 import { confirmDialog } from "../lib/dialog";
-import { openExternalUrl, updateAppConfig, useStore } from "../state/store";
+import { updateAppConfig, useStore } from "../state/store";
+import Marketplace, { type Recommended } from "./Marketplace";
 import { CheckIcon, ErrorIcon, FolderIcon, RefreshIcon } from "./icons";
 
 type Tab = "general" | "extensions" | "skills" | "mcp" | "models" | "app";
@@ -308,10 +309,10 @@ function GeneralTab() {
   );
 }
 
-// ---------- extensions (packages + рекомендуемые) ----------
+// ---------- extensions marketplace (pi.dev community catalog) ----------
 
 /** Расширения, на которые опирается функциональность самого клиента. */
-const RECOMMENDED_EXTENSIONS: { pkg: string; name: string; desc: string }[] = [
+const RECOMMENDED_EXTENSIONS: Recommended[] = [
   {
     pkg: "npm:@gotgenes/pi-permission-system",
     name: "pi-permission-system",
@@ -329,141 +330,17 @@ const RECOMMENDED_EXTENSIONS: { pkg: string; name: string; desc: string }[] = [
   },
 ];
 
-function useRunPi(onDone?: () => void) {
-  const [log, setLog] = useState<string[]>([]);
-  const [running, setRunning] = useState(false);
-  const logRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-  }, [log]);
-
-  const runPi = async (args: string[]) => {
-    setRunning(true);
-    setLog((l) => [...l, `$ pi ${args.join(" ")}`]);
-    const be = await getBackend();
-    let un: (() => void) | null = null;
-    try {
-      // subscribe before starting so fast-finishing runs are not missed
-      let runId: string | null = null;
-      const buffered: Record<string, unknown>[] = [];
-      let finish: () => void = () => {};
-      const donePromise = new Promise<void>((resolve) => (finish = resolve));
-      const handle = (p: Record<string, unknown>) => {
-        if (runId == null) {
-          buffered.push(p);
-          return;
-        }
-        if (p.runId !== runId) return;
-        if (p.done) {
-          setLog((l) => [...l, `— завершено (код ${String(p.code ?? "?")})`]);
-          finish();
-        } else if (p.line) {
-          setLog((l) => [...l.slice(-400), String(p.line)]);
-        }
-      };
-      un = await be.listen("pi-cli-output", handle);
-      runId = await be.invoke<string>("pi_cli_run", { args });
-      for (const p of buffered.splice(0)) handle(p);
-      await donePromise;
-    } catch (e) {
-      setLog((l) => [...l, `ошибка: ${String(e)}`]);
-    } finally {
-      un?.();
-      setRunning(false);
-      onDone?.();
-    }
-  };
-
-  return { log, running, runPi, logRef };
-}
-
 function ExtensionsTab() {
-  const [parsed, , reload] = useSettingsJson();
-  const [newPkg, setNewPkg] = useState("");
-  const { log, running, runPi, logRef } = useRunPi(() => void reload());
-  const packages = Array.isArray(parsed?.packages) ? parsed.packages : [];
-
-  const missing = RECOMMENDED_EXTENSIONS.filter((r) => !packages.includes(r.pkg));
-
   return (
-    <div>
-      {missing.length > 0 && (
-        <>
-          <div className="section-title" style={{ padding: "2px 2px 8px" }}>
-            Рекомендуемые (используются этим клиентом)
-          </div>
-          {missing.map((r) => (
-            <div key={r.pkg} className="card">
-              <div className="row">
-                <span className="c-title">{r.name}</span>
-                <span className="badge">не установлено</span>
-                <div className="grow" />
-                <button className="primary" disabled={running} onClick={() => void runPi(["install", r.pkg])}>
-                  Установить
-                </button>
-              </div>
-              <div className="c-sub">{r.desc}</div>
-              <div className="c-sub" style={{ fontFamily: "var(--font-mono)" }}>{r.pkg}</div>
-            </div>
-          ))}
-        </>
-      )}
-
-      <div className="section-title" style={{ padding: "10px 2px 8px" }}>Установленные пакеты · {packages.length}</div>
-      <div className="row" style={{ marginBottom: 12 }}>
-        <input
-          className="grow"
-          placeholder="npm:имя-пакета или git-URL…"
-          value={newPkg}
-          onChange={(e) => setNewPkg(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && newPkg.trim() && void runPi(["install", newPkg.trim()])}
-        />
-        <button className="primary" disabled={running || !newPkg.trim()} onClick={() => void runPi(["install", newPkg.trim()])}>
-          Установить
-        </button>
-        <button disabled={running} onClick={() => void runPi(["update", "--all"])}>
-          Обновить всё
-        </button>
-      </div>
-
-      {packages.map((p) => {
-        const rec = RECOMMENDED_EXTENSIONS.find((r) => r.pkg === p);
-        return (
-          <div key={p} className="card" style={{ padding: "8px 12px" }}>
-            <div className="row">
-              <span style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{p}</span>
-              {rec && <span className="badge green">используется клиентом</span>}
-              <div className="grow" />
-              {p.startsWith("npm:") && (
-                <button
-                  className="hint"
-                  title="Открыть на npmjs.com"
-                  onClick={() => void openExternalUrl(`https://www.npmjs.com/package/${p.slice(4)}`)}
-                >
-                  npm ↗
-                </button>
-              )}
-              <button className="danger" disabled={running} onClick={() => void runPi(["remove", p])}>
-                Удалить
-              </button>
-            </div>
-            {rec && <div className="c-sub">{rec.desc}</div>}
-          </div>
-        );
-      })}
-      {packages.length === 0 && <div className="muted">Пакеты не установлены</div>}
-
-      {log.length > 0 && (
-        <div className="console" ref={logRef} style={{ marginTop: 14 }}>
-          {log.join("\n")}
-        </div>
-      )}
-    </div>
+    <Marketplace
+      kind="extension"
+      recommended={RECOMMENDED_EXTENSIONS}
+      installHint="Маркетплейс сообщества pi.dev. Установка выполняет «pi install»; изменения подхватываются новыми сессиями агента."
+    />
   );
 }
 
-// ---------- skills ----------
+// ---------- skills marketplace + locally installed ----------
 
 function SkillsTab() {
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -488,6 +365,13 @@ function SkillsTab() {
 
   return (
     <div>
+      <Marketplace
+        kind="skill"
+        installHint="Skills-пакеты из маркетплейса pi.dev. Ниже — skills, уже установленные локально в ваших каталогах."
+      />
+      <div className="section-title" style={{ padding: "16px 2px 6px" }}>
+        Установленные локально · {skills.length}
+      </div>
       <div className="hint" style={{ marginBottom: 10 }}>
         Каталоги skills настраиваются в settings.json → «skills» (вкладка «Общие»).
       </div>
@@ -504,7 +388,7 @@ function SkillsTab() {
           ))}
         </div>
       ))}
-      {skills.length === 0 && <div className="muted">Skills не найдены</div>}
+      {skills.length === 0 && <div className="muted">Локальные skills не найдены</div>}
     </div>
   );
 }
@@ -783,6 +667,14 @@ function AppTab() {
 
   return (
     <div>
+      <div className="form-row">
+        <label>Имя для приветствия (стартовый экран)</label>
+        <input
+          placeholder="Как к вам обращаться"
+          value={appConfig.displayName ?? ""}
+          onChange={(e) => void updateAppConfig({ displayName: e.target.value })}
+        />
+      </div>
       <div className="form-row">
         <label>Внешний редактор</label>
         <select value={appConfig.editor} onChange={(e) => void updateAppConfig({ editor: e.target.value })}>

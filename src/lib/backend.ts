@@ -2,7 +2,19 @@
 // In Tauri it maps to invoke/listen; in a plain browser (vite preview) a mock
 // backend with scripted demo data keeps the whole UI usable for development.
 
-import type { AnalyticsOverview, AppConfig, ConfigFile, PiInfo, ProjectInfo, SessionMeta, SkillInfo } from "./types";
+import type {
+  AnalyticsOverview,
+  AppConfig,
+  ConfigFile,
+  LaunchConfig,
+  PackageSearch,
+  PiInfo,
+  PiPackage,
+  PreviewHandle,
+  ProjectInfo,
+  SessionMeta,
+  SkillInfo,
+} from "./types";
 
 export interface Backend {
   isMock: boolean;
@@ -52,7 +64,19 @@ class MockBackend implements Backend {
       defaultModel: "qwen-local",
       defaultThinkingLevel: "high",
       theme: "dark",
-      packages: ["npm:pi-mcp-adapter", "npm:pi-web-access", "npm:pi-claude-style-tools"],
+      packages: [
+        "npm:pi-mcp-adapter",
+        "npm:pi-web-access",
+        "npm:@tintinweb/pi-subagents",
+        "npm:@juicesharp/rpiv-todo",
+        "npm:@juicesharp/rpiv-ask-user-question",
+        "npm:pi-lens",
+        "npm:pi-hermes-memory",
+        "npm:pi-rewind",
+        "npm:@gotgenes/pi-permission-system",
+        "npm:pi-claude-style-tools",
+        "npm:@plannotator/pi-extension",
+      ],
       skills: ["~/.claude/skills"],
     },
     null,
@@ -221,7 +245,7 @@ class MockBackend implements Backend {
       case "resolve_pi":
         return { path: "/opt/homebrew/bin/pi", version: "0.80.3 (mock)", agentDir: "~/.pi/agent" } satisfies PiInfo as T;
       case "read_app_config":
-        return { editor: "code", processLimit: 2, idleKillSecs: 900, theme: "system", uiScale: 1 } satisfies AppConfig as T;
+        return { editor: "code", processLimit: 2, idleKillSecs: 900, theme: "system", uiScale: 1, displayName: "Nikita" } satisfies AppConfig as T;
       case "write_app_config":
         return undefined as T;
       case "list_projects":
@@ -246,6 +270,18 @@ class MockBackend implements Backend {
             path: "/mock/a/s3.jsonl", id: "s3", cwd: "/Users/dev/pi-app", name: "Старый рефакторинг",
             createdAt: new Date(Date.now() - 200000e3).toISOString(), modifiedMs: Date.now() - 172800e3,
             messageCount: 41, userSnippet: "Рефакторинг supervisor", costTotal: 1.2, tokensIn: 500000, tokensOut: 40000,
+          },
+          // две одноимённые сессии (одинаковый стартовый промпт Create PR) —
+          // воспроизводят баг переключения между сессиями с одинаковым названием
+          {
+            path: "/mock/a/pr1.jsonl", id: "pr1", cwd: "/Users/dev/pi-app", name: null,
+            createdAt: new Date(Date.now() - 600e3).toISOString(), modifiedMs: Date.now() - 300e3,
+            messageCount: 3, userSnippet: "Подготовь pull/merge request по текущим изменениям", costTotal: 0.03, tokensIn: 9000, tokensOut: 600,
+          },
+          {
+            path: "/mock/a/pr2.jsonl", id: "pr2", cwd: "/Users/dev/pi-app", name: null,
+            createdAt: new Date(Date.now() - 120e3).toISOString(), modifiedMs: Date.now() - 60e3,
+            messageCount: 3, userSnippet: "Подготовь pull/merge request по текущим изменениям", costTotal: 0.02, tokensIn: 8000, tokensOut: 500,
           },
         ];
         return [...this.forked, ...base]
@@ -275,30 +311,101 @@ class MockBackend implements Backend {
       case "write_session_flags":
         this.flags = args.flags as Record<string, unknown>;
         return undefined as T;
-      case "read_session_thread":
+      case "read_session_thread": {
+        const p = String(args.path);
         return [
-          { type: "message", message: { role: "user", content: [{ type: "text", text: "Пример архивной сессии (mock)" }] } },
-          { type: "message", message: { role: "assistant", content: [{ type: "text", text: "Ответ из истории. **Markdown** работает." }], model: "qwen-local" } },
+          { type: "message", message: { role: "user", content: [{ type: "text", text: `Открыта сессия ${p} (mock)` }] } },
+          { type: "message", message: { role: "assistant", content: [{ type: "text", text: `Это содержимое файла ${p}. **Markdown** работает.` }], model: "qwen-local" } },
         ] as T;
+      }
       case "search_sessions":
         return [
           { path: "/mock/a/s1.jsonl", cwd: "/Users/dev/pi-app", entryId: "e1", timestamp: new Date().toISOString(), role: "user", snippet: `…найдено: ${String(args.query)}…` },
         ] as T;
       case "analytics_overview": {
-        const days: { date: string; cost: number; messages: number }[] = [];
-        for (let i = 60; i >= 0; i--) {
+        const days: AnalyticsOverview["perDay"] = [];
+        for (let i = 180; i >= 0; i--) {
           const d = new Date(Date.now() - i * 86400e3);
-          if (Math.random() > 0.4) days.push({ date: d.toISOString().slice(0, 10), cost: Math.random() * 2, messages: Math.floor(Math.random() * 40) });
+          if (Math.random() > 0.35) {
+            const messages = Math.floor(Math.random() * 40) + 1;
+            days.push({
+              date: d.toISOString().slice(0, 10),
+              cost: Math.random() * 2,
+              messages,
+              input: messages * 40000,
+              output: messages * 3000,
+              sessions: Math.random() > 0.6 ? 1 + Math.floor(Math.random() * 2) : 0,
+            });
+          }
         }
+        const perHour = Array.from({ length: 24 }, (_, h) =>
+          Math.floor((h >= 9 && h <= 23 ? 1 : 0.15) * (30 + Math.random() * 120)),
+        );
         return {
-          totals: { cost: 12.34, input: 4200000, output: 380000, cacheRead: 900000, cacheWrite: 20000, sessions: 37, messages: 1420 },
+          totals: { cost: 12.34, input: 38200000, output: 500000, cacheRead: 900000, cacheWrite: 20000, sessions: 64, messages: 33901 },
           perDay: days,
           perModel: [
-            { model: "qwen-local", cost: 0, input: 3000000, output: 250000, messages: 900 },
-            { model: "claude-sonnet", cost: 12.34, input: 1200000, output: 130000, messages: 520 },
+            { model: "claude-opus-4-8", cost: 12.34, input: 22000000, output: 300000, messages: 22000 },
+            { model: "qwen-local", cost: 0, input: 16200000, output: 200000, messages: 11901 },
           ],
+          perHour,
         } satisfies AnalyticsOverview as T;
       }
+      case "search_pi_packages": {
+        await sleep(250);
+        const kind = String(args.kind);
+        const from = Number(args.from ?? 0);
+        const ext: PiPackage[] = [
+          { name: "pi-web-access", version: "2.1.0", description: "Web search, URL fetching, GitHub repo cloning, PDF extraction, YouTube video understanding.", author: "nicopreme", downloadsMonthly: 126000, npmUrl: "https://www.npmjs.com/package/pi-web-access", repoUrl: "https://github.com/nicobailon/pi-web-access", homepage: null, keywords: ["pi-extension", "web-search"], updated: new Date().toISOString(), popularity: 1 },
+          { name: "pi-agent-browser-native", version: "0.4.2", description: "Exposes agent-browser as a native tool for browser automation — navigate, inspect DOM, screenshot.", author: "fitchmultz", downloadsMonthly: 12300, npmUrl: "https://www.npmjs.com/package/pi-agent-browser-native", repoUrl: null, homepage: null, keywords: ["pi-extension", "browser"], updated: new Date().toISOString(), popularity: 0.8 },
+          { name: "@gotgenes/pi-permission-system", version: "0.5.0", description: "Permission enforcement extension for Pi coding agent.", author: "gotgenes", downloadsMonthly: 20500, npmUrl: "https://www.npmjs.com/package/@gotgenes/pi-permission-system", repoUrl: null, homepage: null, keywords: ["pi-extension", "permissions"], updated: new Date().toISOString(), popularity: 0.9 },
+          { name: "pi-lens", version: "1.0.3", description: "Real-time code feedback for pi — LSP, linters, formatters, type-checking, structural analysis.", author: "apmantza", downloadsMonthly: 24200, npmUrl: "https://www.npmjs.com/package/pi-lens", repoUrl: null, homepage: null, keywords: ["pi-extension", "lsp"], updated: new Date().toISOString(), popularity: 0.85 },
+        ];
+        const skill: PiPackage[] = [
+          { name: "mitsupi", version: "1.6.0", description: "Armin's pi coding agent commands, skills, extensions, and themes.", author: "mitsuhiko", downloadsMonthly: 4188, npmUrl: "https://www.npmjs.com/package/mitsupi", repoUrl: "https://github.com/mitsuhiko/agent-stuff", homepage: null, keywords: ["pi-skill", "pi-theme"], updated: new Date().toISOString(), popularity: 0.7 },
+          { name: "pi-skill-code-review", version: "0.2.0", description: "Review the current diff for correctness bugs and cleanups.", author: "community", downloadsMonthly: 1200, npmUrl: "https://www.npmjs.com/package/pi-skill-code-review", repoUrl: null, homepage: null, keywords: ["pi-skill"], updated: new Date().toISOString(), popularity: 0.5 },
+        ];
+        const list = kind === "skill" ? skill : ext;
+        return { total: list.length, objects: from > 0 ? [] : list } satisfies PackageSearch as T;
+      }
+      case "pi_packages_meta": {
+        await sleep(200);
+        const names = (args.names as string[]) ?? [];
+        return names
+          .filter((s) => s.startsWith("npm:"))
+          .map((s) => s.slice(4))
+          .map((name) => ({
+            name,
+            version: "1.0.0",
+            description: `Установленный пакет ${name} (mock-метаданные).`,
+            author: name.startsWith("@") ? name.slice(1).split("/")[0] : "community",
+            downloadsMonthly: 0,
+            npmUrl: `https://www.npmjs.com/package/${name}`,
+            repoUrl: null,
+            homepage: null,
+            keywords: [],
+            updated: null,
+            popularity: 0,
+          })) satisfies PiPackage[] as T;
+      }
+      case "preview_configs":
+        return [
+          { name: "pi-app-ui", runtimeExecutable: "npm", runtimeArgs: ["run", "dev"], port: 1420 },
+        ] satisfies LaunchConfig[] as T;
+      case "preview_save_config":
+        return undefined as T;
+      case "preview_start": {
+        const serverId = `prev-${Date.now()}`;
+        void (async () => {
+          for (const l of ["> vite", "VITE ready in 240 ms", "➜ Local: http://localhost:1420/"]) {
+            await sleep(300);
+            this.emit("preview-output", { serverId, line: l, done: false });
+          }
+        })();
+        return { serverId, url: "http://localhost:1420", port: 1420 } satisfies PreviewHandle as T;
+      }
+      case "preview_stop":
+        return undefined as T;
       case "read_pi_config": {
         const name = String(args.name);
         const content = name === "settings" ? this.settings : name === "mcp" ? this.mcp : this.models;
@@ -319,6 +426,10 @@ class MockBackend implements Backend {
         ] satisfies SkillInfo[] as T;
       case "spawn_agent": {
         const id = `mock-agent-${this.agentSeq++}`;
+        // как реальный pi: агент открывается на переданной сессии (get_state
+        // затем вернёт её в sessionFile). null → новая сессия.
+        const opts = (args.opts ?? {}) as { sessionPath?: string | null };
+        this.currentSession = opts.sessionPath ?? `/mock/a/new-${Date.now()}.jsonl`;
         return id as T;
       }
       case "agent_send": {

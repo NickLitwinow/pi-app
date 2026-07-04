@@ -25,7 +25,11 @@ import {
   MessageSquare,
   MessageSquarePlus,
   Minus,
+  Monitor,
+  Package,
   PanelLeft,
+  Smartphone,
+  Tablet,
   Paperclip,
   Pin,
   PinOff,
@@ -84,6 +88,10 @@ export const SidebarIcon = ({ size = 15 }: IconProps) => <PanelLeft size={size} 
 export const FolderPlusIcon = ({ size = 15 }: IconProps) => <FolderPlus size={size} strokeWidth={SW} />;
 export const GroupIcon = ({ size = 15 }: IconProps) => <Folder size={size} strokeWidth={SW} />;
 export const UpdateIcon = ({ size = 15 }: IconProps) => <Sparkles size={size} strokeWidth={SW} />;
+export const PreviewIcon = ({ size = 15 }: IconProps) => <Monitor size={size} strokeWidth={SW} />;
+export const PackageIcon = ({ size = 15 }: IconProps) => <Package size={size} strokeWidth={SW} />;
+export const TabletIcon = ({ size = 15 }: IconProps) => <Tablet size={size} strokeWidth={SW} />;
+export const MobileIcon = ({ size = 15 }: IconProps) => <Smartphone size={size} strokeWidth={SW} />;
 
 export const ChevronIcon = ({ size = 13, open }: IconProps & { open?: boolean }) => (
   <ChevronRight

@@ -3,7 +3,9 @@ pub mod config;
 pub mod editor;
 pub mod gitops;
 pub mod jsonl;
+pub mod packages;
 pub mod pi_cli;
+pub mod preview;
 pub mod sessions;
 pub mod supervisor;
 pub mod watcher;
@@ -74,6 +76,12 @@ pub fn run() {
             config::list_skills,
             pi_cli::pi_cli_run,
             pi_cli::probe_url,
+            packages::search_pi_packages,
+            packages::pi_packages_meta,
+            preview::preview_configs,
+            preview::preview_save_config,
+            preview::preview_start,
+            preview::preview_stop,
             gitops::git_is_repo,
             gitops::git_status,
             gitops::git_checkpoint,

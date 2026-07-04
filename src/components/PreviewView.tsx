@@ -1,0 +1,255 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { getBackend } from "../lib/backend";
+import { messageDialog } from "../lib/dialog";
+import type { LaunchConfig, PreviewHandle } from "../lib/types";
+import { openExternalUrl, useStore } from "../state/store";
+import { useInstalledPackages, useRunPi } from "./Marketplace";
+import { ExternalIcon, MinusIcon, MobileIcon, PreviewIcon, RefreshIcon, StopIcon, TabletIcon } from "./icons";
+
+type Device = "desktop" | "tablet" | "mobile";
+
+const DEVICE_WIDTH: Record<Device, string> = {
+  desktop: "100%",
+  tablet: "834px",
+  mobile: "400px",
+};
+
+// Браузерные расширения pi, дающие агенту нативный контроль над превью
+// (навигация, чтение DOM/консоли, скриншоты) — как в Claude Preview.
+const BROWSER_EXTENSIONS = [
+  {
+    pkg: "pi-agent-browser-native",
+    name: "pi-agent-browser-native",
+    desc: "Нативный инструмент агента поверх agent-browser: навигация, чтение DOM/консоли, скриншоты, автоматизация.",
+  },
+  {
+    pkg: "pi-chrome",
+    name: "pi-chrome",
+    desc: "Использовать уже авторизованный профиль Chrome — агент управляет реальным браузером.",
+  },
+];
+
+/** Live-превью dev-сервера как сплит-панель рядом с чатом (в стиле Claude Preview). */
+export default function PreviewPane({ onClose }: { onClose: () => void }) {
+  const cwd = useStore((s) => s.currentCwd);
+  const [configs, setConfigs] = useState<LaunchConfig[]>([]);
+  const [selected, setSelected] = useState<string>("");
+  const [url, setUrl] = useState("");
+  const [address, setAddress] = useState("");
+  const [server, setServer] = useState<PreviewHandle | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [device, setDevice] = useState<Device>("desktop");
+  const [iframeKey, setIframeKey] = useState(0);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [showLogs, setShowLogs] = useState(false);
+  const logRef = useRef<HTMLDivElement>(null);
+  // зеркалим serverId в ref, чтобы гасить процесс из cleanup/при смене проекта
+  const serverRef = useRef<string | null>(null);
+
+  const killServer = useCallback(async (id: string) => {
+    const be = await getBackend();
+    await be.invoke("preview_stop", { serverId: id }).catch(() => {});
+  }, []);
+  const applyServer = useCallback((h: PreviewHandle | null) => {
+    serverRef.current = h?.serverId ?? null;
+    setServer(h);
+  }, []);
+
+  const { installed, reload: reloadInstalled } = useInstalledPackages();
+  const { runPi, running: installing, log: installLog, logRef: installLogRef } = useRunPi(() => reloadInstalled());
+  const hasBrowserExt = BROWSER_EXTENSIONS.some((e) => installed.has(e.pkg));
+
+  // конфигурации dev-сервера из .claude/launch.json проекта.
+  // Смена проекта гасит прежний сервер и сбрасывает превью.
+  useEffect(() => {
+    if (!cwd) return;
+    if (serverRef.current) void killServer(serverRef.current);
+    applyServer(null);
+    setUrl("");
+    setLogs([]);
+    void (async () => {
+      const be = await getBackend();
+      const cfgs = await be.invoke<LaunchConfig[]>("preview_configs", { cwd }).catch(() => []);
+      setConfigs(cfgs);
+      if (cfgs[0]) {
+        setSelected(cfgs[0].name);
+        setAddress(`http://localhost:${cfgs[0].port}`);
+      } else {
+        setSelected("");
+        setAddress("");
+      }
+    })();
+  }, [cwd, killServer, applyServer]);
+
+  // поток логов dev-сервера
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    void (async () => {
+      const be = await getBackend();
+      un = await be.listen("preview-output", (p) => {
+        if (server && p.serverId !== server.serverId) return;
+        if (p.done) {
+          setLogs((l) => [...l, `— сервер остановлен (код ${String(p.code ?? "?")})`]);
+        } else if (p.line) {
+          setLogs((l) => [...l.slice(-300), String(p.line)]);
+        }
+      });
+    })();
+    return () => un?.();
+  }, [server]);
+
+  useEffect(() => {
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+  }, [logs]);
+
+  // остановить dev-сервер при закрытии панели
+  useEffect(() => {
+    return () => {
+      if (serverRef.current) void killServer(serverRef.current);
+    };
+  }, [killServer]);
+
+  const start = useCallback(async () => {
+    if (!cwd) return;
+    if (serverRef.current) await killServer(serverRef.current); // не плодим процессы
+    setStarting(true);
+    setLogs([]);
+    setShowLogs(true);
+    try {
+      const be = await getBackend();
+      const handle = await be.invoke<PreviewHandle>("preview_start", { cwd, name: selected || null });
+      applyServer(handle);
+      setUrl(handle.url);
+      setAddress(handle.url);
+      setTimeout(() => setIframeKey((k) => k + 1), 1200);
+    } catch (e) {
+      void messageDialog(String(e), { kind: "error" });
+    } finally {
+      setStarting(false);
+    }
+  }, [cwd, selected, killServer, applyServer]);
+
+  const stop = useCallback(async () => {
+    if (!serverRef.current) return;
+    await killServer(serverRef.current);
+    applyServer(null);
+  }, [killServer, applyServer]);
+
+  const reload = () => setIframeKey((k) => k + 1);
+  const go = () => {
+    setUrl(address);
+    setIframeKey((k) => k + 1);
+  };
+
+  const sendToAgent = () => {
+    if (!cwd || !url) return;
+    const prompt = `Открой это превью через браузерные инструменты pi и продолжай разработку UI, сверяясь с реальным рендером: перейди на ${url}, осмотри DOM и консоль, при необходимости сделай скриншот. Адрес обслуживается локальным dev-сервером этого проекта.`;
+    useStore.getState().set({ pendingInsert: prompt });
+  };
+
+  return (
+    <div className="preview-pane">
+      <div className="pv-header">
+        <PreviewIcon size={14} />
+        <span className="pv-title">Превью</span>
+        {cwd && <span className="pv-sub">{cwd.split("/").pop()}</span>}
+        <div className="grow" />
+        <button title="Закрыть превью" onClick={onClose}>
+          <MinusIcon size={14} />
+        </button>
+      </div>
+
+      <div className="pv-toolbar">
+        {configs.length > 0 && (
+          <select value={selected} onChange={(e) => setSelected(e.target.value)} disabled={Boolean(server)} title="Конфигурация из .claude/launch.json">
+            {configs.map((c) => (
+              <option key={c.name} value={c.name}>
+                {c.name} :{c.port}
+              </option>
+            ))}
+          </select>
+        )}
+        {server ? (
+          <button className="danger" onClick={() => void stop()} title="Остановить dev-сервер">
+            <StopIcon size={13} /> Стоп
+          </button>
+        ) : (
+          <button className="primary" disabled={starting || configs.length === 0} onClick={() => void start()} title="Запустить dev-сервер">
+            {starting ? "запуск…" : "▶ Запустить"}
+          </button>
+        )}
+
+        <input
+          className="pv-address"
+          value={address}
+          placeholder="http://localhost:3000"
+          onChange={(e) => setAddress(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && go()}
+        />
+        <button onClick={reload} title="Перезагрузить">
+          <RefreshIcon size={13} />
+        </button>
+
+        <div className="pv-devices">
+          <button className={device === "desktop" ? "active" : ""} onClick={() => setDevice("desktop")} title="Десктоп">
+            <PreviewIcon size={13} />
+          </button>
+          <button className={device === "tablet" ? "active" : ""} onClick={() => setDevice("tablet")} title="Планшет">
+            <TabletIcon size={13} />
+          </button>
+          <button className={device === "mobile" ? "active" : ""} onClick={() => setDevice("mobile")} title="Телефон">
+            <MobileIcon size={13} />
+          </button>
+        </div>
+
+        <div className="grow" />
+        <button onClick={sendToAgent} title="Вставить адрес превью в чат для агента">
+          Агенту →
+        </button>
+        <button onClick={() => url && void openExternalUrl(url)} title="Открыть в системном браузере">
+          <ExternalIcon size={13} />
+        </button>
+        <button className={showLogs ? "active" : ""} onClick={() => setShowLogs(!showLogs)} title="Логи dev-сервера">
+          Логи
+        </button>
+      </div>
+
+      {!hasBrowserExt && (
+        <div className="pv-extbar">
+          <PreviewIcon size={14} />
+          <span>Чтобы агент сам осматривал DOM/консоль и делал скриншоты — установите нативное браузерное расширение:</span>
+          {BROWSER_EXTENSIONS.map((e) => (
+            <button key={e.pkg} className="chip" disabled={installing} title={e.desc} onClick={() => void runPi(["install", `npm:${e.pkg}`])}>
+              + {e.name}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="pv-stage">
+        {url ? (
+          <iframe key={iframeKey} className="pv-frame" src={url} title="preview" style={{ width: DEVICE_WIDTH[device], maxWidth: "100%" }} />
+        ) : (
+          <div className="empty" style={{ height: "100%" }}>
+            <div className="e-icon">
+              <PreviewIcon size={40} />
+            </div>
+            <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text)" }}>Live-превью интерфейса</div>
+            <div>
+              {configs.length > 0
+                ? "Нажмите «Запустить» — dev-сервер поднимется из .claude/launch.json."
+                : "Укажите адрес dev-сервера выше или создайте .claude/launch.json в проекте."}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {showLogs && (
+        <div className="pv-logs" ref={logRef}>
+          {[...logs, ...(installLog.length ? ["", "— установка расширения —", ...installLog] : [])].join("\n") || "нет вывода"}
+          <div ref={installLogRef} />
+        </div>
+      )}
+    </div>
+  );
+}

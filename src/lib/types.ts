@@ -204,6 +204,7 @@ export interface AppConfig {
   sidebarCollapsed?: boolean;
   sidebarWidth?: number;
   sourceRepoPath?: string | null;
+  displayName?: string | null;
 }
 
 export interface AppUpdateInfo {
@@ -241,6 +242,16 @@ export interface StatusEntry {
   path: string;
 }
 
+export interface DayStat {
+  date: string;
+  cost: number;
+  messages: number;
+  input: number;
+  output: number;
+  /** Сессии, стартовавшие в этот день. */
+  sessions: number;
+}
+
 export interface AnalyticsOverview {
   totals: {
     cost: number;
@@ -251,8 +262,48 @@ export interface AnalyticsOverview {
     sessions: number;
     messages: number;
   };
-  perDay: { date: string; cost: number; messages: number }[];
+  perDay: DayStat[];
   perModel: { model: string; cost: number; input: number; output: number; messages: number }[];
+  /** Сообщения по часу суток (24 значения) — для «пикового часа». */
+  perHour: number[];
+}
+
+// ---------- marketplace (pi.dev community packages via npm registry) ----------
+
+export type PackageKind = "extension" | "skill";
+
+export interface PiPackage {
+  name: string;
+  version: string;
+  description: string;
+  author: string;
+  downloadsMonthly: number;
+  npmUrl: string;
+  repoUrl: string | null;
+  homepage: string | null;
+  keywords: string[];
+  updated: string | null;
+  popularity: number;
+}
+
+export interface PackageSearch {
+  total: number;
+  objects: PiPackage[];
+}
+
+// ---------- preview (dev-server launcher) ----------
+
+export interface LaunchConfig {
+  name: string;
+  runtimeExecutable: string;
+  runtimeArgs: string[];
+  port: number;
+}
+
+export interface PreviewHandle {
+  serverId: string;
+  url: string;
+  port: number;
 }
 
 export interface SkillInfo {
