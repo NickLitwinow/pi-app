@@ -7,7 +7,6 @@ import type { ExtUiRequest, GitSummary, ModelInfo } from "../lib/types";
 import {
   abortAgent,
   compactContext,
-  ensureAgent,
   isBrowsingAway,
   loadModelsAndCommands,
   newSession,
@@ -111,7 +110,7 @@ function GitBar({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
     void sendPrompt(
       cwd,
       "Подготовь pull/merge request по текущим незакоммиченным изменениям: если мы на main/master — создай ветку с осмысленным именем; сделай коммит(ы) с внятными сообщениями; запушь в origin. Затем открой запрос средствами, доступными в этом окружении: для GitHub — `gh pr create --fill`, для GitLab — `glab mr create --fill` (или push-опция), для остального — просто дай ссылку на страницу создания PR/MR. Используй существующую авторизацию пользователя (gh/glab/git), ничего не хардкодь. Перед этим кратко перечисли, что войдёт в запрос.",
-    );
+    ).catch((e) => notifyChat(cwd, "warning", e instanceof Error ? e.message : String(e)));
   };
 
   return (
@@ -398,6 +397,8 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [palIdx, setPalIdx] = useState(0);
+  // Esc скрывает палитру команд, НЕ стирая ввод; следующее изменение текста показывает снова
+  const [palHidden, setPalHidden] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const streaming = ws.chat.isStreaming;
@@ -436,10 +437,11 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   }, [text]);
 
   const paletteItems = useMemo(() => {
+    if (palHidden) return [];
     if (!text.startsWith("/") || text.includes(" ") || text.includes("\n")) return [];
     const q = text.slice(1).toLowerCase();
     return ws.commands.filter((c) => c.name.toLowerCase().includes(q)).slice(0, 12);
-  }, [text, ws.commands]);
+  }, [text, ws.commands, palHidden]);
 
   useEffect(() => setPalIdx(0), [paletteItems.length]);
 
@@ -480,7 +482,7 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         return;
       }
       if (e.key === "Escape") {
-        setText("");
+        setPalHidden(true);
         return;
       }
     }
@@ -1043,15 +1045,8 @@ export default function ChatView() {
     window.addEventListener("mouseup", up);
   };
 
-  useEffect(() => {
-    // lazily start the agent when a workspace chat is opened with no history
-    if (cwd && !ws.alive && !ws.agentId && ws.chat.items.length === 0 && !ws.sessionPath) {
-      void ensureAgent(cwd)
-        .then(() => loadModelsAndCommands(cwd))
-        .catch(() => {});
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cwd]);
+  // Агент НЕ спавнится при простом открытии workspace (pi-процесс с расширениями —
+  // сотни МБ): ленивый спавн происходит в sendPrompt/ensureAgent по первому сообщению.
 
   // drag&drop файлов из Finder → пути вставляются в composer
   useEffect(() => {

@@ -20,8 +20,46 @@ use tokio::sync::oneshot;
 use crate::supervisor::child_path;
 
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
-// serverId → kill-signal sender (task owning the child awaits on it).
-static SERVERS: Mutex<Option<HashMap<String, oneshot::Sender<()>>>> = Mutex::new(None);
+// serverId → (kill-signal sender, pid лидера группы). Задача-владелец ждёт сигнал;
+// pid нужен для аварийного SIGKILL группе при выходе приложения.
+static SERVERS: Mutex<Option<HashMap<String, (oneshot::Sender<()>, Option<u32>)>>> = Mutex::new(None);
+
+/// Завершить dev-сервер со всей process group (npm → vite/node): SIGTERM группе,
+/// до 1с грейса, затем безусловный SIGKILL — иначе дети переживают лидера и
+/// держат порт/память.
+async fn kill_child_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let pgid = -(pid as i32);
+        unsafe { libc::kill(pgid, libc::SIGTERM) };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+        unsafe { libc::kill(pgid, libc::SIGKILL) };
+        let _ = child.try_wait();
+        return;
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+/// Аварийная остановка всех dev-серверов при выходе приложения: сигнал задачам
+/// плюс немедленный SIGKILL группам (задачи могут не успеть до завершения процесса).
+pub fn stop_all_servers() {
+    let entries: Vec<(oneshot::Sender<()>, Option<u32>)> = SERVERS
+        .lock()
+        .unwrap()
+        .as_mut()
+        .map(|m| m.drain().map(|(_, v)| v).collect())
+        .unwrap_or_default();
+    for (tx, pid) in entries {
+        let _ = tx.send(());
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+        #[cfg(not(unix))]
+        let _ = pid;
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -107,8 +145,8 @@ pub async fn preview_start(
     let server_id = format!("prev-{}", RUN_COUNTER.fetch_add(1, Ordering::Relaxed));
     let port = cfg.port;
 
-    let mut child = Command::new(&cfg.runtime_executable)
-        .args(&cfg.runtime_args)
+    let mut cmd = Command::new(&cfg.runtime_executable);
+    cmd.args(&cfg.runtime_args)
         .current_dir(&cwd)
         .env("PATH", child_path())
         .env("NO_COLOR", "1")
@@ -116,7 +154,16 @@ pub async fn preview_start(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // собственная process group — см. kill_child_group
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("не удалось запустить «{}»: {e}", cfg.runtime_executable))?;
 
@@ -144,11 +191,12 @@ pub async fn preview_start(
     }
 
     let (kill_tx, kill_rx) = oneshot::channel::<()>();
+    let child_pid = child.id();
     SERVERS
         .lock()
         .unwrap()
         .get_or_insert_with(HashMap::new)
-        .insert(server_id.clone(), kill_tx);
+        .insert(server_id.clone(), (kill_tx, child_pid));
 
     {
         let app = app.clone();
@@ -157,8 +205,7 @@ pub async fn preview_start(
             let code = tokio::select! {
                 status = child.wait() => status.ok().and_then(|s| s.code()),
                 _ = kill_rx => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    kill_child_group(&mut child).await;
                     None
                 }
             };
@@ -178,8 +225,8 @@ pub async fn preview_start(
 /// Stop a running dev server started with preview_start.
 #[tauri::command]
 pub fn preview_stop(server_id: String) -> Result<(), String> {
-    let sender = SERVERS.lock().unwrap().as_mut().and_then(|m| m.remove(&server_id));
-    if let Some(tx) = sender {
+    let entry = SERVERS.lock().unwrap().as_mut().and_then(|m| m.remove(&server_id));
+    if let Some((tx, _pid)) = entry {
         let _ = tx.send(());
     }
     Ok(())

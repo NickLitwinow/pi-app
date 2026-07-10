@@ -118,10 +118,20 @@ function finalizeMessage(chat: ChatState, msg: ChatMessage) {
     return;
   }
   if (role === "user") {
-    // user prompts are added optimistically on send; dedupe echoes
+    // user prompts are added optimistically on send; эхо от pi поглощает ровно ОДИН
+    // непогашенный optimistic-элемент с тем же текстом — два одинаковых сообщения
+    // подряд не схлопываются в одно
     const text = contentText(msg.content);
-    const recent = chat.items.slice(-6);
-    if (recent.some((it) => it.msg.role === "user" && contentText(it.msg.content) === text)) return;
+    const from = Math.max(0, chat.items.length - 6);
+    for (let i = chat.items.length - 1; i >= from; i--) {
+      const it = chat.items[i];
+      if (it.optimistic && it.msg.role === "user" && contentText(it.msg.content) === text) {
+        const items = [...chat.items];
+        items[i] = { ...it, optimistic: false };
+        chat.items = items;
+        return;
+      }
+    }
     chat.items = [...chat.items, { key: nextKey(), msg }];
     return;
   }
@@ -316,7 +326,11 @@ export function entriesToChatState(entries: Record<string, unknown>[]): ChatStat
 export function addUserMessage(chat: ChatState, text: string): ChatState {
   chat.items = [
     ...chat.items,
-    { key: nextKey(), msg: { role: "user", content: [{ type: "text", text }], timestamp: Date.now() } },
+    {
+      key: nextKey(),
+      msg: { role: "user", content: [{ type: "text", text }], timestamp: Date.now() },
+      optimistic: true,
+    },
   ];
   chat.seq++;
   return chat;

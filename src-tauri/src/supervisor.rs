@@ -294,6 +294,39 @@ impl<R: Runtime> Supervisor<R> {
     }
 }
 
+/// Завершить процесс вместе со всей его process group. pi спавнит детей
+/// (MCP-серверы, node-хелперы); kill только лидера сиротил их — утечка RAM.
+/// SIGTERM группе → до 1с грейса → безусловный SIGKILL группе (группа
+/// переживает смерть лидера, поэтому добиваем всегда).
+async fn kill_group(child: &Arc<Mutex<Child>>) {
+    #[cfg(unix)]
+    {
+        let pid = { child.lock().await.id() };
+        if let Some(pid) = pid {
+            let pgid = -(pid as i32);
+            unsafe { libc::kill(pgid, libc::SIGTERM) };
+            for _ in 0..10 {
+                if child.lock().await.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            unsafe { libc::kill(pgid, libc::SIGKILL) };
+            let _ = child.lock().await.try_wait();
+            return;
+        }
+    }
+    let _ = child.lock().await.start_kill();
+}
+
+/// Завершить всех агентов (выход приложения) — группы целиком.
+pub async fn kill_all_agents<R: Runtime>(sup: &Supervisor<R>) {
+    let ids: Vec<String> = sup.agents.lock().await.keys().cloned().collect();
+    for id in ids {
+        kill_by_id(&sup.agents, &sup.app, &id, "killed").await;
+    }
+}
+
 async fn kill_by_id<R: Runtime>(
     agents: &Arc<Mutex<HashMap<String, Agent>>>,
     app: &AppHandle<R>,
@@ -302,8 +335,7 @@ async fn kill_by_id<R: Runtime>(
 ) {
     let agent = { agents.lock().await.remove(id) };
     if let Some(agent) = agent {
-        let mut child = agent.child.lock().await;
-        let _ = child.start_kill();
+        kill_group(&agent.child).await;
         let _ = app.emit(
             "agent-exit",
             AgentExitPayload {
@@ -371,17 +403,25 @@ pub async fn spawn_agent_impl<R: Runtime>(
     // Finder не наследует env шелла, поэтому задаём явно.
     let stall_timeout = crate::config::load_app_config().pi_retry_stall_timeout_ms;
 
-    let mut child = Command::new(&pi)
-        .args(&args)
+    let mut cmd = Command::new(&pi);
+    cmd.args(&args)
         .current_dir(&opts.cwd)
         .env("PATH", child_path())
         .env("PI_RETRY_STALL_TIMEOUT_MS", stall_timeout.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("failed to spawn pi: {e}"))?;
+        .kill_on_drop(true);
+    // Собственная process group: без неё kill доставался только лидеру, а его
+    // дети (MCP-серверы и пр.) сиротели и продолжали жить (см. kill_group).
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn pi: {e}"))?;
 
     let stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;

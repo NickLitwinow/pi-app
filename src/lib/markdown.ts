@@ -80,11 +80,18 @@ async function getHighlighter(): Promise<Highlighter | null> {
 
 const hlCache = new Map<string, string>();
 
+function hashStr(s: string): number {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return h >>> 0;
+}
+
 export async function highlightCode(code: string, lang: string, dark: boolean): Promise<string | null> {
   const hl = await getHighlighter();
   if (!hl) return null;
   const theme = dark ? "github-dark" : "github-light";
-  const key = `${theme}:${lang}:${code.length}:${code.slice(0, 80)}`;
+  // полный хэш содержимого: len+префикс давали коллизии (одинаковая подсветка у разных блоков)
+  const key = `${theme}:${lang}:${code.length}:${hashStr(code).toString(36)}`;
   const cached = hlCache.get(key);
   if (cached) return cached;
   const aliases: Record<string, string> = {

@@ -111,6 +111,15 @@ pub fn run() {
             app_update::app_update_run,
             app_update::relaunch_app,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app_handle, event| {
+            // Выход приложения: гасим все process group'ы (агенты pi + dev-серверы),
+            // иначе их дети (MCP-серверы, vite) переживают выход и копят память.
+            if let tauri::RunEvent::Exit = event {
+                let sup = app_handle.state::<supervisor::Supervisor<tauri::Wry>>();
+                tauri::async_runtime::block_on(supervisor::kill_all_agents(&sup));
+                preview::stop_all_servers();
+            }
+        });
 }

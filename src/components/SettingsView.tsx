@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getBackend } from "../lib/backend";
 import type { ConfigFile, PiInfo, SkillInfo } from "../lib/types";
 import { confirmDialog } from "../lib/dialog";
@@ -7,6 +7,38 @@ import Marketplace, { type Recommended } from "./Marketplace";
 import { CheckIcon, ErrorIcon, FolderIcon, RefreshIcon } from "./icons";
 
 type Tab = "general" | "extensions" | "skills" | "mcp" | "models" | "app";
+
+/** Текстовое поле с отложенной записью: локальное значение мгновенно, коммит в файл —
+ *  после паузы ввода (иначе settings.json переписывается на каждую букву — I/O-шторм
+ *  и гонка с pi, который тоже пишет этот файл). */
+function useDebouncedField(
+  value: string,
+  commit: (v: string) => void,
+  delay = 600,
+): [string, (v: string) => void] {
+  const [local, setLocal] = useState(value);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const committed = useRef(value);
+  useEffect(() => {
+    // внешнее изменение (перечитали файл) — синхронизируем локальное значение
+    if (value !== committed.current) {
+      committed.current = value;
+      setLocal(value);
+    }
+  }, [value]);
+  useEffect(() => () => {
+    if (timer.current) clearTimeout(timer.current);
+  }, []);
+  const set = (v: string) => {
+    setLocal(v);
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(() => {
+      committed.current = v;
+      commit(v);
+    }, delay);
+  };
+  return [local, set];
+}
 
 const ALL_TABS: { id: Tab; label: string; needsPi: boolean }[] = [
   { id: "general", label: "Общие", needsPi: false },
@@ -224,6 +256,9 @@ function GeneralTab() {
   const [parsed, update, reload] = useSettingsJson();
   const compaction = parsed?.compaction ?? {};
   const compactionEnabled = compaction.enabled !== false;
+  const [prov, setProv] = useDebouncedField(String(parsed?.defaultProvider ?? ""), (v) => void update({ defaultProvider: v }));
+  const [model, setModel] = useDebouncedField(String(parsed?.defaultModel ?? ""), (v) => void update({ defaultModel: v }));
+  const [tuiTheme, setTuiTheme] = useDebouncedField(String(parsed?.theme ?? ""), (v) => void update({ theme: v }));
 
   return (
     <div>
@@ -234,17 +269,11 @@ function GeneralTab() {
           <div className="section-title" style={{ padding: "12px 2px 8px" }}>Значения по умолчанию</div>
           <div className="form-row">
             <label>Провайдер по умолчанию</label>
-            <input
-              value={String(parsed.defaultProvider ?? "")}
-              onChange={(e) => void update({ defaultProvider: e.target.value })}
-            />
+            <input value={prov} onChange={(e) => setProv(e.target.value)} />
           </div>
           <div className="form-row">
             <label>Модель по умолчанию</label>
-            <input
-              value={String(parsed.defaultModel ?? "")}
-              onChange={(e) => void update({ defaultModel: e.target.value })}
-            />
+            <input value={model} onChange={(e) => setModel(e.target.value)} />
           </div>
           <div className="form-row">
             <label>Thinking по умолчанию</label>
@@ -259,7 +288,7 @@ function GeneralTab() {
           </div>
           <div className="form-row">
             <label>Тема pi (TUI)</label>
-            <input value={String(parsed.theme ?? "")} onChange={(e) => void update({ theme: e.target.value })} />
+            <input value={tuiTheme} onChange={(e) => setTuiTheme(e.target.value)} />
           </div>
 
           <div className="section-title" style={{ padding: "12px 2px 8px" }}>Компакция контекста</div>
@@ -664,16 +693,13 @@ function ModelsTab() {
 
 function AppTab() {
   const appConfig = useStore((s) => s.appConfig);
+  const [name, setName] = useDebouncedField(appConfig.displayName ?? "", (v) => void updateAppConfig({ displayName: v }));
 
   return (
     <div>
       <div className="form-row">
         <label>Имя для приветствия (стартовый экран)</label>
-        <input
-          placeholder="Как к вам обращаться"
-          value={appConfig.displayName ?? ""}
-          onChange={(e) => void updateAppConfig({ displayName: e.target.value })}
-        />
+        <input placeholder="Как к вам обращаться" value={name} onChange={(e) => setName(e.target.value)} />
       </div>
       <div className="form-row">
         <label>Внешний редактор</label>

@@ -111,6 +111,8 @@ export interface Toast {
 export interface TimelineItem {
   key: string;
   msg: ChatMessage;
+  /** Добавлено оптимистично при отправке; эхо от pi «поглощает» ровно один такой элемент. */
+  optimistic?: boolean;
 }
 
 export interface ChatState {

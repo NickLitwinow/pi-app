@@ -289,6 +289,14 @@ export async function initApp(): Promise<void> {
 
   await be.listen("agent-exit", (payload) => {
     const agentId = String(payload.agentId ?? "");
+    // отклонить зависшие RPC этого агента — иначе операции молча ждут таймаута (до 180с)
+    for (const [key, p] of [...pending]) {
+      if (key.startsWith(`${agentId}:`)) {
+        pending.delete(key);
+        clearTimeout(p.timer);
+        p.reject(new Error("агент завершился во время запроса"));
+      }
+    }
     const cwd = agentToCwd.get(agentId);
     if (!cwd) return;
     agentToCwd.delete(agentId);
@@ -389,6 +397,8 @@ export async function ensureAgent(cwd: string, sessionPath?: string | null): Pro
     // агент открыт в spawnSession — это и есть live-сессия (для новой узнаем из get_state)
     updateChat(cwd, (w) => ({ ...w, agentId, alive: true, liveSessionPath: spawnSession ?? w.sessionPath }));
     await refreshAgentMeta(cwd);
+    // спавн ленивый (по первому сообщению) — модели/команды тянем после него
+    void loadModelsAndCommands(cwd);
     return agentId;
   })();
   spawnInFlight.set(cwd, promise);
@@ -896,7 +906,8 @@ export async function deleteSessionAction(cwd: string, path: string): Promise<vo
   const be = await getBackend();
   const ws = getChat(cwd);
   // если удаляем открытую/активную сессию — сначала гасим агента
-  if (ws.sessionPath === path) {
+  // (samePath: pi может вернуть иную форму пути, чем листинг)
+  if (samePath(ws.sessionPath, path)) {
     if (ws.agentId) {
       await be.invoke("kill_agent", { agentId: ws.agentId }).catch(() => {});
       agentToCwd.delete(ws.agentId);

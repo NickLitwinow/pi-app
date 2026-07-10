@@ -121,7 +121,19 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
       applyServer(handle);
       setUrl(handle.url);
       setAddress(handle.url);
-      setTimeout(() => setIframeKey((k) => k + 1), 1200);
+      // перезагружаем iframe по фактической готовности порта, а не по таймеру:
+      // dev-серверы поднимаются от сотен мс до десятков секунд
+      void (async () => {
+        for (let i = 0; i < 60; i++) {
+          if (serverRef.current !== handle.serverId) return; // сервер сменили/остановили
+          const code = await be.invoke<string>("probe_url", { url: handle.url }).catch(() => null);
+          if (code) {
+            setIframeKey((k) => k + 1);
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      })();
     } catch (e) {
       void messageDialog(String(e), { kind: "error" });
     } finally {

@@ -285,7 +285,9 @@ const MessageViewImpl = function MessageView({
           <UserMessageActions cwd={cwd} msg={msg} userIndex={userIndex} busy={busy ?? false} />
         )}
         <div className="bubble">
-          <Markdown source={contentText(msg.content)} final />
+          {/* ввод пользователя — плоский текст, НЕ markdown: «# заметка» не должна
+              превращаться в заголовок (паритет с Claude Code) */}
+          <div className="user-plain">{contentText(msg.content)}</div>
         </div>
       </div>
     );
