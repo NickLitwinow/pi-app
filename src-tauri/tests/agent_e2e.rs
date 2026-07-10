@@ -3,14 +3,14 @@
 //! to it, and (when the local model server is up) drives a full prompt turn.
 //!
 //! Skips gracefully when pi is not installed; skips the LLM round-trip when the
-//! model server at 127.0.0.1:8099 is down.
+//! model server at 127.0.0.1:8003 is down.
 
 use pi_app_lib::supervisor::{self, SpawnOpts, Supervisor};
 use std::time::Duration;
 use tauri::Manager;
 
 fn model_server_up() -> bool {
-    "127.0.0.1:8099"
+    "127.0.0.1:8003"
         .parse()
         .ok()
         .and_then(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(800)).ok())
@@ -126,7 +126,7 @@ async fn real_pi_agent_roundtrip() {
         );
         eprintln!("LLM round-trip OK");
     } else {
-        eprintln!("SKIP LLM round-trip: model server at 127.0.0.1:8099 is down");
+        eprintln!("SKIP LLM round-trip: model server at 127.0.0.1:8003 is down");
     }
 
     // --- teardown through the production kill path ---

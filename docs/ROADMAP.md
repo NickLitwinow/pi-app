@@ -408,9 +408,9 @@ R1→R2 менять местами нельзя (harness бессмыслен, 
 - [x] C4. Открытые пункты плана размечены в GitHub issues [#10–#19](https://github.com/NickLitwinow/pi-app/issues) (E2/E4–E8, R2/R3/R5/R6); закрытые P0/P1 из §4.1 в issues не дублируются. *(2026-07-11)*
 
 **Цель D — личное окружение (§5.9, вне кода приложения):**
-- [ ] D1. Чистка расширений 24→~11 (команды в §5.9-1) + перевод нишевых в per-workspace.
-- [ ] D2. Sub-agents 15→3–5 (`agents/_disabled/`).
-- [ ] D3. Замер стартового промпта до/после, цель ≤15К; цифры зафиксировать в §5.9.
+- [x] D1. Расширения 24→14 (убраны: guardrails-дубль, web-access, subagents, lens, team-mode, observability, task-scheduler, loop, supi-cache, browser-native; бэкап `settings.json.bak-20260711-d1`). Новички ponytail/simplify/goal оставлены — оценивать по одному. *(2026-07-11)*
+- [x] D2. Sub-agents 15→4 (codebase-locator/-analyzer/-pattern-finder, web-search-researcher; остальные 11 в `agents/_disabled/`). *(2026-07-11)*
+- [x] D3. Замер (pi -p в чистом tmp-каталоге, первый ответ): **35 867 → 13 062 токена (−64%), цель ≤15К достигнута**. Метод: `pi -p "…" </dev/null` (без `</dev/null` pi ждёт stdin — это не зависание). *(2026-07-11)*
 - [x] D4. models.json/settings.json: id модели обновлён на `Qwable-v2-DWQ4e-mtp` (oMLX сменил имена; старый id ломал все раны). *(2026-07-11)*
 
 **Цель E — вторая волна (§5.10):**
