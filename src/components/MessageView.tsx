@@ -266,6 +266,7 @@ const MessageViewImpl = function MessageView({
   cwd,
   userIndex,
   busy,
+  viaExtension,
 }: {
   msg: ChatMessage;
   execs: Record<string, ToolExec>;
@@ -275,6 +276,8 @@ const MessageViewImpl = function MessageView({
   userIndex?: number;
   /** Агент занят — деструктивные действия недоступны. */
   busy?: boolean;
+  /** Сообщение отправлено расширением (pi-goal и т.п.), а не пользователем. */
+  viaExtension?: boolean;
 }) {
   const pinId = useMemo(() => msgPinId(msg), [msg]);
 
@@ -285,6 +288,7 @@ const MessageViewImpl = function MessageView({
           <UserMessageActions cwd={cwd} msg={msg} userIndex={userIndex} busy={busy ?? false} />
         )}
         <div className="bubble">
+          {viaExtension && <div className="via-ext">⚙ отправлено расширением</div>}
           {/* ввод пользователя — плоский текст, НЕ markdown: «# заметка» не должна
               превращаться в заголовок (паритет с Claude Code) */}
           <div className="user-plain">{contentText(msg.content)}</div>

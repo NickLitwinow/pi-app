@@ -982,6 +982,7 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
                 cwd={cwd}
                 userIndex={it.msg.role === "user" ? userCounter++ : undefined}
                 busy={ws.chat.isStreaming}
+                viaExtension={it.viaExtension}
               />
             ))}
             {ws.chat.streaming && (

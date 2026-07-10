@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { getBackend } from "../lib/backend";
+import { notifyOS } from "../lib/notify";
 import { addUserMessage, applyAgentEvent, contentText, entriesToChatState } from "../lib/reducer";
 import {
   emptyChatState,
@@ -201,6 +202,13 @@ function flushAgentEvents() {
   const nextChats = { ...s.chats };
   const finishedRuns: string[] = [];
   let newDialog = false;
+  // уведомления ОС: ход завершён / агент ждёт разрешения, когда пользователь
+  // не смотрит (окно без фокуса или открыт другой workspace)
+  const osNotes: { cwd: string; kind: "end" | "perm" }[] = [];
+  const noteOnce = (cwd: string, kind: "end" | "perm") => {
+    const away = !document.hasFocus() || s.currentCwd !== cwd;
+    if (away && !osNotes.some((n) => n.cwd === cwd && n.kind === kind)) osNotes.push({ cwd, kind });
+  };
   for (const [cwd, events] of eventQueue) {
     const ws = nextChats[cwd] ?? emptyWorkspaceChat();
     // Гейт: когда пользователь смотрит другую сессию (browse), богатые события
@@ -227,11 +235,15 @@ function flushAgentEvents() {
         if (applyToView && (t === "agent_start" || t === "agent_end" || t === "turn_end" || t === "compaction_end")) {
           if (!finishedRuns.includes(cwd)) finishedRuns.push(cwd);
         }
-        if (t === "extension_ui_request" && DIALOG_METHODS.has(String(ev.method))) newDialog = true;
+        if (t === "extension_ui_request" && DIALOG_METHODS.has(String(ev.method))) {
+          newDialog = true;
+          noteOnce(cwd, "perm");
+        }
       } else if (t === "agent_end" || t === "turn_end" || t === "compaction_end") {
         // фоновая сессия завершила ход — обновим её стату (без изменения вида)
         if (!finishedRuns.includes(cwd)) finishedRuns.push(cwd);
       }
+      if (t === "agent_end") noteOnce(cwd, "end");
     }
     if (applied || liveStreaming !== ws.liveStreaming) {
       nextChats[cwd] = { ...ws, chat, liveStreaming };
@@ -242,6 +254,10 @@ function flushAgentEvents() {
   useStore.setState(newDialog ? { chats: nextChats, permCollapsed: false } : { chats: nextChats });
   for (const cwd of finishedRuns) {
     void refreshAgentMeta(cwd);
+  }
+  for (const n of osNotes) {
+    const name = n.cwd.split("/").pop() || n.cwd;
+    void notifyOS(name, n.kind === "perm" ? "Агент ждёт подтверждения" : "Агент завершил ход");
   }
 }
 
@@ -702,6 +718,29 @@ export async function setAgentMode(cwd: string, mode: AgentMode): Promise<void> 
   const prev = getChat(cwd).mode;
   if (prev === mode) return;
   updateChat(cwd, (w) => ({ ...w, mode }));
+
+  if (mode === "bypass") {
+    // Bypass снимает гейты pi-permission-system, но сторонние гейтующие
+    // расширения (напр. @aliou/pi-guardrails: secret-files → .env) работают
+    // независимо — честно предупреждаем (ROADMAP §5.10-2, полный контракт в R2).
+    void (async () => {
+      const be = await getBackend();
+      const f = await be.invoke<{ content?: string }>("read_pi_config", { name: "settings" }).catch(() => null);
+      try {
+        const pkgs: string[] = JSON.parse(f?.content ?? "{}").packages ?? [];
+        const gate = pkgs.find((p) => p.includes("pi-guardrails"));
+        if (gate) {
+          notifyChat(
+            cwd,
+            "info",
+            `Bypass не отключает стороннее расширение «${gate}» — секретные файлы (.env и т.п.) оно продолжит блокировать. Отключить: pi remove ${gate}`,
+          );
+        }
+      } catch {
+        // settings.json нечитаем — предупреждение не критично
+      }
+    })();
+  }
 
   if (mode === "plan") {
     await ensureAgent(cwd);

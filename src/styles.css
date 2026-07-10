@@ -838,3 +838,6 @@ table.data td { padding: 6px 10px; border-bottom: 1px solid var(--border); font-
 
 /* ввод пользователя показывается как набрано (не markdown) */
 .user-plain { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* user-сообщение, отправленное расширением (pi-goal и т.п.), а не пользователем */
+.via-ext { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }

@@ -119,8 +119,11 @@ function finalizeMessage(chat: ChatState, msg: ChatMessage) {
   }
   if (role === "user") {
     // user prompts are added optimistically on send; эхо от pi поглощает ровно ОДИН
-    // непогашенный optimistic-элемент с тем же текстом — два одинаковых сообщения
-    // подряд не схлопываются в одно
+    // непогашенный optimistic-элемент. Сначала точное совпадение текста; если его
+    // нет, но optimistic ждёт — расширение переписало prompt (напр. pi-goal
+    // оборачивает цель) → эхо считается истиной и ЗАМЕНЯЕТ optimistic-элемент.
+    // Эхо вовсе без пары = сообщение отправило расширение, не пользователь —
+    // помечаем viaExtension (бейдж в UI вместо маскировки под пользователя).
     const text = contentText(msg.content);
     const from = Math.max(0, chat.items.length - 6);
     for (let i = chat.items.length - 1; i >= from; i--) {
@@ -132,7 +135,16 @@ function finalizeMessage(chat: ChatState, msg: ChatMessage) {
         return;
       }
     }
-    chat.items = [...chat.items, { key: nextKey(), msg }];
+    for (let i = chat.items.length - 1; i >= from; i--) {
+      const it = chat.items[i];
+      if (it.optimistic && it.msg.role === "user") {
+        const items = [...chat.items];
+        items[i] = { key: it.key, msg, optimistic: false };
+        chat.items = items;
+        return;
+      }
+    }
+    chat.items = [...chat.items, { key: nextKey(), msg, viaExtension: true }];
     return;
   }
   // assistant (and unknown roles worth showing)

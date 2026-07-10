@@ -123,6 +123,39 @@ describe("applyAgentEvent — streaming lifecycle", () => {
     expect(chat.items).toHaveLength(1);
   });
 
+  it("keeps two identical consecutive user messages (each echo consumes one optimistic)", () => {
+    let chat = emptyChatState();
+    chat = addUserMessage({ ...chat }, "again");
+    chat = addUserMessage({ ...chat }, "again");
+    const echo = { type: "message_end", message: { role: "user", content: [{ type: "text", text: "again" }] } };
+    chat = applyAgentEvent({ ...chat }, echo);
+    chat = applyAgentEvent({ ...chat }, echo);
+    expect(chat.items).toHaveLength(2);
+    expect(chat.items.every((it) => !it.optimistic && !it.viaExtension)).toBe(true);
+  });
+
+  it("extension-rewritten echo replaces the pending optimistic item (pi-goal scenario)", () => {
+    let chat = emptyChatState();
+    chat = addUserMessage({ ...chat }, "/goal ship the feature");
+    chat = applyAgentEvent({ ...chat }, {
+      type: "message_end",
+      message: { role: "user", content: [{ type: "text", text: "[GOAL] ship the feature\nGuidelines: …" }] },
+    });
+    expect(chat.items).toHaveLength(1);
+    expect(contentText(chat.items[0].msg.content)).toContain("[GOAL]");
+    expect(chat.items[0].viaExtension).toBeUndefined();
+  });
+
+  it("marks a user echo without an optimistic pair as sent by an extension", () => {
+    let chat = emptyChatState();
+    chat = applyAgentEvent({ ...chat }, {
+      type: "message_end",
+      message: { role: "user", content: [{ type: "text", text: "Continue working on the active goal." }] },
+    });
+    expect(chat.items).toHaveLength(1);
+    expect(chat.items[0].viaExtension).toBe(true);
+  });
+
   it("salvages a streamed message when message_end never arrives", () => {
     let chat = emptyChatState();
     chat = applyAgentEvent({ ...chat }, { type: "agent_start" });

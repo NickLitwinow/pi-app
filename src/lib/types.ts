@@ -113,6 +113,8 @@ export interface TimelineItem {
   msg: ChatMessage;
   /** Добавлено оптимистично при отправке; эхо от pi «поглощает» ровно один такой элемент. */
   optimistic?: boolean;
+  /** User-эхо без optimistic-пары: сообщение в сессию отправило расширение (pi-goal и т.п.). */
+  viaExtension?: boolean;
 }
 
 export interface ChatState {
