@@ -405,7 +405,7 @@ R1→R2 менять местами нельзя (harness бессмыслен, 
 - [x] C1. CI: GitHub Actions (cargo test + tsc + vitest) на push/PR. *(2026-07-11)*
 - [x] C2. LICENSE (MIT) + рабочий бейдж. *(2026-07-11)*
 - [x] C3. Уведомления ОС: tauri-plugin-notification; агент закончил ход / ждёт разрешения, когда окно не в фокусе или открыт другой workspace. *(2026-07-11)*
-- [ ] C4. Разметить баг-лист §4.1 в GitHub issues (P0/P1/P2, good first issue).
+- [x] C4. Открытые пункты плана размечены в GitHub issues [#10–#19](https://github.com/NickLitwinow/pi-app/issues) (E2/E4–E8, R2/R3/R5/R6); закрытые P0/P1 из §4.1 в issues не дублируются. *(2026-07-11)*
 
 **Цель D — личное окружение (§5.9, вне кода приложения):**
 - [ ] D1. Чистка расширений 24→~11 (команды в §5.9-1) + перевод нишевых в per-workspace.
