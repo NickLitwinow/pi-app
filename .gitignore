@@ -4,3 +4,5 @@ src-tauri/target/
 src-tauri/gen/
 .DS_Store
 *.local
+# локальное состояние pi этого проекта (permission-режим и т.п.)
+.pi/
