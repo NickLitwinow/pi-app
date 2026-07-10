@@ -1,0 +1,16 @@
+{
+  "name": "pi-app-harness",
+  "version": "0.1.0",
+  "description": "pi-app workflow harness: todo-first nudge, verify-before-done reminder, and skill routing — ephemeral system reminders injected per LLM call, tuned for local ~35B models.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NickLitwinow/pi-app.git",
+    "directory": "harness-extension"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
