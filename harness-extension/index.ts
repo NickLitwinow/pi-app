@@ -54,6 +54,13 @@ function isNonTrivial(prompt: string): boolean {
 	);
 }
 
+/** Команда, которая считается проверкой: тесты/линт/сборка/тайпчек популярных стеков. */
+function isVerifyCommand(cmd: string): boolean {
+	return /((npm|pnpm|yarn|bun)\s+(run\s+)?(test|check|lint|build|typecheck)|vitest|jest\b|pytest|cargo\s+(test|check|clippy|build)|go\s+(test|vet|build)|\btsc\b|eslint|ruff|mypy|make\s+(test|check|lint|build)|gradlew?\s+(test|check|build)|mvn\s+(test|verify)|ctest|swift\s+(test|build))/i.test(
+		cmd,
+	);
+}
+
 function matchSkill(prompt: string, skills: SkillInfo[]): SkillInfo | null {
 	const installed = new Map(skills.map((s) => [s.name, s]));
 	for (const [re, name] of SKILL_TRIGGERS) {
@@ -109,14 +116,29 @@ export default function harness(pi: ExtensionAPI) {
 		}
 	});
 
+	/** bash-команды по toolCallId: у tool_execution_end нет args — берём из start. */
+	const cmdByCall = new Map<string, string>();
+
+	pi.on("tool_execution_start", async (ev) => {
+		if (String(ev.toolName ?? "").toLowerCase() === "bash") {
+			cmdByCall.set(ev.toolCallId, String((ev.args as { command?: string } | undefined)?.command ?? ""));
+		}
+	});
+
 	pi.on("tool_execution_end", async (ev) => {
 		const name = String(ev.toolName ?? "").toLowerCase();
 		if (name === "edit" || name === "write") {
 			editsUnverified = true;
-		} else if (name === "bash" && editsUnverified) {
-			// любая выполненная команда после правки снимает надж: проверка была
-			// (какая именно — решает модель/скилл verify)
+			return;
+		}
+		if (name !== "bash") return;
+		const cmd = cmdByCall.get(ev.toolCallId) ?? "";
+		cmdByCall.delete(ev.toolCallId);
+		// надж снимает только УСПЕШНАЯ команда, похожая на проверку проекта,
+		// а не любой bash (F2): `echo done` — не верификация
+		if (editsUnverified && !ev.isError && isVerifyCommand(cmd)) {
 			editsUnverified = false;
+			log(`verified by: ${cmd.slice(0, 60)}`);
 		}
 	});
 
@@ -143,6 +165,7 @@ export default function harness(pi: ExtensionAPI) {
 		pendingNudges = [];
 		editsUnverified = false;
 		verifyNudgesSent = 0;
+		cmdByCall.clear();
 	});
 
 	log("loaded");

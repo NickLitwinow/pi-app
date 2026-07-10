@@ -3,7 +3,7 @@ import { getBackend } from "../lib/backend";
 import { confirmDialog, messageDialog } from "../lib/dialog";
 import { firstChangedLine, parseUnifiedDiff, type DiffFile } from "../lib/diff";
 import type { BranchInfo, CommitInfo, GitSummary, StatusEntry } from "../lib/types";
-import { sendPrompt, useStore } from "../state/store";
+import { notifyChat, sendPrompt, useStore } from "../state/store";
 import {
   BranchIcon,
   CheckIcon,
@@ -759,6 +759,19 @@ export default function ReviewView() {
     await sendPrompt(cwd, msg);
   };
 
+  // F3 (ROADMAP §6.1): ревью текущего диффа агентом по скиллу code-review
+  const reviewByAgent = () => {
+    useStore.getState().set({ view: "chat" });
+    void sendPrompt(
+      cwd,
+      "Сделай code review текущих незакоммиченных изменений (staged и unstaged). " +
+        "Следуй скиллу code-review: сначала прочитай его SKILL.md. Возьми дифф (git diff и git diff --cached), " +
+        "для каждого изменённого файла прочитай окружение правок целиком, проверяй каждую находку перед тем как " +
+        "заявить её. Отчёт: file:line — дефект — конкретный сценарий отказа — предлагаемый фикс, по убыванию " +
+        "серьёзности; только подтверждённые проблемы, без стилистики. Ничего не редактируй — только отчёт.",
+    ).catch((e) => notifyChat(cwd, "warning", e instanceof Error ? e.message : String(e)));
+  };
+
   if (isRepo === false) {
     return (
       <div className="chat">
@@ -785,6 +798,11 @@ export default function ReviewView() {
         <button onClick={onGitChanged} title="Обновить">
           <RefreshIcon size={14} />
         </button>
+        {summary != null && summary.changedFiles > 0 && (
+          <button onClick={reviewByAgent} title="Агент проведёт ревью незакоммиченных изменений по скиллу code-review">
+            Ревью агентом
+          </button>
+        )}
         <div className="spacer" data-tauri-drag-region />
         {comments.length > 0 && (
           <button className="primary" onClick={() => void sendComments()}>
