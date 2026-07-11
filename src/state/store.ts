@@ -719,28 +719,8 @@ export async function setAgentMode(cwd: string, mode: AgentMode): Promise<void> 
   if (prev === mode) return;
   updateChat(cwd, (w) => ({ ...w, mode }));
 
-  if (mode === "bypass") {
-    // Bypass снимает гейты pi-permission-system, но сторонние гейтующие
-    // расширения (напр. @aliou/pi-guardrails: secret-files → .env) работают
-    // независимо — честно предупреждаем (ROADMAP §5.10-2, полный контракт в R2).
-    void (async () => {
-      const be = await getBackend();
-      const f = await be.invoke<{ content?: string }>("read_pi_config", { name: "settings" }).catch(() => null);
-      try {
-        const pkgs: string[] = JSON.parse(f?.content ?? "{}").packages ?? [];
-        const gate = pkgs.find((p) => p.includes("pi-guardrails"));
-        if (gate) {
-          notifyChat(
-            cwd,
-            "info",
-            `Bypass не отключает стороннее расширение «${gate}» — секретные файлы (.env и т.п.) оно продолжит блокировать. Отключить: pi remove ${gate}`,
-          );
-        }
-      } catch {
-        // settings.json нечитаем — предупреждение не критично
-      }
-    })();
-  }
+  // Контракт гейтов (§5.10-2): write_permission_preset сам синхронизирует
+  // конфиги известных сторонних гейтов (pi-guardrails) и возвращает сообщение.
 
   if (mode === "plan") {
     await ensureAgent(cwd);
@@ -753,7 +733,11 @@ export async function setAgentMode(cwd: string, mode: AgentMode): Promise<void> 
   }
 
   const be = await getBackend();
-  await be.invoke("write_permission_preset", { cwd, mode });
+  const gateNotice = await be.invoke<string | null>("write_permission_preset", { cwd, mode });
+  if (gateNotice) {
+    // «не трогает» = чужой конфиг guardrails остался активен — это предупреждение
+    notifyChat(cwd, gateNotice.includes("не трогает") ? "warning" : "info", gateNotice);
+  }
 
   // перезапуск с той же сессией, чтобы permission-гейт перечитал конфиг
   const ws = getChat(cwd);

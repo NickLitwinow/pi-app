@@ -349,9 +349,14 @@ fn migrate_project_permission_files(cwd: &str, log: &mut Vec<String>) {
 
 /// Write the project-local permission preset for @gotgenes/pi-permission-system.
 /// A user-authored config (no marker file) is backed up once before overwrite.
+/// Возвращает необязательное сообщение пользователю от контракта гейтов.
 #[tauri::command]
-pub fn write_permission_preset(cwd: String, mode: String) -> Result<(), String> {
-    let content = match mode.as_str() {
+pub fn write_permission_preset(cwd: String, mode: String) -> Result<Option<String>, String> {
+    write_permission_preset_in(&agent_dir(), &cwd, &mode)
+}
+
+pub fn write_permission_preset_in(agent_dir: &Path, cwd: &str, mode: &str) -> Result<Option<String>, String> {
+    let content = match mode {
         "ask" => PRESET_ASK,
         "accept-edits" => PRESET_ACCEPT_EDITS,
         "auto" => PRESET_AUTO,
@@ -359,9 +364,9 @@ pub fn write_permission_preset(cwd: String, mode: String) -> Result<(), String> 
         _ => return Err(format!("unknown mode: {mode}")),
     };
     // сперва убрать проектные legacy-файлы, чтобы расширение не ругалось и не мержило их
-    migrate_project_permission_files(&cwd, &mut Vec::new());
+    migrate_project_permission_files(cwd, &mut Vec::new());
 
-    let dir = project_permission_dir(&cwd);
+    let dir = project_permission_dir(cwd);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let config_path = dir.join("config.json");
     let marker = dir.join(".pi-app-mode");
@@ -373,8 +378,71 @@ pub fn write_permission_preset(cwd: String, mode: String) -> Result<(), String> 
         }
     }
     write_json_atomic(&config_path, content)?;
-    fs::write(&marker, &mode).map_err(|e| e.to_string())?;
-    Ok(())
+    fs::write(&marker, mode).map_err(|e| e.to_string())?;
+    Ok(sync_gate_configs(agent_dir, cwd, mode))
+}
+
+// ---------- контракт гейтов (ROADMAP §5.10-2, E2) ----------
+//
+// Режим разрешений pi-app — контракт со ВСЕМИ гейтующими расширениями, а не
+// только с pi-permission-system. Известный сторонний гейт: @aliou/pi-guardrails.
+// Его проектный конфиг — <cwd>/.pi/extensions/guardrails.json; поле
+// `enabled: false` глушит все проверки (включая блокировку .env в bypass).
+
+const GUARDRAILS_OFF: &str = "{\n  \"enabled\": false\n}\n";
+
+fn guardrails_local_config(cwd: &str) -> PathBuf {
+    Path::new(cwd).join(".pi").join("extensions").join("guardrails.json")
+}
+
+/// Файл — наш bypass-override: ровно один ключ, `{"enabled": false}`.
+/// Всё остальное считается пользовательским конфигом и не трогается.
+fn is_pi_app_guardrails_override(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else { return false };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else { return false };
+    v.as_object()
+        .is_some_and(|m| m.len() == 1 && m.get("enabled").and_then(|b| b.as_bool()) == Some(false))
+}
+
+/// Установлен ли guardrails: ищем в packages глобальных и проектных настроек pi.
+fn guardrails_installed(agent_dir: &Path, cwd: &str) -> bool {
+    let listed = |p: &Path| {
+        fs::read_to_string(p)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.get("packages").map(|pkgs| pkgs.to_string()))
+            .is_some_and(|s| s.contains("pi-guardrails"))
+    };
+    listed(&agent_dir.join("settings.json")) || listed(&Path::new(cwd).join(".pi").join("settings.json"))
+}
+
+/// bypass → отключить guardrails project-locally; другие режимы → снять наш
+/// override (пользовательский конфиг не трогаем никогда). Возвращает сообщение
+/// для тоста: info об отключении или warning о чужом конфиге.
+fn sync_gate_configs(agent_dir: &Path, cwd: &str, mode: &str) -> Option<String> {
+    let path = guardrails_local_config(cwd);
+    if mode == "bypass" {
+        if !guardrails_installed(agent_dir, cwd) {
+            return None;
+        }
+        if path.exists() && !is_pi_app_guardrails_override(&path) {
+            return Some(
+                "Bypass: найден пользовательский .pi/extensions/guardrails.json — pi-app его не трогает, guardrails может продолжать блокировать (например, .env)".into(),
+            );
+        }
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if fs::write(&path, GUARDRAILS_OFF).is_ok() {
+            return Some("Bypass: pi-guardrails отключён для этого проекта (.pi/extensions/guardrails.json)".into());
+        }
+        None
+    } else {
+        if path.exists() && is_pi_app_guardrails_override(&path) {
+            let _ = fs::remove_file(&path);
+        }
+        None
+    }
 }
 
 /// Current preset mode for a workspace, if pi-app manages it.
@@ -547,6 +615,47 @@ mod tests {
         assert_eq!(read_permission_mode(cwd.to_string_lossy().into_owned()).as_deref(), Some("ask"));
         let content = fs::read_to_string(&new_cfg).unwrap();
         assert!(content.contains("\"write\": \"ask\""));
+    }
+
+    #[test]
+    fn gate_contract_bypass_toggles_guardrails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("settings.json"), r#"{"packages":["npm:@aliou/pi-guardrails"]}"#).unwrap();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let cwd = proj.to_string_lossy().into_owned();
+        let gpath = proj.join(".pi").join("extensions").join("guardrails.json");
+
+        // bypass выключает guardrails своим override-файлом
+        let notice = write_permission_preset_in(&agent, &cwd, "bypass").unwrap();
+        assert!(notice.unwrap().contains("отключён"));
+        assert!(is_pi_app_guardrails_override(&gpath));
+
+        // возврат в ask снимает наш override
+        assert!(write_permission_preset_in(&agent, &cwd, "ask").unwrap().is_none());
+        assert!(!gpath.exists());
+
+        // пользовательский конфиг: не трогаем и предупреждаем
+        fs::create_dir_all(gpath.parent().unwrap()).unwrap();
+        fs::write(&gpath, r#"{"enabled": true, "policies": {"rules": []}}"#).unwrap();
+        let notice = write_permission_preset_in(&agent, &cwd, "bypass").unwrap();
+        assert!(notice.unwrap().contains("не трогает"));
+        write_permission_preset_in(&agent, &cwd, "ask").unwrap();
+        assert!(gpath.exists(), "чужой файл сохранён");
+        fs::remove_file(&gpath).unwrap();
+
+        // guardrails не установлен → bypass не создаёт файл и молчит
+        fs::write(agent.join("settings.json"), r#"{"packages":["npm:pi-mcp-adapter"]}"#).unwrap();
+        assert!(write_permission_preset_in(&agent, &cwd, "bypass").unwrap().is_none());
+        assert!(!gpath.exists());
+
+        // ...но проектные packages тоже учитываются
+        fs::create_dir_all(proj.join(".pi")).unwrap();
+        fs::write(proj.join(".pi").join("settings.json"), r#"{"packages":["npm:@aliou/pi-guardrails"]}"#).unwrap();
+        assert!(write_permission_preset_in(&agent, &cwd, "bypass").unwrap().is_some());
+        assert!(gpath.exists());
     }
 
     #[test]
