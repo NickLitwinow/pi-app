@@ -86,6 +86,7 @@ pub fn run() {
             preview::preview_start,
             preview::preview_stop,
             gitops::git_is_repo,
+            gitops::list_workspace_files,
             gitops::git_status,
             gitops::git_checkpoint,
             gitops::git_review_diff,

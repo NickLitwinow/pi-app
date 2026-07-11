@@ -424,6 +424,18 @@ class MockBackend implements Backend {
           { name: "code-review", description: "Review the current diff for bugs", path: "/mock/skills/code-review/SKILL.md", sourceDir: "~/.claude/skills" },
           { name: "verify", description: "Verify a change by running the app", path: "/mock/skills/verify/SKILL.md", sourceDir: "~/.claude/skills" },
         ] satisfies SkillInfo[] as T;
+      case "list_workspace_files":
+        return [
+          "src/App.tsx",
+          "src/components/ChatView.tsx",
+          "src/components/ReviewView.tsx",
+          "src/state/store.ts",
+          "src/lib/backend.ts",
+          "src-tauri/src/gitops.rs",
+          "docs/ROADMAP.md",
+          "package.json",
+          "README.md",
+        ] as T;
       case "process_stats":
         return [
           { kind: "agent", id: "mock-agent-1", label: "/Users/demo/pi-app", pid: 4242, rssMb: 412.5, procs: 6 },

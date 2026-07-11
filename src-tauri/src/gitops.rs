@@ -32,6 +32,50 @@ pub async fn git_is_repo(cwd: String) -> Result<bool, String> {
     }
 }
 
+/// Список файлов рабочего каталога для @-меншенов (E4). В git-репо —
+/// `git ls-files` tracked + untracked с учётом .gitignore; иначе — ограниченный
+/// обход. Возвращает относительные пути, капнутые числом (фронт делает fuzzy).
+#[tauri::command]
+pub async fn list_workspace_files(cwd: String) -> Result<Vec<String>, String> {
+    const CAP: usize = 4000;
+    if let Ok((out, _, 0)) =
+        run_git(&cwd, &["ls-files", "--cached", "--others", "--exclude-standard"]).await
+    {
+        let mut files: Vec<String> = out.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect();
+        files.truncate(CAP);
+        return Ok(files);
+    }
+    // не git — ограниченный обход, пропуская тяжёлые каталоги
+    let root = std::path::PathBuf::from(&cwd);
+    let mut out = Vec::new();
+    let skip = ["node_modules", ".git", "target", "dist", "build", ".venv", "__pycache__"];
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= CAP {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') && name != ".env" {
+                continue;
+            }
+            if p.is_dir() {
+                if !skip.contains(&name.as_str()) {
+                    stack.push(p);
+                }
+            } else if let Ok(rel) = p.strip_prefix(&root) {
+                out.push(rel.to_string_lossy().into_owned());
+                if out.len() >= CAP {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusEntry {

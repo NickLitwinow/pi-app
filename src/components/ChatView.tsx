@@ -444,7 +444,48 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
     return ws.commands.filter((c) => c.name.toLowerCase().includes(q)).slice(0, 12);
   }, [text, ws.commands, palHidden]);
 
+  // @-меншены файлов (E4): токен «@…» перед курсором (концом текста)
+  const [repoFiles, setRepoFiles] = useState<string[]>([]);
+  const [atIdx, setAtIdx] = useState(0);
+  const atQuery = useMemo(() => {
+    const m = /(?:^|\s)@([^\s@]*)$/.exec(text);
+    return m ? m[1] : null;
+  }, [text]);
+
+  // список файлов подгружаем один раз при первом «@» в этом workspace
+  useEffect(() => {
+    if (atQuery == null || repoFiles.length > 0) return;
+    void (async () => {
+      const be = await getBackend();
+      setRepoFiles(await be.invoke<string[]>("list_workspace_files", { cwd }).catch(() => []));
+    })();
+  }, [atQuery, repoFiles.length, cwd]);
+  // смена workspace сбрасывает кэш файлов
+  useEffect(() => setRepoFiles([]), [cwd]);
+
+  const atItems = useMemo(() => {
+    if (atQuery == null) return [] as string[];
+    const q = atQuery.toLowerCase();
+    const scored = repoFiles
+      .filter((f) => f.toLowerCase().includes(q))
+      // короче путь и совпадение в basename — выше
+      .sort((a, b) => {
+        const ab = a.split("/").pop()!.toLowerCase().startsWith(q) ? 0 : 1;
+        const bb = b.split("/").pop()!.toLowerCase().startsWith(q) ? 0 : 1;
+        return ab - bb || a.length - b.length;
+      });
+    return scored.slice(0, 10);
+  }, [atQuery, repoFiles]);
+
+  const applyMention = (path: string) => {
+    // заменяем хвост «@token» на «@path » (pi прочитает файл по пути)
+    setText((t) => t.replace(/(^|\s)@([^\s@]*)$/, `$1@${path} `));
+    setAtIdx(0);
+    taRef.current?.focus();
+  };
+
   useEffect(() => setPalIdx(0), [paletteItems.length]);
+  useEffect(() => setAtIdx(0), [atItems.length]);
 
   const canSendImages = ws.agentState?.model?.input?.includes("image") ?? true;
 
@@ -466,6 +507,28 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (atItems.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setAtIdx((i) => Math.min(i + 1, atItems.length - 1));
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setAtIdx((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === "Tab" || e.key === "Enter") {
+        e.preventDefault();
+        applyMention(atItems[atIdx]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setRepoFiles([]); // прячем палитру, не стирая текст (пере-подтянется на новый @)
+        return;
+      }
+    }
     if (paletteItems.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -557,6 +620,23 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         </div>
       )}
       <div className="composer" style={{ position: "relative" }}>
+        {atItems.length > 0 && (
+          <div className="palette">
+            {atItems.map((f, i) => (
+              <div
+                key={f}
+                className={`p-item ${i === atIdx ? "sel" : ""}`}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applyMention(f);
+                }}
+              >
+                <span className="p-name">@{f.split("/").pop()}</span>
+                <span className="p-desc">{f}</span>
+              </div>
+            ))}
+          </div>
+        )}
         {paletteItems.length > 0 && (
           <div className="palette">
             {paletteItems.map((c, i) => (
