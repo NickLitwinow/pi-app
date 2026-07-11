@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getBackend } from "./lib/backend";
 import { initApp, newSession, updateAppConfig, useStore } from "./state/store";
 import Sidebar from "./components/Sidebar";
@@ -19,6 +19,10 @@ export default function App() {
   const uiScale = useStore((s) => s.appConfig.uiScale);
   const sidebarCollapsed = useStore((s) => s.appConfig.sidebarCollapsed ?? false);
   const sidebarWidth = useStore((s) => s.appConfig.sidebarWidth ?? 240);
+  // читшит хоткеев (⌘/); ref — чтобы keydown-эффект с пустыми deps видел актуальное
+  const [hkOpen, setHkOpen] = useState(false);
+  const hkOpenRef = useRef(false);
+  hkOpenRef.current = hkOpen;
 
   useEffect(() => {
     void initApp();
@@ -88,8 +92,25 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && hkOpenRef.current) {
+        setHkOpen(false);
+        return;
+      }
       if (!(e.metaKey || e.ctrlKey)) return;
       const s = useStore.getState();
+
+      if (e.key === "/") {
+        e.preventDefault();
+        setHkOpen((v) => !v);
+        return;
+      }
+      if (e.key === "l") {
+        e.preventDefault();
+        s.set({ view: "chat" });
+        // после переключения вью композер должен смонтироваться
+        setTimeout(() => document.querySelector<HTMLTextAreaElement>(".composer textarea")?.focus(), 60);
+        return;
+      }
 
       if (e.key === "=" || e.key === "+") {
         e.preventDefault();
@@ -160,6 +181,37 @@ export default function App() {
         {view === "chat" && <ChatView />}
         {view === "review" && <ReviewView />}
         {view === "settings" && <SettingsView />}
+      </div>
+      {hkOpen && <HotkeysOverlay onClose={() => setHkOpen(false)} />}
+    </div>
+  );
+}
+
+const HOTKEYS: Array<[string, string]> = [
+  ["⌘1 / ⌘2 / ⌘4", "Чат / Code Review / Настройки"],
+  ["⌘3", "Live-превью рядом с чатом (сплит)"],
+  ["⌘B", "Свернуть/показать сайдбар"],
+  ["⌘N", "Новая сессия в текущем проекте"],
+  ["⌘L", "Фокус в поле сообщения"],
+  ["⌘,", "Настройки"],
+  ["⌘+ / ⌘− / ⌘0", "Масштаб интерфейса"],
+  ["Enter / ⇧Enter", "Отправить / перенос строки"],
+  ["/", "Палитра команд в композере (Esc — закрыть, текст сохранится)"],
+  ["⌘/", "Эта справка"],
+];
+
+function HotkeysOverlay({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="hk-overlay" onClick={onClose}>
+      <div className="hk-panel" onClick={(e) => e.stopPropagation()}>
+        <div className="c-title" style={{ marginBottom: 10 }}>Горячие клавиши</div>
+        {HOTKEYS.map(([keys, desc]) => (
+          <div key={keys} className="hk-row">
+            <span className="hk-keys">{keys}</span>
+            <span className="hk-desc">{desc}</span>
+          </div>
+        ))}
+        <div className="muted" style={{ marginTop: 10, fontSize: 11 }}>Esc или клик мимо — закрыть</div>
       </div>
     </div>
   );

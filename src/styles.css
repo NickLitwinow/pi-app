@@ -841,3 +841,10 @@ table.data td { padding: 6px 10px; border-bottom: 1px solid var(--border); font-
 
 /* user-сообщение, отправленное расширением (pi-goal и т.п.), а не пользователем */
 .via-ext { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
+
+/* читшит хоткеев (⌘/) */
+.hk-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+.hk-panel { background: var(--panel, #161618); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; min-width: 380px; max-width: 480px; box-shadow: 0 12px 40px rgba(0,0,0,0.5); }
+.hk-row { display: flex; gap: 14px; padding: 4px 0; font-size: 13px; }
+.hk-keys { flex: 0 0 130px; font-variant-numeric: tabular-nums; color: var(--text-dim); white-space: nowrap; }
+.hk-desc { flex: 1; }
