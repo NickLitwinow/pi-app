@@ -33,6 +33,17 @@ const VERIFY_NUDGE =
 	"Before declaring the task complete: run the project's checks/tests " +
 	"(follow the verify skill if installed) and report their REAL output.";
 
+const REPEAT_NUDGE =
+	"STOP: you just repeated the EXACT same tool call. A further repeat will be blocked. " +
+	"Take a DIFFERENT action: use the result you already have, change the arguments, or ask the user.";
+
+const TODO_LOOP_NUDGE =
+	"STOP: you are cycling todo updates without doing real work. Do NOT call todo again now — " +
+	"advance the current task with read/edit/bash first, then update its status once.";
+
+/** Инструменты, считающиеся «содержательной работой» (сбрасывают todo-серию). */
+const WORK_TOOLS = new Set(["read", "edit", "write", "bash", "grep", "find", "ls"]);
+
 /** Триггеры → имя скилла. Подсказываем только если скилл реально установлен.
  *  ВАЖНО: `\b` в JS-регэкспах не работает с кириллицей (не входит в \w) —
  *  для русских основ используем голые вхождения, для коротких английских
@@ -83,6 +94,11 @@ export default function harness(pi: ExtensionAPI) {
 	let skillsCache: SkillInfo[] = [];
 	/** Скиллы, уже подсказанные в этом ране (не повторяемся). */
 	const hintedSkills = new Set<string>();
+	/** Анти-луп (H1): подпись последнего tool-вызова и длина серии повторов. */
+	let lastCallSig = "";
+	let sameCallStreak = 0;
+	/** Анти-луп (H2): длина серии todo-вызовов без содержательной работы. */
+	let todoStreak = 0;
 
 	const log = (line: string) => {
 		if (!debugLog) return;
@@ -109,6 +125,9 @@ export default function harness(pi: ExtensionAPI) {
 		editsUnverified = false;
 		verifyNudgesSent = 0;
 		hintedSkills.clear();
+		lastCallSig = "";
+		sameCallStreak = 0;
+		todoStreak = 0;
 		skillsCache = (ev.systemPromptOptions?.skills ?? []) as SkillInfo[];
 
 		const prompt = (ev.prompt ?? "").trim();
@@ -121,6 +140,57 @@ export default function harness(pi: ExtensionAPI) {
 		}
 		const skill = matchSkill(prompt, skillsCache);
 		if (skill) skillHint(skill, "this task");
+	});
+
+	// Анти-луп (§5.11-1): наблюдаемый отказ локальной 35B — карусель одинаковых
+	// вызовов (read того же файла, todo create→pending→completed) без прогресса.
+	// Эскалация: 2-й идентичный подряд → стоп-реминдер; 4-й → блокировка вызова.
+	// Todo-серия: 3 подряд без содержательной работы → реминдер; 6 → блок todo.
+	pi.on("tool_call", async (ev) => {
+		const name = String(ev.toolName ?? "").toLowerCase();
+		let sig = name;
+		try {
+			sig = `${name}:${JSON.stringify(ev.input ?? {})}`;
+		} catch {
+			// нестрокуемый input — различаем только по имени
+		}
+		if (sig === lastCallSig) {
+			sameCallStreak++;
+		} else {
+			lastCallSig = sig;
+			sameCallStreak = 1;
+		}
+		if (sameCallStreak === 2) {
+			pendingNudges.push(REPEAT_NUDGE);
+			log(`loop: repeat x2 ${name}`);
+		} else if (sameCallStreak >= 4) {
+			log(`loop: BLOCK repeat x${sameCallStreak} ${name}`);
+			return {
+				block: true,
+				reason:
+					"pi-app-harness: this exact tool call was already executed several times in a row. " +
+					"Use the earlier result or take a different action.",
+			};
+		}
+
+		if (name === "todo") {
+			todoStreak++;
+			if (todoStreak === 3) {
+				pendingNudges.push(TODO_LOOP_NUDGE);
+				log("loop: todo x3");
+			} else if (todoStreak >= 6) {
+				log(`loop: BLOCK todo x${todoStreak}`);
+				return {
+					block: true,
+					reason:
+						"pi-app-harness: too many consecutive todo updates without real work. " +
+						"Advance the task with read/edit/bash first.",
+				};
+			}
+		} else if (WORK_TOOLS.has(name)) {
+			todoStreak = 0;
+		}
+		return undefined;
 	});
 
 	/** bash-команды по toolCallId: у tool_execution_end нет args — берём из start. */
@@ -198,6 +268,9 @@ export default function harness(pi: ExtensionAPI) {
 		verifyNudgesSent = 0;
 		cmdByCall.clear();
 		hintedSkills.clear();
+		lastCallSig = "";
+		sameCallStreak = 0;
+		todoStreak = 0;
 	});
 
 	log("loaded");
