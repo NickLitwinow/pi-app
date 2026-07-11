@@ -39,7 +39,7 @@ const VERIFY_NUDGE =
  *  токенов — явные границы. */
 const SKILL_TRIGGERS: Array<[RegExp, string]> = [
 	[/(ревью|провер(ь|ка)\s+(код|дифф)|посмотри\s+(pr|дифф|diff)|code\s+review|\breview\b)/i, "code-review"],
-	[/(баг|ошибк|краш|падает|не\s+работает|сломал|исправь|почини|\b(bug|crash|fix|broken)\b)/i, "debug"],
+	[/(баг|ошибк|краш|падает|не\s+работает|слома|исправ|почин|\b(bug|crash|fix|broken)\b)/i, "debug"],
 	[/(тест|покрыти|\b(tests?|coverage)\b)/i, "testing"],
 	[/(коммит|запушь|релиз|\b(commit|push|pull\s+request|merge\s+request|pr|mr|release|ship)\b)/i, "ship"],
 	[/(работает\s+ли|проверь,?\s+что|убедись|прогони\s+провер|\bverify\b)/i, "verify"],
@@ -79,6 +79,10 @@ export default function harness(pi: ExtensionAPI) {
 	let editsUnverified = false;
 	/** Сколько раз verify-надж уже вставлен в этом ране (потолок 2). */
 	let verifyNudgesSent = 0;
+	/** Скиллы из систем-промпта (кэш с before_agent_start) — для todo-роутинга. */
+	let skillsCache: SkillInfo[] = [];
+	/** Скиллы, уже подсказанные в этом ране (не повторяемся). */
+	const hintedSkills = new Set<string>();
 
 	const log = (line: string) => {
 		if (!debugLog) return;
@@ -90,30 +94,33 @@ export default function harness(pi: ExtensionAPI) {
 		}
 	};
 
+	const skillHint = (skill: SkillInfo, reason: string) => {
+		if (hintedSkills.has(skill.name)) return;
+		hintedSkills.add(skill.name);
+		pendingNudges.push(
+			`The "${skill.name}" skill matches ${reason}${skill.description ? ` (${skill.description})` : ""}. ` +
+				"Read its SKILL.md now and follow it instead of improvising.",
+		);
+		log(`nudge: skill ${skill.name} [${reason}]`);
+	};
+
 	pi.on("before_agent_start", async (ev) => {
 		pendingNudges = [];
 		editsUnverified = false;
 		verifyNudgesSent = 0;
+		hintedSkills.clear();
+		skillsCache = (ev.systemPromptOptions?.skills ?? []) as SkillInfo[];
 
 		const prompt = (ev.prompt ?? "").trim();
-		log(
-			`start: skills=[${((ev.systemPromptOptions?.skills ?? []) as SkillInfo[]).map((s) => s?.name ?? JSON.stringify(Object.keys(s ?? {}))).join(",")}]`,
-		);
+		log(`start: skills=${skillsCache.length}`);
 		if (!prompt || prompt.startsWith("/")) return; // слэш-команды не трогаем
 
 		if (isNonTrivial(prompt)) {
 			pendingNudges.push(TODO_NUDGE);
 			log("nudge: todo-first");
 		}
-		const skills = (ev.systemPromptOptions?.skills ?? []) as SkillInfo[];
-		const skill = matchSkill(prompt, skills);
-		if (skill) {
-			pendingNudges.push(
-				`The "${skill.name}" skill matches this task${skill.description ? ` (${skill.description})` : ""}. ` +
-					"Read its SKILL.md now and follow it instead of improvising.",
-			);
-			log(`nudge: skill ${skill.name}`);
-		}
+		const skill = matchSkill(prompt, skillsCache);
+		if (skill) skillHint(skill, "this task");
 	});
 
 	/** bash-команды по toolCallId: у tool_execution_end нет args — берём из start. */
@@ -129,6 +136,30 @@ export default function harness(pi: ExtensionAPI) {
 		const name = String(ev.toolName ?? "").toLowerCase();
 		if (name === "edit" || name === "write") {
 			editsUnverified = true;
+			return;
+		}
+		if (name === "todo" && !ev.isError) {
+			// F5: роутинг по активной задаче. Сабджект in_progress-задачи берём
+			// (а) структурно из details.params, (б) из list-формата «[in_progress] #3 subject»,
+			// (в) из create/update-формата «#1: subject (in_progress)».
+			const details = (ev.result as { details?: { params?: { subject?: unknown; status?: unknown } } } | null)
+				?.details;
+			const subjects: string[] = [];
+			if (details?.params?.status === "in_progress" && typeof details.params.subject === "string") {
+				subjects.push(details.params.subject);
+			}
+			const text = JSON.stringify(ev.result ?? "");
+			const listM = /\[in_progress\]\s+#\d+\s+([^"\\(]+)/.exec(text);
+			if (listM) subjects.push(listM[1]);
+			const inlineM = /#\d+:?\s+([^"\\(]+?)\s*\(in_progress\)/.exec(text);
+			if (inlineM) subjects.push(inlineM[1]);
+			for (const subject of subjects) {
+				const skill = matchSkill(subject, skillsCache);
+				if (skill) {
+					skillHint(skill, `the active todo ("${subject.trim().slice(0, 60)}")`);
+					break;
+				}
+			}
 			return;
 		}
 		if (name !== "bash") return;
@@ -166,6 +197,7 @@ export default function harness(pi: ExtensionAPI) {
 		editsUnverified = false;
 		verifyNudgesSent = 0;
 		cmdByCall.clear();
+		hintedSkills.clear();
 	});
 
 	log("loaded");
