@@ -230,6 +230,9 @@ function DiffFileBlock({
   const editor = useStore((s) => s.appConfig.editor);
   const [commentDraft, setCommentDraft] = useState<number | null>(null);
   const [draftText, setDraftText] = useState("");
+  // G1: большие диффы сворачиваем по умолчанию — тысячи DOM-строк тормозят
+  const totalLines = file.hunks.reduce((n, h) => n + h.lines.length, 0);
+  const [expanded, setExpanded] = useState(totalLines <= 400);
 
   const openInEditor = async () => {
     const be = await getBackend();
@@ -252,6 +255,14 @@ function DiffFileBlock({
         <div className="muted" style={{ padding: 12 }}>
           Бинарный файл
         </div>
+      ) : !expanded ? (
+        <button
+          className="muted"
+          style={{ display: "block", width: "100%", padding: 12, textAlign: "left" }}
+          onClick={() => setExpanded(true)}
+        >
+          Большой дифф: {totalLines} строк, {file.hunks.length} ханков — показать
+        </button>
       ) : (
         file.hunks.map((h, hi) => (
           <div key={hi}>
