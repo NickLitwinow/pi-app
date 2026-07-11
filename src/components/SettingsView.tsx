@@ -359,13 +359,69 @@ const RECOMMENDED_EXTENSIONS: Recommended[] = [
   },
 ];
 
+/** Рекомендуемое ядро (ROADMAP §5.9): пакеты вне списка — кандидаты в per-workspace.
+ *  Матчинг по подстроке, чтобы покрыть и npm-имена, и локальные пути. */
+const CORE_PACKAGES = [
+  "pi-mcp-adapter",
+  "rpiv-todo",
+  "rpiv-ask-user-question",
+  "pi-hermes-memory",
+  "pi-rewind",
+  "pi-permission-system",
+  "pi-claude-style-tools",
+  "pi-retry",
+  "pi-statusline",
+  "pi-vcc",
+  "plannotator",
+  "harness",
+];
+
+/** Грубая оценка токенов текста (≈4 символа/токен для английских описаний). */
+function estTokens(s: string): number {
+  return Math.max(1, Math.round(s.length / 4));
+}
+
 function ExtensionsTab() {
+  const [pkgs, setPkgs] = useState<string[] | null>(null);
+
+  useEffect(() => {
+    void (async () => {
+      const be = await getBackend();
+      const f = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" }).catch(() => null);
+      try {
+        setPkgs((JSON.parse(f?.content ?? "{}").packages ?? []) as string[]);
+      } catch {
+        setPkgs([]);
+      }
+    })();
+  }, []);
+
+  const extras = (pkgs ?? []).filter((p) => !CORE_PACKAGES.some((c) => p.includes(c)));
+
   return (
-    <Marketplace
-      kind="extension"
-      recommended={RECOMMENDED_EXTENSIONS}
-      installHint="Маркетплейс сообщества pi.dev. Установка выполняет «pi install»; изменения подхватываются новыми сессиями агента."
-    />
+    <div>
+      {pkgs != null && pkgs.length > 0 && (
+        <div className="card" style={{ padding: "10px 12px", marginBottom: 12 }}>
+          <div className="c-title" style={{ fontSize: 13 }}>
+            Куратор окружения: {pkgs.length} глобальных пакетов · {extras.length} вне рекомендуемого ядра
+          </div>
+          {extras.length > 0 ? (
+            <div className="c-sub">
+              Каждое расширение добавляет свои инструкции в стартовый промпт каждой сессии («fewest tools
+              wins» для локальной 35B). Кандидаты на перенос в проектный <code>.pi/settings.json</code>:{" "}
+              {extras.join(", ")}. Обоснование — docs/ROADMAP.md §5.9.
+            </div>
+          ) : (
+            <div className="c-sub">Все пакеты в пределах рекомендуемого ядра pi-app.</div>
+          )}
+        </div>
+      )}
+      <Marketplace
+        kind="extension"
+        recommended={RECOMMENDED_EXTENSIONS}
+        installHint="Маркетплейс сообщества pi.dev. Установка выполняет «pi install»; изменения подхватываются новыми сессиями агента."
+      />
+    </div>
   );
 }
 
@@ -400,9 +456,12 @@ function SkillsTab() {
       />
       <div className="section-title" style={{ padding: "16px 2px 6px" }}>
         Установленные локально · {skills.length}
+        {skills.length > 0 &&
+          ` · описания ≈ ${skills.reduce((n, s) => n + estTokens(s.name + s.description), 0)} ток. в каждом системном промпте`}
       </div>
       <div className="hint" style={{ marginBottom: 10 }}>
-        Каталоги skills настраиваются в settings.json → «skills» (вкладка «Общие»).
+        Каталоги skills настраиваются в settings.json → «skills» (вкладка «Общие»). Описание каждого скилла
+        pi кладёт в стартовый промпт целиком — длинные описания стоят токенов в каждой сессии.
       </div>
       {Object.entries(grouped).map(([dir, list]) => (
         <div key={dir}>
@@ -411,7 +470,12 @@ function SkillsTab() {
           </div>
           {list.map((s) => (
             <div key={s.path} className="card click" style={{ padding: "8px 12px" }} onClick={() => void open(s.path)}>
-              <div className="c-title" style={{ fontSize: 13 }}>{s.name}</div>
+              <div className="c-title" style={{ fontSize: 13 }}>
+                {s.name}
+                <span className="muted" style={{ fontWeight: 400, fontSize: 11, marginLeft: 8 }}>
+                  ≈{estTokens(s.name + s.description)} ток.
+                </span>
+              </div>
               {s.description && <div className="c-sub">{s.description}</div>}
             </div>
           ))}
