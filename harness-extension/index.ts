@@ -41,6 +41,23 @@ const TODO_LOOP_NUDGE =
 	"STOP: you are cycling todo updates without doing real work. Do NOT call todo again now — " +
 	"advance the current task with read/edit/bash first, then update its status once.";
 
+const CONTEXT_NUDGE =
+	"Context has grown past the reliable size for this model. FINISH the current todo item, " +
+	"then compact the session (or ask the user to /compact) BEFORE starting anything new. " +
+	"Prefer finishing over exploring; do not open new files unless strictly required.";
+
+const SUMMARY_NUDGE =
+	"All todos are complete. Give the user a concise summary NOW: what was changed (files), " +
+	"how it was verified (real command output), and anything left undone. Then STOP — no more tool calls.";
+
+const REREAD_NUDGE =
+	"You are re-reading the same file in small slices. Read the needed range in ONE call " +
+	"(or the whole file if it is small) and MOVE ON to acting on it.";
+
+/** Порог контекст-гарда (~токены, оценка chars/4): за train seq 8К модель уже
+ *  деградирует, но рабочая зона до ~60К с дисциплиной. */
+const CONTEXT_NUDGE_TOKENS = 60_000;
+
 const MALFORMED_NUDGE =
 	"Your tool calls are arriving with EMPTY arguments — the call format is broken. " +
 	"Emit the tool call again with ALL required fields as proper JSON " +
@@ -112,6 +129,12 @@ export default function harness(pi: ExtensionAPI) {
 	let blockedCalls = 0;
 	/** Подряд идущие assistant-сообщения со сломанными (пустые args) tool-вызовами. */
 	let malformedStreak = 0;
+	/** file-read-streak: последний читаемый path и длина серии его чтений подряд. */
+	let lastReadPath = "";
+	let readStreak = 0;
+	/** Одноразовые за ран флаги контекст-гарда и итога. */
+	let contextNudged = false;
+	let summaryNudged = false;
 
 	const log = (line: string) => {
 		if (!debugLog) return;
@@ -143,6 +166,10 @@ export default function harness(pi: ExtensionAPI) {
 		todoStreak = 0;
 		blockedCalls = 0;
 		malformedStreak = 0;
+		lastReadPath = "";
+		readStreak = 0;
+		contextNudged = false;
+		summaryNudged = false;
 		skillsCache = (ev.systemPromptOptions?.skills ?? []) as SkillInfo[];
 
 		const prompt = (ev.prompt ?? "").trim();
@@ -227,6 +254,32 @@ export default function harness(pi: ExtensionAPI) {
 		} else if (WORK_TOOLS.has(name)) {
 			todoStreak = 0;
 		}
+
+		// file-read-streak: чтение одного файла ломтями (offset меняется — детектор
+		// идентичных вызовов не ловит). 3 подряд → надж, 5 → блок.
+		if (name === "read") {
+			const input = (ev.input ?? {}) as { path?: string; file_path?: string };
+			const p = String(input.path ?? input.file_path ?? "");
+			if (p && p === lastReadPath) {
+				readStreak++;
+				if (readStreak === 3) {
+					pendingNudges.push(REREAD_NUDGE);
+					log(`loop: reread x3 ${p.split("/").pop()}`);
+				} else if (readStreak >= 5) {
+					log(`loop: BLOCK reread x${readStreak} ${p.split("/").pop()}`);
+					return blockCall(
+						"pi-app-harness: this file was just read several times in slices. " +
+							"Use what you already have or read one large range, then act.",
+					);
+				}
+			} else {
+				lastReadPath = p;
+				readStreak = 1;
+			}
+		} else {
+			lastReadPath = "";
+			readStreak = 0;
+		}
 		return undefined;
 	});
 
@@ -302,6 +355,18 @@ export default function harness(pi: ExtensionAPI) {
 					break;
 				}
 			}
+			// итог по завершению: все задачи completed → потребовать финальное резюме
+			if (!summaryNudged) {
+				const text = JSON.stringify(ev.result ?? "");
+				// только статус-маркеры в скобках: «(pending →» перехода не считается открытой задачей
+				const hasCompleted = /[\[(]completed[\])]|(→|->)\s*completed/.test(text);
+				const hasOpen = /[\[(](pending|in_progress)[\])]/.test(text);
+				if (hasCompleted && !hasOpen) {
+					summaryNudged = true;
+					pendingNudges.push(SUMMARY_NUDGE);
+					log("nudge: summary");
+				}
+			}
 			return;
 		}
 		if (name !== "bash") return;
@@ -316,6 +381,22 @@ export default function harness(pi: ExtensionAPI) {
 	});
 
 	pi.on("context", async (ev) => {
+		// контекст-гард: за пределами надёжного размера — курс на завершение и компакцию
+		if (!contextNudged) {
+			let chars = 0;
+			for (const m of ev.messages) {
+				try {
+					chars += JSON.stringify((m as { content?: unknown }).content ?? "").length;
+				} catch {
+					// не считаем нестрокуемое
+				}
+			}
+			if (chars / 4 > CONTEXT_NUDGE_TOKENS) {
+				contextNudged = true;
+				pendingNudges.push(CONTEXT_NUDGE);
+				log(`nudge: context ~${Math.round(chars / 4 / 1000)}K`);
+			}
+		}
 		const notes = [...pendingNudges];
 		pendingNudges = [];
 		if (editsUnverified && verifyNudgesSent < 2) {
@@ -343,6 +424,10 @@ export default function harness(pi: ExtensionAPI) {
 		lastCallSig = "";
 		sameCallStreak = 0;
 		todoStreak = 0;
+		lastReadPath = "";
+		readStreak = 0;
+		contextNudged = false;
+		summaryNudged = false;
 	});
 
 	log("loaded");

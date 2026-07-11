@@ -796,7 +796,8 @@ function StatusLine({ ws, cwd }: { ws: WorkspaceChat; cwd: string }) {
   return (
     <div className="statusline">
       {ws.alive ? <span className="dot live" /> : <span className="dot idle" />}
-      <span className="sl-fixed">{ws.alive ? "агент активен" : "агент остановлен"}</span>
+      {/* спавн ленивый (R1-A): до первого сообщения это норма, а не сбой */}
+      <span className="sl-fixed">{ws.alive ? "агент активен" : "агент запустится с первым сообщением"}</span>
       {tokens?.input != null && <span className="sl-fixed">↑{fmtNum(tokens.input)} ↓{fmtNum(tokens.output ?? 0)}</span>}
       {cost != null && cost > 0 && <span className="sl-fixed">${cost.toFixed(3)}</span>}
       {entries.map((e, i) => {
