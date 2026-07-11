@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getBackend } from "./lib/backend";
-import { initApp, newSession, updateAppConfig, useStore } from "./state/store";
+import { initApp, newSession, selectWorkspace, updateAppConfig, useStore } from "./state/store";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import ReviewView from "./components/ReviewView";
@@ -23,6 +23,10 @@ export default function App() {
   const [hkOpen, setHkOpen] = useState(false);
   const hkOpenRef = useRef(false);
   hkOpenRef.current = hkOpen;
+  // ⌘K командная палитра
+  const [cmdkOpen, setCmdkOpen] = useState(false);
+  const cmdkOpenRef = useRef(false);
+  cmdkOpenRef.current = cmdkOpen;
 
   useEffect(() => {
     void initApp();
@@ -96,9 +100,18 @@ export default function App() {
         setHkOpen(false);
         return;
       }
+      if (e.key === "Escape" && cmdkOpenRef.current) {
+        setCmdkOpen(false);
+        return;
+      }
       if (!(e.metaKey || e.ctrlKey)) return;
       const s = useStore.getState();
 
+      if (e.key === "k") {
+        e.preventDefault();
+        setCmdkOpen((v) => !v);
+        return;
+      }
       if (e.key === "/") {
         e.preventDefault();
         setHkOpen((v) => !v);
@@ -183,11 +196,110 @@ export default function App() {
         {view === "settings" && <SettingsView />}
       </div>
       {hkOpen && <HotkeysOverlay onClose={() => setHkOpen(false)} />}
+      {cmdkOpen && <CommandPalette onClose={() => setCmdkOpen(false)} />}
+    </div>
+  );
+}
+
+interface Cmd {
+  id: string;
+  label: string;
+  hint?: string;
+  run: () => void;
+}
+
+function CommandPalette({ onClose }: { onClose: () => void }) {
+  const projects = useStore((s) => s.projects);
+  const extra = useStore((s) => s.extraWorkspaces);
+  const currentCwd = useStore((s) => s.currentCwd);
+  const [q, setQ] = useState("");
+  const [idx, setIdx] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setTimeout(() => inputRef.current?.focus(), 30);
+  }, []);
+
+  const cmds = useMemo<Cmd[]>(() => {
+    const s = useStore.getState();
+    const go = (patch: Parameters<typeof s.set>[0]) => {
+      s.set(patch);
+      onClose();
+    };
+    const list: Cmd[] = [
+      { id: "chat", label: "Перейти: Чат", hint: "⌘1", run: () => go({ view: "chat" }) },
+      { id: "review", label: "Перейти: Code Review", hint: "⌘2", run: () => go({ view: "review" }) },
+      { id: "settings", label: "Перейти: Настройки", hint: "⌘4", run: () => go({ view: "settings" }) },
+      { id: "preview", label: "Переключить live-превью (сплит)", hint: "⌘3", run: () => go({ view: "chat", previewOpen: !s.previewOpen }) },
+      { id: "sidebar", label: "Переключить боковую панель", hint: "⌘B", run: () => { toggleSidebar(); onClose(); } },
+      {
+        id: "newsession",
+        label: "Новая сессия",
+        hint: "⌘N",
+        run: () => { if (currentCwd) void newSession(currentCwd); onClose(); },
+      },
+    ];
+    const seen = new Set<string>();
+    for (const p of [...extra, ...projects]) {
+      if (seen.has(p.cwd)) continue;
+      seen.add(p.cwd);
+      list.push({
+        id: `ws:${p.cwd}`,
+        label: `Проект: ${p.name}`,
+        hint: p.cwd === currentCwd ? "текущий" : undefined,
+        run: () => { selectWorkspace(p.cwd); onClose(); },
+      });
+    }
+    return list;
+  }, [projects, extra, currentCwd, onClose]);
+
+  const filtered = useMemo(() => {
+    const query = q.trim().toLowerCase();
+    if (!query) return cmds;
+    return cmds.filter((c) => c.label.toLowerCase().includes(query));
+  }, [q, cmds]);
+
+  useEffect(() => setIdx(0), [q]);
+
+  const onKey = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); setIdx((i) => Math.min(i + 1, filtered.length - 1)); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setIdx((i) => Math.max(i - 1, 0)); }
+    else if (e.key === "Enter") { e.preventDefault(); filtered[idx]?.run(); }
+  };
+
+  return (
+    <div className="hk-overlay" onClick={onClose}>
+      <div className="cmdk" onClick={(e) => e.stopPropagation()}>
+        <input
+          ref={inputRef}
+          className="cmdk-input"
+          placeholder="Команда или проект…"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={onKey}
+        />
+        <div className="cmdk-list">
+          {filtered.length === 0 && <div className="muted" style={{ padding: "10px 12px" }}>Ничего не найдено</div>}
+          {filtered.map((c, i) => (
+            <div
+              key={c.id}
+              className={`cmdk-item ${i === idx ? "sel" : ""}`}
+              onMouseEnter={() => setIdx(i)}
+              onMouseDown={(e) => { e.preventDefault(); c.run(); }}
+            >
+              <span>{c.label}</span>
+              {c.hint && <span className="muted" style={{ fontSize: "var(--text-xs)" }}>{c.hint}</span>}
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
 
 const HOTKEYS: Array<[string, string]> = [
+  ["⌘K", "Командная палитра (навигация, проекты)"],
+  ["⌘F", "Поиск по сессии"],
   ["⌘1 / ⌘2 / ⌘4", "Чат / Code Review / Настройки"],
   ["⌘3", "Live-превью рядом с чатом (сплит)"],
   ["⌘B", "Свернуть/показать сайдбар"],
