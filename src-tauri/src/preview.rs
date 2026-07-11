@@ -20,9 +20,19 @@ use tokio::sync::oneshot;
 use crate::supervisor::child_path;
 
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
-// serverId → (kill-signal sender, pid лидера группы). Задача-владелец ждёт сигнал;
-// pid нужен для аварийного SIGKILL группе при выходе приложения.
-static SERVERS: Mutex<Option<HashMap<String, (oneshot::Sender<()>, Option<u32>)>>> = Mutex::new(None);
+// serverId → (kill-signal sender, pid лидера группы, label=cwd). Задача-владелец
+// ждёт сигнал; pid нужен для SIGKILL группе при выходе и для процесс-панели.
+static SERVERS: Mutex<Option<HashMap<String, (oneshot::Sender<()>, Option<u32>, String)>>> = Mutex::new(None);
+
+/// Снимок работающих dev-серверов для процесс-панели: (serverId, label, pid).
+pub fn server_list() -> Vec<(String, String, Option<u32>)> {
+    SERVERS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.iter().map(|(id, (_, pid, label))| (id.clone(), label.clone(), *pid)).collect())
+        .unwrap_or_default()
+}
 
 /// Завершить dev-сервер со всей process group (npm → vite/node): SIGTERM группе,
 /// до 1с грейса, затем безусловный SIGKILL — иначе дети переживают лидера и
@@ -44,13 +54,13 @@ async fn kill_child_group(child: &mut tokio::process::Child) {
 /// Аварийная остановка всех dev-серверов при выходе приложения: сигнал задачам
 /// плюс немедленный SIGKILL группам (задачи могут не успеть до завершения процесса).
 pub fn stop_all_servers() {
-    let entries: Vec<(oneshot::Sender<()>, Option<u32>)> = SERVERS
+    let entries: Vec<(oneshot::Sender<()>, Option<u32>, String)> = SERVERS
         .lock()
         .unwrap()
         .as_mut()
         .map(|m| m.drain().map(|(_, v)| v).collect())
         .unwrap_or_default();
-    for (tx, pid) in entries {
+    for (tx, pid, _label) in entries {
         let _ = tx.send(());
         #[cfg(unix)]
         if let Some(pid) = pid {
@@ -196,7 +206,7 @@ pub async fn preview_start(
         .lock()
         .unwrap()
         .get_or_insert_with(HashMap::new)
-        .insert(server_id.clone(), (kill_tx, child_pid));
+        .insert(server_id.clone(), (kill_tx, child_pid, cwd.clone()));
 
     {
         let app = app.clone();
@@ -226,7 +236,7 @@ pub async fn preview_start(
 #[tauri::command]
 pub fn preview_stop(server_id: String) -> Result<(), String> {
     let entry = SERVERS.lock().unwrap().as_mut().and_then(|m| m.remove(&server_id));
-    if let Some((tx, _pid)) = entry {
+    if let Some((tx, _pid, _label)) = entry {
         let _ = tx.send(());
     }
     Ok(())

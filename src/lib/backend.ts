@@ -424,6 +424,12 @@ class MockBackend implements Backend {
           { name: "code-review", description: "Review the current diff for bugs", path: "/mock/skills/code-review/SKILL.md", sourceDir: "~/.claude/skills" },
           { name: "verify", description: "Verify a change by running the app", path: "/mock/skills/verify/SKILL.md", sourceDir: "~/.claude/skills" },
         ] satisfies SkillInfo[] as T;
+      case "process_stats":
+        return [
+          { kind: "agent", id: "mock-agent-1", label: "/Users/demo/pi-app", pid: 4242, rssMb: 412.5, procs: 6 },
+          { kind: "preview", id: "srv-1", label: "/Users/demo/pi-app", pid: 4310, rssMb: 156.2, procs: 3 },
+          { kind: "app", id: "app", label: "pi-app (процесс приложения)", pid: 100, rssMb: 220.7, procs: 1 },
+        ] as T;
       case "spawn_agent": {
         const id = `mock-agent-${this.agentSeq++}`;
         // как реальный pi: агент открывается на переданной сессии (get_state

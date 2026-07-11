@@ -611,3 +611,120 @@ pub async fn list_agents_impl<R: Runtime>(sup: &Supervisor<R>) -> Result<Vec<Age
 fn _assert_agent_fields_used(a: &Agent) -> &str {
     &a.id
 }
+
+// ---------- процесс-панель (R3-G2): RSS по process group ----------
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcStat {
+    /// "agent" | "preview" | "app"
+    pub kind: String,
+    pub id: String,
+    /// Человекочитаемая подпись (cwd воркспейса и т.п.)
+    pub label: String,
+    pub pid: Option<u32>,
+    pub rss_mb: f64,
+    /// Сколько процессов в группе (pi + его MCP-дети и т.д.)
+    pub procs: u32,
+}
+
+/// Разбор вывода `ps -axo pid=,pgid=,rss=` (rss в КБ).
+/// Возвращает (rss_kb и число процессов по каждой группе; rss_kb по каждому pid).
+fn parse_ps(text: &str) -> (HashMap<u32, (u64, u32)>, HashMap<u32, u64>) {
+    let mut by_group: HashMap<u32, (u64, u32)> = HashMap::new();
+    let mut by_pid: HashMap<u32, u64> = HashMap::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(pgid), Some(rss)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(pgid), Ok(rss)) = (pid.parse::<u32>(), pgid.parse::<u32>(), rss.parse::<u64>()) else {
+            continue;
+        };
+        let e = by_group.entry(pgid).or_insert((0, 0));
+        e.0 += rss;
+        e.1 += 1;
+        by_pid.insert(pid, rss);
+    }
+    (by_group, by_pid)
+}
+
+fn ps_snapshot() -> (HashMap<u32, (u64, u32)>, HashMap<u32, u64>) {
+    let out = std::process::Command::new("ps").args(["-axo", "pid=,pgid=,rss="]).output();
+    match out {
+        Ok(o) => parse_ps(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => (HashMap::new(), HashMap::new()),
+    }
+}
+
+const KB_IN_MB: f64 = 1024.0;
+
+/// Снимок памяти: агенты pi (вся process group — включая MCP-детей),
+/// dev-серверы превью (группа) и собственный процесс приложения.
+#[tauri::command]
+pub async fn process_stats(sup: State<'_, Supervisor<tauri::Wry>>) -> Result<Vec<ProcStat>, String> {
+    process_stats_impl(&sup).await
+}
+
+pub async fn process_stats_impl<R: Runtime>(sup: &Supervisor<R>) -> Result<Vec<ProcStat>, String> {
+    let (by_group, by_pid) = ps_snapshot();
+    let mut out = Vec::new();
+
+    {
+        let map = sup.agents.lock().await;
+        for (id, a) in map.iter() {
+            let pid = a.child.lock().await.id();
+            let (kb, n) = pid.and_then(|p| by_group.get(&p)).copied().unwrap_or((0, 0));
+            out.push(ProcStat {
+                kind: "agent".into(),
+                id: id.clone(),
+                label: a.cwd.clone(),
+                pid,
+                rss_mb: kb as f64 / KB_IN_MB,
+                procs: n,
+            });
+        }
+    }
+
+    for (id, label, pid) in crate::preview::server_list() {
+        let (kb, n) = pid.and_then(|p| by_group.get(&p)).copied().unwrap_or((0, 0));
+        out.push(ProcStat {
+            kind: "preview".into(),
+            id,
+            label,
+            pid,
+            rss_mb: kb as f64 / KB_IN_MB,
+            procs: n,
+        });
+    }
+
+    // собственный процесс (WebKit-хелперы macOS живут вне нашей группы и сюда не входят)
+    let own = std::process::id();
+    let own_kb = by_pid.get(&own).copied().unwrap_or(0);
+    out.push(ProcStat {
+        kind: "app".into(),
+        id: "app".into(),
+        label: "pi-app (процесс приложения; WebView-хелперы macOS не учитываются)".into(),
+        pid: Some(own),
+        rss_mb: own_kb as f64 / KB_IN_MB,
+        procs: 1,
+    });
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ps;
+
+    #[test]
+    fn parse_ps_sums_groups_and_pids() {
+        let text = "  101  100  2048\n  100  100  1024\n  200  200  512\nмусор строка\n  300  300  abc\n";
+        let (groups, pids) = parse_ps(text);
+        assert_eq!(groups.get(&100), Some(&(3072, 2)));
+        assert_eq!(groups.get(&200), Some(&(512, 1)));
+        assert_eq!(groups.get(&300), None, "нечисловой rss пропущен");
+        assert_eq!(pids.get(&101), Some(&2048));
+        assert_eq!(pids.get(&100), Some(&1024));
+    }
+}

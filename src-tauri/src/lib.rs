@@ -56,6 +56,7 @@ pub fn run() {
             supervisor::agent_send,
             supervisor::kill_agent,
             supervisor::list_agents,
+            supervisor::process_stats,
             sessions::list_projects,
             sessions::list_sessions,
             sessions::list_sessions_for_cwd,

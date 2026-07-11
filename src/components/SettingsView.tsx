@@ -6,7 +6,7 @@ import { updateAppConfig, useStore } from "../state/store";
 import Marketplace, { type Recommended } from "./Marketplace";
 import { CheckIcon, ErrorIcon, FolderIcon, RefreshIcon } from "./icons";
 
-type Tab = "general" | "extensions" | "skills" | "mcp" | "models" | "app";
+type Tab = "general" | "extensions" | "skills" | "mcp" | "models" | "proc" | "app";
 
 /** Текстовое поле с отложенной записью: локальное значение мгновенно, коммит в файл —
  *  после паузы ввода (иначе settings.json переписывается на каждую букву — I/O-шторм
@@ -40,12 +40,95 @@ function useDebouncedField(
   return [local, set];
 }
 
+// ---------- процесс-панель (R3-G2): куда уходит память ----------
+
+interface ProcStat {
+  kind: "agent" | "preview" | "app" | string;
+  id: string;
+  label: string;
+  pid: number | null;
+  rssMb: number;
+  procs: number;
+}
+
+const PROC_KIND_LABEL: Record<string, string> = {
+  agent: "Агент pi",
+  preview: "Dev-сервер",
+  app: "Приложение",
+};
+
+function ProcessesTab() {
+  const [rows, setRows] = useState<ProcStat[] | null>(null);
+
+  const refresh = useCallback(async () => {
+    const be = await getBackend();
+    setRows(await be.invoke<ProcStat[]>("process_stats").catch(() => []));
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const t = setInterval(() => void refresh(), 3000);
+    return () => clearInterval(t);
+  }, [refresh]);
+
+  const kill = async (r: ProcStat) => {
+    const be = await getBackend();
+    if (r.kind === "agent") await be.invoke("kill_agent", { agentId: r.id }).catch(() => {});
+    else if (r.kind === "preview") await be.invoke("preview_stop", { serverId: r.id }).catch(() => {});
+    void refresh();
+  };
+
+  const total = (rows ?? []).reduce((n, r) => n + r.rssMb, 0);
+
+  return (
+    <div>
+      <div className="hint" style={{ marginBottom: 10 }}>
+        Каждый агент pi — это process group: сам pi плюс его MCP-серверы и хелперы; dev-серверы превью —
+        тоже группа (npm + vite/node). WebKit-хелперы macOS живут вне групп приложения и здесь не видны.
+        Обновление каждые 3 секунды.
+      </div>
+      <div className="section-title" style={{ padding: "0 2px 6px" }}>
+        Суммарно ≈ {Math.round(total)} МБ
+      </div>
+      {rows != null && rows.length === 0 && <div className="muted">Нет запущенных процессов.</div>}
+      {(rows ?? []).map((r) => (
+        <div
+          key={`${r.kind}:${r.id}`}
+          className="card"
+          style={{ padding: "8px 12px", display: "flex", alignItems: "center", gap: 10 }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="c-title" style={{ fontSize: 13 }}>
+              {PROC_KIND_LABEL[r.kind] ?? r.kind}
+              <span className="muted" style={{ fontWeight: 400, fontSize: 11, marginLeft: 8 }}>
+                {r.pid != null ? `pid ${r.pid}` : "pid —"} · {r.procs} проц.
+              </span>
+            </div>
+            <div className="c-sub" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {r.label}
+            </div>
+          </div>
+          <div style={{ fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>
+            {r.rssMb >= 100 ? Math.round(r.rssMb) : r.rssMb.toFixed(1)} МБ
+          </div>
+          {(r.kind === "agent" || r.kind === "preview") && (
+            <button onClick={() => void kill(r)} title={r.kind === "agent" ? "Остановить агента" : "Остановить dev-сервер"}>
+              Стоп
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 const ALL_TABS: { id: Tab; label: string; needsPi: boolean }[] = [
   { id: "general", label: "Общие", needsPi: false },
   { id: "extensions", label: "Расширения", needsPi: true },
   { id: "skills", label: "Skills", needsPi: true },
   { id: "mcp", label: "MCP", needsPi: true },
   { id: "models", label: "Модели и эндпоинты", needsPi: true },
+  { id: "proc", label: "Процессы", needsPi: false },
   { id: "app", label: "Приложение", needsPi: false },
 ];
 
@@ -871,6 +954,7 @@ export default function SettingsView() {
         {effective === "skills" && <SkillsTab />}
         {effective === "mcp" && <McpTab />}
         {effective === "models" && <ModelsTab />}
+        {effective === "proc" && <ProcessesTab />}
         {effective === "app" && <AppTab />}
       </div>
     </div>
