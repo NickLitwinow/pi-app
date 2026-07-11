@@ -153,6 +153,15 @@ export default function harness(pi: ExtensionAPI) {
 			pendingNudges.push(TODO_NUDGE);
 			log("nudge: todo-first");
 		}
+		// свежие факты → web-инструменты (H4): модель сама о них не вспоминает
+		if (/(найди в (интернете|сети)|погугли|поищи в|актуальн\w+ верси|последн\w+ верси|latest version|search the web|что нового в)/i.test(prompt)) {
+			pendingNudges.push(
+				"This task needs FRESH external facts. Use the web tools now: web_search for discovery, " +
+					"fetch_content for a specific page. Do not answer from memory. " +
+					"If web tools are not available, state that explicitly.",
+			);
+			log("nudge: web");
+		}
 		const skill = matchSkill(prompt, skillsCache);
 		if (skill) skillHint(skill, "this task");
 	});
