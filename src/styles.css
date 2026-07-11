@@ -5,7 +5,30 @@
 :root {
   --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
-  --radius: 10px;
+
+  /* ---- scales (R6 §5.3): единые шкалы вместо магических чисел в inline-стилях ---- */
+  /* spacing (4px база) */
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px;
+  --space-4: 16px; --space-5: 24px; --space-6: 32px;
+  /* type */
+  --text-xs: 11px; --text-sm: 12.5px; --text-md: 13px; --text-lg: 15px; --text-xl: 20px;
+  /* radius */
+  --radius-sm: 6px; --radius-md: 10px; --radius-lg: 14px;
+  --radius: 10px; /* legacy-алиас (= --radius-md) */
+
+  /* ---- motion (R6 §5.8): один источник длительностей и кривых, spring-подобные ---- */
+  --dur-1: 0.12s;  /* микровзаимодействия (hover/press) */
+  --dur-2: 0.18s;  /* поповеры/меню */
+  --dur-3: 0.24s;  /* появление сообщений */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);       /* snappy, «пружинистый» вылет */
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1); /* лёгкий overshoot */
+  --press-scale: 0.97;
+
+  /* поверхность поповеров/модалок и уровни высоты (var() резолвится лениво,
+     поэтому автоматически следует за сменой темы) */
+  --panel: var(--bg-raised);
+  --elev-1: 0 4px 14px rgba(0, 0, 0, 0.28);
+  --elev-2: var(--shadow);
   /* коэффициент масштаба UI (transform на #root); нужен для контр-масштабирования
      физических констант вроде зоны системных traffic lights */
   --ui-scale: 1;
@@ -100,10 +123,12 @@ button {
   cursor: pointer;
   border-radius: 7px;
   padding: 5px 10px;
-  transition: background 0.12s ease;
+  /* motion §5.8: анимируем только фон+transform; press-scale даёт тактильный отклик */
+  transition: background var(--dur-1) ease, transform var(--dur-1) var(--ease-out);
 }
 button:hover { background: var(--bg-hover); }
-button:active { background: var(--bg-active); }
+button:active { background: var(--bg-active); transform: scale(var(--press-scale)); }
+button:disabled:active { transform: none; }
 button.primary { background: var(--accent); color: var(--accent-contrast); }
 button.primary:hover { background: var(--accent); opacity: 0.85; }
 button.danger { color: var(--danger); }
