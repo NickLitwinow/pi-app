@@ -6,3 +6,4 @@ src-tauri/gen/
 *.local
 # локальное состояние pi этого проекта (permission-режим и т.п.)
 .pi/
+bench/results/

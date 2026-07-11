@@ -41,6 +41,15 @@ const TODO_LOOP_NUDGE =
 	"STOP: you are cycling todo updates without doing real work. Do NOT call todo again now — " +
 	"advance the current task with read/edit/bash first, then update its status once.";
 
+const MALFORMED_NUDGE =
+	"Your tool calls are arriving with EMPTY arguments — the call format is broken. " +
+	"Emit the tool call again with ALL required fields as proper JSON " +
+	'(write: {"path": …, "content": …}; edit: {"path", "oldText", "newText"}; read: {"path"}; bash: {"command"}). ' +
+	"Do NOT wrap tool calls in markdown.";
+
+/** Инструменты, у которых пустые arguments всегда означают сломанный вызов. */
+const ARGS_REQUIRED = new Set(["read", "write", "edit", "bash"]);
+
 /** Инструменты, считающиеся «содержательной работой» (сбрасывают todo-серию). */
 const WORK_TOOLS = new Set(["read", "edit", "write", "bash", "grep", "find", "ls"]);
 
@@ -99,6 +108,10 @@ export default function harness(pi: ExtensionAPI) {
 	let sameCallStreak = 0;
 	/** Анти-луп (H2): длина серии todo-вызовов без содержательной работы. */
 	let todoStreak = 0;
+	/** Сколько вызовов уже заблокировано в этом ране (предохранитель на аборт). */
+	let blockedCalls = 0;
+	/** Подряд идущие assistant-сообщения со сломанными (пустые args) tool-вызовами. */
+	let malformedStreak = 0;
 
 	const log = (line: string) => {
 		if (!debugLog) return;
@@ -128,6 +141,8 @@ export default function harness(pi: ExtensionAPI) {
 		lastCallSig = "";
 		sameCallStreak = 0;
 		todoStreak = 0;
+		blockedCalls = 0;
+		malformedStreak = 0;
 		skillsCache = (ev.systemPromptOptions?.skills ?? []) as SkillInfo[];
 
 		const prompt = (ev.prompt ?? "").trim();
@@ -146,7 +161,7 @@ export default function harness(pi: ExtensionAPI) {
 	// вызовов (read того же файла, todo create→pending→completed) без прогресса.
 	// Эскалация: 2-й идентичный подряд → стоп-реминдер; 4-й → блокировка вызова.
 	// Todo-серия: 3 подряд без содержательной работы → реминдер; 6 → блок todo.
-	pi.on("tool_call", async (ev) => {
+	pi.on("tool_call", async (ev, ctx) => {
 		const name = String(ev.toolName ?? "").toLowerCase();
 		let sig = name;
 		try {
@@ -160,17 +175,32 @@ export default function harness(pi: ExtensionAPI) {
 			lastCallSig = sig;
 			sameCallStreak = 1;
 		}
+
+		// Предохранитель: блокировки не останавливают генерацию — модель может
+		// пробовать бесконечно (наблюдалось BLOCK todo x20 до таймаута). После
+		// 8 заблокированных вызовов ран прерывается целиком.
+		const blockCall = (reason: string) => {
+			blockedCalls++;
+			if (blockedCalls >= 8) {
+				log(`loop: ABORT after ${blockedCalls} blocked calls`);
+				try {
+					ctx.abort();
+				} catch {
+					// abort вне стрима кидает — игнорируем
+				}
+			}
+			return { block: true, reason };
+		};
+
 		if (sameCallStreak === 2) {
 			pendingNudges.push(REPEAT_NUDGE);
 			log(`loop: repeat x2 ${name}`);
 		} else if (sameCallStreak >= 4) {
 			log(`loop: BLOCK repeat x${sameCallStreak} ${name}`);
-			return {
-				block: true,
-				reason:
-					"pi-app-harness: this exact tool call was already executed several times in a row. " +
+			return blockCall(
+				"pi-app-harness: this exact tool call was already executed several times in a row. " +
 					"Use the earlier result or take a different action.",
-			};
+			);
 		}
 
 		if (name === "todo") {
@@ -180,17 +210,50 @@ export default function harness(pi: ExtensionAPI) {
 				log("loop: todo x3");
 			} else if (todoStreak >= 6) {
 				log(`loop: BLOCK todo x${todoStreak}`);
-				return {
-					block: true,
-					reason:
-						"pi-app-harness: too many consecutive todo updates without real work. " +
+				return blockCall(
+					"pi-app-harness: too many consecutive todo updates without real work. " +
 						"Advance the task with read/edit/bash first.",
-				};
+				);
 			}
 		} else if (WORK_TOOLS.has(name)) {
 			todoStreak = 0;
 		}
 		return undefined;
+	});
+
+	// Детектор сломанных tool-вызовов (формат-дрейф Qwable): вызовы с пустыми
+	// arguments отбраковываются ДО tool_call-события — детекторы выше их не видят
+	// (наблюдалось 60×write{} подряд до таймаута). Ловим на message_end.
+	pi.on("message_end", async (ev, ctx) => {
+		const msg = ev.message as { role?: string; content?: unknown } | undefined;
+		if (msg?.role !== "assistant" || !Array.isArray(msg.content)) return;
+		let sawCall = false;
+		let sawBroken = false;
+		for (const b of msg.content as Array<{ type?: string; name?: string; arguments?: unknown }>) {
+			if (b?.type !== "toolCall") continue;
+			sawCall = true;
+			const name = String(b.name ?? "").toLowerCase();
+			const args = b.arguments;
+			const empty = args == null || (typeof args === "object" && Object.keys(args as object).length === 0);
+			if (ARGS_REQUIRED.has(name) && empty) sawBroken = true;
+		}
+		if (!sawCall) return;
+		if (!sawBroken) {
+			malformedStreak = 0;
+			return;
+		}
+		malformedStreak++;
+		if (malformedStreak === 2) {
+			pendingNudges.push(MALFORMED_NUDGE);
+			log("loop: malformed x2");
+		} else if (malformedStreak >= 6) {
+			log(`loop: ABORT malformed x${malformedStreak}`);
+			try {
+				ctx.abort();
+			} catch {
+				// вне стрима — игнорируем
+			}
+		}
 	});
 
 	/** bash-команды по toolCallId: у tool_execution_end нет args — берём из start. */
