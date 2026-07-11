@@ -59,29 +59,29 @@ Browse and install community extensions and skills from the npm registry.
 | [Rust](https://rustup.rs) | stable (for building) |
 | [Git](https://git-scm.com) | ≥ 2.39 |
 
-### Install from Source
+### One-command install
+
+Clone, build, and drop the app into `/Applications` in a single step:
 
 ```bash
-# Clone the repository
-git clone https://github.com/NickLitwinow/pi-app.git
-cd pi-app
-
-# Install dependencies
-npm install
-
-# Run in development mode (with mock backend for UI testing)
-npm run dev
-# Opens http://localhost:1420/ in your browser
-
-# Run with Tauri (requires pi installed)
-npm run tauri dev
+git clone https://github.com/NickLitwinow/pi-app.git && cd pi-app && npm run bootstrap
 ```
 
-### Build for Distribution
+The app is unsigned — on first launch, right-click `Pi.app` → **Open**. Install
+[pi](https://pi.dev) so agent sessions work.
+
+### Develop
 
 ```bash
-# Build a signed .app and .dmg (requires Developer ID for notarization)
-npm run tauri build
+npm install
+npm run dev          # UI only, mock backend, no pi needed — http://localhost:1420
+npm run tauri dev    # full app with hot-reload (requires pi installed)
+```
+
+### Build for distribution
+
+```bash
+npm run tauri build  # .app + .dmg under src-tauri/target/release/bundle/
 ```
 
 ## ⌨️ Keyboard Shortcuts
@@ -184,15 +184,23 @@ The mock backend simulates sessions, tool calls, permissions, and analytics.
 | Icons | [Lucide React](https://lucide.dev) |
 | Security | [DOMPurify 3](https://github.com/cure53/DOMPurify) |
 
+## 🗺 Roadmap
+
+Development is planned and tracked in **[docs/ROADMAP.md](docs/ROADMAP.md)** — a detailed,
+iteration-by-iteration plan (harness, memory/performance, ecosystem, design system).
+Open items are filed as [issues](https://github.com/NickLitwinow/pi-app/issues).
+
 ## 🤝 Contributing
 
-Contributions are welcome! Please read the [PLAN.md](PLAN.md) for architecture details and requirements.
+Contributions are welcome — see **[CONTRIBUTING.md](CONTRIBUTING.md)** for dev setup, the
+repository map, how to run the tests, and the PR checklist. Good starting points are issues
+labeled [`good first issue`](https://github.com/NickLitwinow/pi-app/labels/good%20first%20issue);
+open-ended questions go in [Discussions](https://github.com/NickLitwinow/pi-app/discussions).
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'feat: add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+## 🙏 Acknowledgements
+
+Built on top of the open [pi](https://pi.dev) coding agent and its community ecosystem of
+extensions, skills, and themes.
 
 ## 📄 License
 

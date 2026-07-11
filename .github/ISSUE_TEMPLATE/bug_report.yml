@@ -1,0 +1,42 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What went wrong, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open workspace …
+        2. Click …
+        3. See …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version / commit
+      description: Footer shows the build; or `git rev-parse --short HEAD`.
+    validations:
+      required: false
+  - type: input
+    id: pi
+    attributes:
+      label: pi version
+      description: Output of `pi --version`.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots
+      description: Console errors, screenshots, or a short clip if UI-related.
+    validations:
+      required: false

@@ -300,8 +300,8 @@
 **Программа:**
 1. LICENSE (после выбора) + правка бейджа.
 2. **README-рефакторинг** (EN — основной, README.ru — зеркало): hero-скриншоты light/dark + GIF стриминга; «Why pi-app» (vs Claude Desktop / pi TUI — наша ниша: локальные модели, открытая экосистема); Install (Releases dmg, позже brew cask); Quickstart; Architecture (процессная модель из PLAN §3.2 диаграммой); ссылки на ROADMAP/SKILLS-AUDIT/AGENT-ENV; Contributing; Acknowledgements (pi.dev).
-3. **CONTRIBUTING.md**: dev-setup (npm i → npm run tauri dev), карта модулей (½ страницы), как гонять тесты (cargo/vitest/e2e), conventional commits, чеклист PR (verify обязателен).
-4. **.github/**: workflows — CI из §5.5 + release-сборка по тегу (артефакт dmg; пока без подписи — с инструкцией right-click→Open); ISSUE_TEMPLATE (bug/feature); PR-шаблон.
+3. **CONTRIBUTING.md** ✅ 2026-07-11: dev-setup, карта репозитория, тесты (tsc/vitest/cargo), conventional commits, чеклист PR. + one-command `npm run bootstrap` (§5.11-6): `npm ci` → `tauri build` → `scripts/install-app.mjs` копирует `Pi.app` в /Applications (unsigned → right-click Open). README EN/RU: секции one-command install, Roadmap, Contributing, Acknowledgements.
+4. **.github/** ✅ (частично) 2026-07-11: ISSUE_TEMPLATE (bug/feature yml + config с Discussions), PR-шаблон. Остаётся: release-сборка по тегу (dmg-артефакт) — после разблокировки биллинга CI (§5.11-5).
 5. Разметить баг-лист §4.1 в issues, часть — `good first issue`; включить Discussions; ROADMAP-ссылка из README.
 6. Политика: новые модули и публичные доки — EN; существующие RU-комментарии переводить по мере касания.
 
