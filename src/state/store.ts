@@ -1073,18 +1073,26 @@ export async function rewindToMessage(cwd: string, userIndex: number, text: stri
   const msgs = (data.messages ?? []) as { entryId: string; text: string }[];
   const target = pickForkEntry(msgs, userIndex, text);
   if (!target) throw new Error("Сообщение для отката не найдено");
-  // fork с pi-rewind восстанавливает файлы + может ждать подтверждения — на
-  // медленной модели/большой сессии это долго, поэтому таймаут щедрый.
-  const res = (await rpcRequest(cwd, { type: "fork", entryId: target.entryId }, 180000)) as {
-    text?: string;
-    cancelled?: boolean;
-  };
-  if (res.cancelled) return;
+
+  // In-session rewind (§5.12-4, как в Claude Code): если наш harness
+  // предоставляет /pi-rewind — откатываемся navigateTree'ом ВНУТРИ той же
+  // сессии (leaf сдвигается, новый файл НЕ создаётся). Иначе — легаси-путь
+  // через RPC fork (создаёт ветку-сессию). pi-rewind в обоих случаях может
+  // предложить восстановление файлов диалогом.
+  const hasInSession = ws.commands.some((c) => c.name === "pi-rewind");
+  if (hasInSession) {
+    await rpcRequest(cwd, { type: "prompt", message: `/pi-rewind ${target.entryId}` }, 180000);
+  } else {
+    const res = (await rpcRequest(cwd, { type: "fork", entryId: target.entryId }, 180000)) as {
+      cancelled?: boolean;
+    };
+    if (res.cancelled) return;
+  }
   discardQueuedEvents(cwd);
-  // полная история новой активной ветки — из файла живого агента
+  // полная история активной ветки — из файла живого агента (тот же при in-session)
   const live = getChat(cwd).liveSessionPath ?? ws.sessionPath;
   const chat = live ? await loadSessionFromFile(live) : emptyChatState();
-  chat.editorPrefill = res.text ?? target.text;
+  chat.editorPrefill = target.text;
   updateChat(cwd, (w) => ({ ...w, chat }));
   await refreshAgentMeta(cwd);
 }

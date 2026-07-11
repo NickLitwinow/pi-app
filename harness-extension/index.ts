@@ -160,6 +160,31 @@ export default function harness(pi: ExtensionAPI) {
 		log(`nudge: skill ${skill.name} [${reason}]`);
 	};
 
+	// /pi-rewind <entryId> — откат IN-SESSION (§5.12-4): navigateTree сдвигает
+	// leaf в том же файле сессии (в отличие от RPC fork, который всегда плодит
+	// новый файл). pi-app вызывает эту команду вместо fork, если она доступна.
+	pi.registerCommand("pi-rewind", {
+		description: "pi-app: откат разговора к сообщению внутри текущей сессии (без новой сессии)",
+		handler: async (args, ctx) => {
+			const entryId = args.trim();
+			if (!entryId) {
+				ctx.ui.notify("pi-rewind: не передан entryId", "warning");
+				return;
+			}
+			const entry = ctx.sessionManager.getEntry(entryId);
+			// откат «до этого сообщения» = leaf на родителя выбранного user-сообщения
+			const target = entry?.parentId ?? null;
+			if (!target) {
+				// первое сообщение ветки — родителя нет; навигация «в начало» не
+				// выражается через navigateTree, пусть pi-app откатит через fork
+				ctx.ui.notify("pi-rewind: это первое сообщение — используйте форк", "info");
+				return;
+			}
+			await ctx.navigateTree(target, { summarize: false });
+			log(`rewind: navigateTree -> ${target}`);
+		},
+	});
+
 	pi.on("before_agent_start", async (ev) => {
 		pendingNudges = [];
 		editsUnverified = false;
