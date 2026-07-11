@@ -842,6 +842,12 @@ table.data td { padding: 6px 10px; border-bottom: 1px solid var(--border); font-
 /* user-сообщение, отправленное расширением (pi-goal и т.п.), а не пользователем */
 .via-ext { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
 
+/* ⌘F поиск по сессии */
+.chat-search { position: absolute; top: 8px; right: 16px; z-index: 30; display: flex; align-items: center; gap: 6px; background: var(--panel, #161618); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.4); }
+.chat-search input { width: 200px; background: transparent; border: none; outline: none; color: inherit; font-size: 13px; }
+.chat-search button { padding: 2px 7px; }
+.msg.search-hit { outline: 2px solid var(--accent, #4a9eff); outline-offset: 2px; border-radius: 8px; }
+
 /* читшит хоткеев (⌘/) */
 .hk-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 1000; }
 .hk-panel { background: var(--panel, #161618); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; min-width: 380px; max-width: 480px; box-shadow: 0 12px 40px rgba(0,0,0,0.5); }

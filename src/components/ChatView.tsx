@@ -9,6 +9,7 @@ import {
   compactContext,
   isBrowsingAway,
   loadModelsAndCommands,
+  msgPinId,
   newSession,
   notifyChat,
   refreshStats,
@@ -955,6 +956,73 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
     }, 60);
   };
 
+  // ⌘F: поиск по сообщениям текущей сессии (E5-2)
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [matchPos, setMatchPos] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  /** Для какого query уже прыгали: первый Enter идёт к текущему матчу, не к следующему. */
+  const jumpedFor = useRef("");
+
+  const matches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!searchOpen || q.length < 2) return [] as number[];
+    const out: number[] = [];
+    ws.chat.items.forEach((it, i) => {
+      if (contentText(it.msg.content).toLowerCase().includes(q)) out.push(i);
+    });
+    return out;
+  }, [searchOpen, query, ws.chat.items]);
+
+  const gotoMatch = (pos: number) => {
+    if (matches.length === 0) return;
+    const p = ((pos % matches.length) + matches.length) % matches.length;
+    setMatchPos(p);
+    const it = ws.chat.items[matches[p]];
+    if (it) jumpToPin(msgPinId(it.msg));
+  };
+
+  const closeSearch = () => {
+    setSearchOpen(false);
+    setQuery("");
+    setMatchPos(0);
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+        e.preventDefault();
+        setSearchOpen(true);
+        setTimeout(() => searchInputRef.current?.focus(), 40);
+      } else if (e.key === "Escape" && searchOpen) {
+        closeSearch();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchOpen]);
+
+  // подсветка текущего совпадения (после jumpToPin и коммита расширенного окна)
+  useEffect(() => {
+    if (!searchOpen || matches.length === 0) return;
+    const it = ws.chat.items[matches[matchPos]];
+    if (!it) return;
+    let el: HTMLElement | null = null;
+    const t = setTimeout(() => {
+      const found = ref.current?.querySelector(`[data-pin="${msgPinId(it.msg)}"]`);
+      if (found instanceof HTMLElement) {
+        el = found;
+        el.classList.add("search-hit");
+      }
+    }, 120);
+    return () => {
+      clearTimeout(t);
+      el?.classList.remove("search-hit");
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchOpen, matchPos, matches]);
+
   const empty = ws.chat.items.length === 0 && !ws.chat.streaming;
   const items = ws.chat.items;
   const visible = items.length <= renderLimit ? items : items.slice(items.length - renderLimit);
@@ -964,6 +1032,36 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
 
   return (
     <div style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}>
+      {searchOpen && (
+        <div className="chat-search">
+          <input
+            ref={searchInputRef}
+            placeholder="Поиск по сессии…"
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setMatchPos(0);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                if (jumpedFor.current !== query) {
+                  jumpedFor.current = query;
+                  gotoMatch(matchPos);
+                } else {
+                  gotoMatch(e.shiftKey ? matchPos - 1 : matchPos + 1);
+                }
+              }
+            }}
+          />
+          <span className="muted" style={{ fontVariantNumeric: "tabular-nums" }}>
+            {matches.length ? matchPos + 1 : 0}/{matches.length}
+          </span>
+          <button title="Предыдущее (⇧Enter)" onClick={() => gotoMatch(matchPos - 1)}>↑</button>
+          <button title="Следующее (Enter)" onClick={() => gotoMatch(matchPos + 1)}>↓</button>
+          <button title="Закрыть (Esc)" onClick={closeSearch}>✕</button>
+        </div>
+      )}
       <PinnedWidget cwd={cwd} ws={ws} onJump={jumpToPin} />
       <div className="msg-scroll" ref={ref} onScroll={onScroll} style={{ flex: 1 }}>
         {empty ? (
