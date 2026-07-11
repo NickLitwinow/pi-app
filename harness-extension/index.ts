@@ -54,9 +54,11 @@ const REREAD_NUDGE =
 	"You are re-reading the same file in small slices. Read the needed range in ONE call " +
 	"(or the whole file if it is small) and MOVE ON to acting on it.";
 
-/** Порог контекст-гарда (~токены, оценка chars/4): за train seq 8К модель уже
- *  деградирует, но рабочая зона до ~60К с дисциплиной. */
-const CONTEXT_NUDGE_TOKENS = 60_000;
+/** Порог контекст-гарда (~токены, оценка chars/4). Окно модели 262К, поэтому
+ *  голый размер — не повод паниковать: ниже порога надж не приходит вовсе, а в
+ *  «серой зоне» (½ порога…порог) — только при признаках деградации (луп-события
+ *  в этом ране). Настраивается: PI_APP_HARNESS_CTX_TOKENS. */
+const CONTEXT_NUDGE_TOKENS = Number(process.env.PI_APP_HARNESS_CTX_TOKENS ?? "") || 100_000;
 
 const MALFORMED_NUDGE =
 	"Your tool calls are arriving with EMPTY arguments — the call format is broken. " +
@@ -135,6 +137,8 @@ export default function harness(pi: ExtensionAPI) {
 	/** Одноразовые за ран флаги контекст-гарда и итога. */
 	let contextNudged = false;
 	let summaryNudged = false;
+	/** Были ли в этом ране луп-события (повторы/блоки/reread) — сигнал деградации. */
+	let loopSignals = 0;
 
 	const log = (line: string) => {
 		if (!debugLog) return;
@@ -170,6 +174,7 @@ export default function harness(pi: ExtensionAPI) {
 		readStreak = 0;
 		contextNudged = false;
 		summaryNudged = false;
+		loopSignals = 0;
 		skillsCache = (ev.systemPromptOptions?.skills ?? []) as SkillInfo[];
 
 		const prompt = (ev.prompt ?? "").trim();
@@ -231,8 +236,10 @@ export default function harness(pi: ExtensionAPI) {
 		if (sameCallStreak === 2) {
 			pendingNudges.push(REPEAT_NUDGE);
 			log(`loop: repeat x2 ${name}`);
+			loopSignals++;
 		} else if (sameCallStreak >= 4) {
 			log(`loop: BLOCK repeat x${sameCallStreak} ${name}`);
+			loopSignals++;
 			return blockCall(
 				"pi-app-harness: this exact tool call was already executed several times in a row. " +
 					"Use the earlier result or take a different action.",
@@ -244,8 +251,10 @@ export default function harness(pi: ExtensionAPI) {
 			if (todoStreak === 3) {
 				pendingNudges.push(TODO_LOOP_NUDGE);
 				log("loop: todo x3");
+			loopSignals++;
 			} else if (todoStreak >= 6) {
 				log(`loop: BLOCK todo x${todoStreak}`);
+			loopSignals++;
 				return blockCall(
 					"pi-app-harness: too many consecutive todo updates without real work. " +
 						"Advance the task with read/edit/bash first.",
@@ -265,8 +274,10 @@ export default function harness(pi: ExtensionAPI) {
 				if (readStreak === 3) {
 					pendingNudges.push(REREAD_NUDGE);
 					log(`loop: reread x3 ${p.split("/").pop()}`);
+			loopSignals++;
 				} else if (readStreak >= 5) {
 					log(`loop: BLOCK reread x${readStreak} ${p.split("/").pop()}`);
+			loopSignals++;
 					return blockCall(
 						"pi-app-harness: this file was just read several times in slices. " +
 							"Use what you already have or read one large range, then act.",
@@ -308,6 +319,7 @@ export default function harness(pi: ExtensionAPI) {
 		if (malformedStreak === 2) {
 			pendingNudges.push(MALFORMED_NUDGE);
 			log("loop: malformed x2");
+			loopSignals++;
 		} else if (malformedStreak >= 6) {
 			log(`loop: ABORT malformed x${malformedStreak}`);
 			try {
@@ -391,10 +403,13 @@ export default function harness(pi: ExtensionAPI) {
 					// не считаем нестрокуемое
 				}
 			}
-			if (chars / 4 > CONTEXT_NUDGE_TOKENS) {
+			const tokens = chars / 4;
+			// жёсткий порог — всегда; серая зона (½ порога…порог) — только при
+			// наблюдаемой деградации (луп-события в этом ране)
+			if (tokens > CONTEXT_NUDGE_TOKENS || (tokens > CONTEXT_NUDGE_TOKENS / 2 && loopSignals > 0)) {
 				contextNudged = true;
 				pendingNudges.push(CONTEXT_NUDGE);
-				log(`nudge: context ~${Math.round(chars / 4 / 1000)}K`);
+				log(`nudge: context ~${Math.round(tokens / 1000)}K (loopSignals=${loopSignals})`);
 			}
 		}
 		const notes = [...pendingNudges];
@@ -428,6 +443,7 @@ export default function harness(pi: ExtensionAPI) {
 		readStreak = 0;
 		contextNudged = false;
 		summaryNudged = false;
+		loopSignals = 0;
 	});
 
 	log("loaded");
