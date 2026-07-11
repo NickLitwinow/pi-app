@@ -48,3 +48,52 @@ pub fn start_sessions_watcher<R: Runtime>(app: AppHandle<R>) {
         }
     });
 }
+
+/// Watch pi agent config files (settings.json, models.json, mcp.json) and
+/// notify the WebView (debounced) when they change outside the app — правки
+/// из TUI/редактора должны подхватываться без перезапуска (§5.12-5).
+pub fn start_config_watcher<R: Runtime>(app: AppHandle<R>) {
+    std::thread::spawn(move || {
+        let dir = crate::sessions::agent_dir();
+        let (tx, rx) = mpsc::channel::<String>();
+        let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(ev) = res {
+                for p in &ev.paths {
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        if matches!(name, "settings.json" | "models.json" | "mcp.json") {
+                            let _ = tx.send(name.to_string());
+                        }
+                    }
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err() {
+            return;
+        }
+
+        while let Ok(first) = rx.recv() {
+            let mut names = std::collections::HashSet::new();
+            names.insert(first);
+            let deadline = Instant::now() + Duration::from_millis(500);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(left) {
+                    Ok(n) => {
+                        names.insert(n);
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+            let list: Vec<String> = names.into_iter().collect();
+            let _ = app.emit("config-changed", serde_json::json!({ "files": list }));
+        }
+    });
+}

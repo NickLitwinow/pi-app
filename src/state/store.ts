@@ -115,6 +115,8 @@ interface Store {
   permCollapsed: boolean;
   /** Сплит-скрин: панель live-превью открыта рядом с чатом. */
   previewOpen: boolean;
+  /** Инкремент при внешнем изменении конфигов pi (config-changed) — зависимость перечитывающих вкладок. */
+  configVersion: number;
   set: (patch: Partial<Store>) => void;
 }
 
@@ -133,6 +135,7 @@ export const useStore = create<Store>((set) => ({
   sessionFlags: emptySessionFlags(),
   permCollapsed: false,
   previewOpen: false,
+  configVersion: 0,
   set: (patch) => set(patch),
 }));
 
@@ -301,6 +304,21 @@ export async function initApp(): Promise<void> {
       ...ws,
       stderrLog: [...ws.stderrLog, String(payload.line ?? "")].slice(-200),
     }));
+  });
+
+  await be.listen("config-changed", (payload) => {
+    // конфиги pi изменены снаружи (TUI/редактор): UI перечитает при следующем
+    // открытии вкладок; работающие агенты живут со старым конфигом до рестарта
+    const files = Array.isArray(payload.files) ? payload.files.join(", ") : "конфиг";
+    useStore.setState((s) => ({ configVersion: (s.configVersion ?? 0) + 1 }));
+    const cwd = useStore.getState().currentCwd;
+    if (cwd) {
+      notifyChat(
+        cwd,
+        "info",
+        `${files} изменён вне приложения — подхвачено. Новые сессии агента будут использовать обновлённый конфиг.`,
+      );
+    }
   });
 
   await be.listen("agent-exit", (payload) => {

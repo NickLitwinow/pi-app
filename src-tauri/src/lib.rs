@@ -21,6 +21,7 @@ pub fn run() {
             let sup = supervisor::Supervisor::new(app.handle().clone());
             app.manage(sup);
             watcher::start_sessions_watcher(app.handle().clone());
+            watcher::start_config_watcher(app.handle().clone());
 
             // системное меню: View → Toggle Sidebar (⌘B)
             let menu = Menu::default(app.handle())?;
