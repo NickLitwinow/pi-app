@@ -814,8 +814,12 @@ table.data td { padding: 6px 10px; border-bottom: 1px solid var(--border); font-
 }
 
 ::-webkit-scrollbar { width: 9px; height: 9px; }
-::-webkit-scrollbar-thumb { background: var(--bg-active); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--bg-active); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; transition: background var(--dur-1) ease; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); border: 2px solid transparent; background-clip: content-box; }
+/* выделение текста — мягкий акцент вместо системного синего */
+::selection { background: var(--accent-soft); }
+.md ::selection, code ::selection, pre ::selection { background: var(--accent-soft); }
 
 /* ---------- start screen (new-session home + analytics) ---------- */
 
@@ -826,7 +830,7 @@ table.data td { padding: 6px 10px; border-bottom: 1px solid var(--border); font-
 .ss-card { background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px 18px; box-shadow: var(--elev-1), var(--hairline-top); overflow: hidden; container-type: inline-size; }
 .ss-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; gap: 10px; flex-wrap: wrap; }
 .ss-tabs, .ss-range { display: flex; gap: 3px; }
-.ss-tabs button, .ss-range button { color: var(--text-dim); padding: 4px 11px; font-size: 12.5px; }
+.ss-tabs button, .ss-range button { color: var(--text-dim); padding: 4px 11px; font-size: 12.5px; border-radius: var(--radius-sm); transition: background var(--dur-1) ease, color var(--dur-1) ease; }
 .ss-tabs button.active, .ss-range button.active { background: var(--accent-soft); color: var(--text); font-weight: 550; }
 .ss-range button { font-size: 12px; padding: 3px 9px; }
 .ss-stats { grid-template-columns: repeat(4, 1fr); margin-bottom: 14px; gap: 8px; }
