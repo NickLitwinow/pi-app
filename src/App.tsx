@@ -1,11 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { getBackend } from "./lib/backend";
-import { initApp, newSession, selectWorkspace, updateAppConfig, useStore } from "./state/store";
+import { useT } from "./lib/i18n";
+import { notifyOS } from "./lib/notify";
+import { stripAnsi } from "./lib/markdown";
+import type { AppUpdateInfo } from "./lib/types";
+import { applyAppearanceConfig } from "./lib/theme";
+import { contentText } from "./lib/reducer";
+import { splitTrailingTurnTiming } from "./lib/turn-timing";
+import { closeCurrentSession, initApp, newSession, selectWorkspace, updateAppConfig, useStore } from "./state/store";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
-import ReviewView from "./components/ReviewView";
-import SettingsView from "./components/SettingsView";
 import { SidebarIcon } from "./components/icons";
+
+const ReviewView = lazy(() => import("./components/ReviewView"));
+const SettingsView = lazy(() => import("./components/SettingsView"));
+const LibraryView = lazy(() => import("./components/LibraryView"));
 
 function toggleSidebar() {
   const s = useStore.getState();
@@ -17,8 +26,16 @@ export default function App() {
   const view = useStore((s) => s.view);
   const theme = useStore((s) => s.appConfig.theme);
   const uiScale = useStore((s) => s.appConfig.uiScale);
+  const accentColor = useStore((s) => s.appConfig.accentColor ?? "#8b5cf6");
+  const iconColor = useStore((s) => s.appConfig.iconColor ?? s.appConfig.accentColor ?? "#8b5cf6");
+  const appearancePreset = useStore((s) => s.appConfig.appearancePreset ?? "chatgpt");
+  const visualEffects = useStore((s) => s.appConfig.visualEffects !== false);
+  const interfaceDensity = useStore((s) => s.appConfig.interfaceDensity ?? "comfortable");
+  const customTheme = useStore((s) => s.appConfig.customTheme ?? null);
   const sidebarCollapsed = useStore((s) => s.appConfig.sidebarCollapsed ?? false);
   const sidebarWidth = useStore((s) => s.appConfig.sidebarWidth ?? 240);
+  const automaticUpdates = useStore((s) => s.appConfig.automaticUpdates !== false);
+  const sourceRepoPath = useStore((s) => s.appConfig.sourceRepoPath ?? null);
   // читшит хоткеев (⌘/); ref — чтобы keydown-эффект с пустыми deps видел актуальное
   const [hkOpen, setHkOpen] = useState(false);
   const hkOpenRef = useRef(false);
@@ -27,16 +44,181 @@ export default function App() {
   const [cmdkOpen, setCmdkOpen] = useState(false);
   const cmdkOpenRef = useRef(false);
   cmdkOpenRef.current = cmdkOpen;
+  const actionRef = useRef<(action: string) => void>(() => {});
+
+  actionRef.current = (action: string) => {
+    const s = useStore.getState();
+    const cwd = s.currentCwd;
+    if (action === "command-palette") return setCmdkOpen((value) => !value);
+    if (action === "hotkeys") return setHkOpen((value) => !value);
+    if (action === "toggle-sidebar") return toggleSidebar();
+    if (action === "focus-composer") {
+      s.set({ view: "chat" });
+      window.setTimeout(() => document.querySelector<HTMLTextAreaElement>(".composer textarea")?.focus(), 60);
+      return;
+    }
+    if (action === "copy-last-answer") {
+      const items = cwd ? s.chats[cwd]?.chat.items ?? [] : [];
+      const last = [...items].reverse().find((item) => item.msg.role === "assistant");
+      // без ANSI и служебной строки «✻ Turn took…» — копируем то, что видит пользователь
+      const answer = last ? splitTrailingTurnTiming(stripAnsi(contentText(last.msg.content))).body : "";
+      if (answer) void navigator.clipboard.writeText(answer);
+      return;
+    }
+    if (action === "new-session" && cwd) {
+      s.set({ view: "chat" });
+      void newSession(cwd);
+      return;
+    }
+    if (action === "close-session" && cwd) {
+      void closeCurrentSession(cwd);
+      return;
+    }
+    if (action === "find-session") {
+      s.set({ view: "chat" });
+      window.setTimeout(() => window.dispatchEvent(new CustomEvent("pi:find-session")), 60);
+      return;
+    }
+    if (action === "code-review") return s.set({ view: "review" });
+    if (action === "toggle-preview") return s.set({ view: "chat", previewOpen: !s.previewOpen });
+    if (action === "settings") return s.set({ view: "settings" });
+    const workspaceMatch = action.match(/^workspace-(\d)$/);
+    if (workspaceMatch) {
+      const hidden = new Set(s.sessionFlags.hiddenProjects);
+      const ordered = [...s.extraWorkspaces, ...s.projects].filter(
+        (workspace, index, all) => !hidden.has(workspace.cwd)
+          && all.findIndex((candidate) => candidate.cwd === workspace.cwd) === index,
+      );
+      const workspace = ordered[Number(workspaceMatch[1]) - 1];
+      if (workspace) selectWorkspace(workspace.cwd);
+    }
+  };
 
   useEffect(() => {
     void initApp();
   }, []);
 
   useEffect(() => {
+    if (!ready) return;
+    void getBackend().then((be) => {
+      if (!be.isMock) return be.invoke("perf_ready");
+    });
+  }, [ready]);
+
+  // Готовый GitHub Release скачивается и устанавливается поверх текущего .app
+  // в фоне. Работающая копия не прерывается; новый бандл запустится при
+  // следующем обычном перезапуске приложения.
+  useEffect(() => {
+    if (!ready || !automaticUpdates) return;
+    let cancelled = false;
+    let unsubscribe: (() => void) | undefined;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const be = await getBackend();
+        if (be.isMock || cancelled) return;
+        const info = await be.invoke<AppUpdateInfo>("check_app_update", { sourceRepo: sourceRepoPath }).catch(() => null);
+        if (cancelled || !info?.updateAvailable || !info.assetUrl) return;
+        const key = `pi-app-auto-update:${info.latest ?? info.assetUrl}`;
+        if (sessionStorage.getItem(key)) return;
+        sessionStorage.setItem(key, "installing");
+        let runId: string | null = null;
+        const buffered: Record<string, unknown>[] = [];
+        const handle = (payload: Record<string, unknown>) => {
+          if (runId == null) {
+            buffered.push(payload);
+            return;
+          }
+          if (payload.runId !== runId || !payload.done) return;
+          if (payload.code === 0) {
+            sessionStorage.setItem(key, "installed");
+            void notifyOS("Pi App обновлён", "Новая версия установлена в фоне и запустится после перезапуска.");
+          } else {
+            sessionStorage.removeItem(key);
+          }
+          unsubscribe?.();
+        };
+        unsubscribe = await be.listen("app-update-output", handle);
+        try {
+          runId = await be.invoke<string>("app_update_install_release", { assetUrl: info.assetUrl });
+          for (const payload of buffered.splice(0)) handle(payload);
+        } catch {
+          sessionStorage.removeItem(key);
+          unsubscribe?.();
+        }
+      })();
+    }, 8_000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      unsubscribe?.();
+    };
+  }, [ready, automaticUpdates, sourceRepoPath]);
+
+  useEffect(() => {
     const el = document.documentElement;
     if (theme === "dark" || theme === "light") el.setAttribute("data-theme", theme);
     else el.removeAttribute("data-theme");
   }, [theme]);
+
+  useEffect(() => {
+    const el = document.documentElement;
+    el.dataset.preset = appearancePreset;
+    el.dataset.effects = visualEffects ? "on" : "off";
+    el.dataset.density = interfaceDensity;
+    applyAppearanceConfig({ ...useStore.getState().appConfig, appearancePreset, accentColor, iconColor, customTheme });
+  }, [accentColor, iconColor, appearancePreset, visualEffects, interfaceDensity, customTheme]);
+
+  useEffect(() => {
+    if (!visualEffects || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const selector = [
+      ".card", ".settings-group", ".customization-panel", ".appearance-preview",
+      ".ss-card", ".composer", ".difffile", ".app-modal", ".theme-preset",
+      ".mk-card", ".update-section", ".chat-msg", ".sidebar .navitem",
+      ".sidebar .ws", ".sidebar .sess-row", ".profile-card", ".library-onboarding", ".gitbar",
+      ".toolcard", ".agent-avatar", ".advanced-editor", ".commit-box", "button",
+    ].join(",");
+    let active: HTMLElement | null = null;
+    let frame = 0;
+    let next: { element: HTMLElement; x: number; y: number } | null = null;
+    const paint = () => {
+      frame = 0;
+      if (!next) return;
+      if (active !== next.element) {
+        active?.classList.remove("pointer-glow");
+        active = next.element;
+        active.classList.add("pointer-glow");
+      }
+      const rect = next.element.getBoundingClientRect();
+      next.element.style.setProperty("--pointer-x", `${next.x - rect.left}px`);
+      next.element.style.setProperty("--pointer-y", `${next.y - rect.top}px`);
+    };
+    const onMove = (event: PointerEvent) => {
+      const element = event.target instanceof Element ? event.target.closest<HTMLElement>(selector) : null;
+      if (!element) {
+        active?.classList.remove("pointer-glow");
+        active = null;
+        next = null;
+        return;
+      }
+      next = { element, x: event.clientX, y: event.clientY };
+      if (!frame) frame = requestAnimationFrame(paint);
+    };
+    const clear = () => {
+      active?.classList.remove("pointer-glow");
+      active = null;
+      next = null;
+    };
+    window.addEventListener("pointermove", onMove, { passive: true });
+    window.addEventListener("blur", clear);
+    document.addEventListener("pointerleave", clear);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("blur", clear);
+      document.removeEventListener("pointerleave", clear);
+      if (frame) cancelAnimationFrame(frame);
+      clear();
+    };
+  }, [visualEffects]);
 
   // Масштаб интерфейса (⌘+ / ⌘− / ⌘0). CSS zoom в WKWebView глючит с layout,
   // поэтому масштабируем корень через transform + компенсацию размеров.
@@ -65,12 +247,14 @@ export default function App() {
     document.documentElement.style.setProperty("--sidebar-w", `${sidebarWidth}px`);
   }, [sidebarWidth]);
 
-  // системное меню: View → Toggle Sidebar (эмитится из Rust)
+  // Нативное меню и web-view используют одну таблицу действий.
   useEffect(() => {
     let un: (() => void) | undefined;
     void getBackend().then(async (be) => {
       if (be.isMock) return;
-      un = await be.listen("menu-toggle-sidebar", () => toggleSidebar());
+      un = await be.listen("menu-action", (payload) => {
+        if (typeof payload.action === "string") actionRef.current(payload.action);
+      });
     });
     return () => un?.();
   }, []);
@@ -109,19 +293,28 @@ export default function App() {
 
       if (e.key === "k") {
         e.preventDefault();
-        setCmdkOpen((v) => !v);
+        actionRef.current("command-palette");
+        return;
+      }
+      if (e.key.toLowerCase() === "c" && e.shiftKey) {
+        const cwd = s.currentCwd;
+        const items = cwd ? s.chats[cwd]?.chat.items ?? [] : [];
+        const last = [...items].reverse().find((item) => item.msg.role === "assistant");
+        const answer = last ? contentText(last.msg.content) : "";
+        if (answer) {
+          e.preventDefault();
+          actionRef.current("copy-last-answer");
+        }
         return;
       }
       if (e.key === "/") {
         e.preventDefault();
-        setHkOpen((v) => !v);
+        actionRef.current("hotkeys");
         return;
       }
       if (e.key === "l") {
         e.preventDefault();
-        s.set({ view: "chat" });
-        // после переключения вью композер должен смонтироваться
-        setTimeout(() => document.querySelector<HTMLTextAreaElement>(".composer textarea")?.focus(), 60);
+        actionRef.current("focus-composer");
         return;
       }
 
@@ -142,31 +335,37 @@ export default function App() {
       }
       if (e.key === "b") {
         e.preventDefault();
-        toggleSidebar();
+        actionRef.current("toggle-sidebar");
         return;
       }
-      if (e.key === "n" && s.currentCwd) {
+      if ((e.key.toLowerCase() === "t" || e.key.toLowerCase() === "n") && s.currentCwd) {
         e.preventDefault();
-        s.set({ view: "chat" });
-        void newSession(s.currentCwd);
+        actionRef.current("new-session");
+        return;
+      }
+      if (e.key.toLowerCase() === "w" && s.currentCwd) {
+        e.preventDefault();
+        actionRef.current("close-session");
         return;
       }
       if (e.key === ",") {
         e.preventDefault();
-        s.set({ view: "settings" });
+        actionRef.current("settings");
         return;
       }
-      if (e.key === "3") {
-        // ⌘3 — переключить сплит-скрин live-превью рядом с чатом
+      if (e.key.toLowerCase() === "r") {
         e.preventDefault();
-        s.set({ view: "chat", previewOpen: !s.previewOpen });
+        actionRef.current("code-review");
         return;
       }
-      const views = { "1": "chat", "2": "review", "4": "settings" } as const;
-      const v = views[e.key as keyof typeof views];
-      if (v) {
+      if (e.key.toLowerCase() === "e") {
         e.preventDefault();
-        s.set({ view: v });
+        actionRef.current("toggle-preview");
+        return;
+      }
+      if (/^[1-9]$/.test(e.key)) {
+        e.preventDefault();
+        actionRef.current(`workspace-${e.key}`);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -191,9 +390,12 @@ export default function App() {
         </button>
       )}
       <div className="main">
-        {view === "chat" && <ChatView />}
-        {view === "review" && <ReviewView />}
-        {view === "settings" && <SettingsView />}
+        <Suspense fallback={<div className="empty">Загрузка…</div>}>
+          {view === "chat" && <ChatView />}
+          {view === "review" && <ReviewView />}
+          {view === "library" && <LibraryView />}
+          {view === "settings" && <SettingsView />}
+        </Suspense>
       </div>
       {hkOpen && <HotkeysOverlay onClose={() => setHkOpen(false)} />}
       {cmdkOpen && <CommandPalette onClose={() => setCmdkOpen(false)} />}
@@ -209,8 +411,10 @@ interface Cmd {
 }
 
 function CommandPalette({ onClose }: { onClose: () => void }) {
+  const t = useT();
   const projects = useStore((s) => s.projects);
   const extra = useStore((s) => s.extraWorkspaces);
+  const hiddenProjects = useStore((s) => s.sessionFlags.hiddenProjects);
   const currentCwd = useStore((s) => s.currentCwd);
   const [q, setQ] = useState("");
   const [idx, setIdx] = useState(0);
@@ -227,31 +431,41 @@ function CommandPalette({ onClose }: { onClose: () => void }) {
       onClose();
     };
     const list: Cmd[] = [
-      { id: "chat", label: "Перейти: Чат", hint: "⌘1", run: () => go({ view: "chat" }) },
-      { id: "review", label: "Перейти: Code Review", hint: "⌘2", run: () => go({ view: "review" }) },
-      { id: "settings", label: "Перейти: Настройки", hint: "⌘4", run: () => go({ view: "settings" }) },
-      { id: "preview", label: "Переключить live-превью (сплит)", hint: "⌘3", run: () => go({ view: "chat", previewOpen: !s.previewOpen }) },
-      { id: "sidebar", label: "Переключить боковую панель", hint: "⌘B", run: () => { toggleSidebar(); onClose(); } },
+      { id: "chat", label: t("Перейти: Чат"), run: () => go({ view: "chat" }) },
+      { id: "review", label: t("Перейти: Code Review"), hint: "⌘R", run: () => go({ view: "review" }) },
+      { id: "library", label: t("Перейти: Library"), run: () => go({ view: "library" }) },
+      { id: "settings", label: t("Перейти: Настройки"), hint: "⌘,", run: () => go({ view: "settings" }) },
+      { id: "preview", label: t("Переключить live-превью (сплит)"), hint: "⌘E", run: () => go({ view: "chat", previewOpen: !s.previewOpen }) },
+      { id: "sidebar", label: t("Переключить боковую панель"), hint: "⌘B", run: () => { toggleSidebar(); onClose(); } },
       {
         id: "newsession",
-        label: "Новая сессия",
-        hint: "⌘N",
+        label: t("Новая сессия"),
+        hint: "⌘T",
         run: () => { if (currentCwd) void newSession(currentCwd); onClose(); },
+      },
+      {
+        id: "closesession",
+        label: t("Закрыть текущую сессию"),
+        hint: "⌘W",
+        run: () => { if (currentCwd) void closeCurrentSession(currentCwd); onClose(); },
       },
     ];
     const seen = new Set<string>();
+    const hidden = new Set(hiddenProjects);
     for (const p of [...extra, ...projects]) {
+      if (hidden.has(p.cwd)) continue;
       if (seen.has(p.cwd)) continue;
       seen.add(p.cwd);
+      const number = seen.size;
       list.push({
         id: `ws:${p.cwd}`,
-        label: `Проект: ${p.name}`,
-        hint: p.cwd === currentCwd ? "текущий" : undefined,
+        label: `${t("Проект")}: ${p.name}`,
+        hint: number <= 9 ? `⌘${number}${p.cwd === currentCwd ? ` · ${t("текущий")}` : ""}` : p.cwd === currentCwd ? t("текущий") : undefined,
         run: () => { selectWorkspace(p.cwd); onClose(); },
       });
     }
     return list;
-  }, [projects, extra, currentCwd, onClose]);
+  }, [projects, extra, hiddenProjects, currentCwd, onClose, t]);
 
   const filtered = useMemo(() => {
     const query = q.trim().toLowerCase();
@@ -273,13 +487,13 @@ function CommandPalette({ onClose }: { onClose: () => void }) {
         <input
           ref={inputRef}
           className="cmdk-input"
-          placeholder="Команда или проект…"
+          placeholder={t("Команда или проект…")}
           value={q}
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={onKey}
         />
         <div className="cmdk-list">
-          {filtered.length === 0 && <div className="muted" style={{ padding: "10px 12px" }}>Ничего не найдено</div>}
+          {filtered.length === 0 && <div className="muted" style={{ padding: "10px 12px" }}>{t("Ничего не найдено")}</div>}
           {filtered.map((c, i) => (
             <div
               key={c.id}
@@ -300,30 +514,35 @@ function CommandPalette({ onClose }: { onClose: () => void }) {
 const HOTKEYS: Array<[string, string]> = [
   ["⌘K", "Командная палитра (навигация, проекты)"],
   ["⌘F", "Поиск по сессии"],
-  ["⌘1 / ⌘2 / ⌘4", "Чат / Code Review / Настройки"],
-  ["⌘3", "Live-превью рядом с чатом (сплит)"],
+  ["⌘1 … ⌘9", "Переключить workspace по номеру"],
+  ["⌘R", "Открыть Code Review"],
+  ["⌘E", "Live-превью рядом с чатом (сплит)"],
   ["⌘B", "Свернуть/показать сайдбар"],
-  ["⌘N", "Новая сессия в текущем проекте"],
+  ["⌘T", "Новая сессия в текущем проекте"],
+  ["⌘W", "Закрыть сессию без удаления истории"],
+  ["⇧⌘C", "Скопировать последний ответ агента"],
   ["⌘L", "Фокус в поле сообщения"],
   ["⌘,", "Настройки"],
   ["⌘+ / ⌘− / ⌘0", "Масштаб интерфейса"],
-  ["Enter / ⇧Enter", "Отправить / перенос строки"],
+  ["Enter / ⌘Enter", "Отправка настраивается; вторая комбинация — перенос"],
+  ["⇧⌘Enter", "Steer во время текущего хода"],
   ["/", "Палитра команд в композере (Esc — закрыть, текст сохранится)"],
   ["⌘/", "Эта справка"],
 ];
 
 function HotkeysOverlay({ onClose }: { onClose: () => void }) {
+  const t = useT();
   return (
     <div className="hk-overlay" onClick={onClose}>
       <div className="hk-panel" onClick={(e) => e.stopPropagation()}>
-        <div className="c-title" style={{ marginBottom: 10 }}>Горячие клавиши</div>
+        <div className="c-title" style={{ marginBottom: 10 }}>{t("Горячие клавиши")}</div>
         {HOTKEYS.map(([keys, desc]) => (
           <div key={keys} className="hk-row">
             <span className="hk-keys">{keys}</span>
-            <span className="hk-desc">{desc}</span>
+            <span className="hk-desc">{t(desc)}</span>
           </div>
         ))}
-        <div className="muted" style={{ marginTop: 10, fontSize: 11 }}>Esc или клик мимо — закрыть</div>
+        <div className="muted" style={{ marginTop: 10, fontSize: 11 }}>{t("Esc или клик мимо — закрыть")}</div>
       </div>
     </div>
   );

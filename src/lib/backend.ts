@@ -8,8 +8,10 @@ import type {
   ConfigFile,
   LaunchConfig,
   PackageSearch,
+  PackageDetails,
   PiInfo,
   PiPackage,
+  PiUpdateInfo,
   PreviewHandle,
   ProjectInfo,
   SessionMeta,
@@ -87,13 +89,25 @@ class MockBackend implements Backend {
     null,
     2,
   );
+  // Несколько провайдеров и моделей: до спавна агента каталог берётся ИМЕННО
+  // отсюда (models.json), поэтому одномодельный мок скрывал бы баги выбора.
   private models = JSON.stringify(
     {
       providers: {
         ollama: {
           baseUrl: "http://127.0.0.1:8099/v1",
           api: "openai-completions",
-          models: [{ id: "qwen-local", reasoning: true, contextWindow: 128000, maxTokens: 16384 }],
+          models: [
+            { id: "qwen-local", reasoning: true, contextWindow: 128000, maxTokens: 16384 },
+            { id: "qwen-coder-30b", reasoning: false, contextWindow: 262144, maxTokens: 16384 },
+          ],
+        },
+        anthropic: {
+          api: "anthropic-messages",
+          models: [
+            { id: "claude-sonnet-4", reasoning: true, contextWindow: 200000, maxTokens: 64000 },
+            { id: "claude-opus-4-8", reasoning: true, contextWindow: 200000, maxTokens: 64000 },
+          ],
         },
       },
     },
@@ -140,8 +154,14 @@ class MockBackend implements Backend {
     });
   }
 
+  /** Суммарное «работал»-время и счётчик ходов (как pi-claude-style-tools). */
+  private workedTotalMs = 0;
+  private turnCount = 0;
+
   private async runScript(agentId: string, prompt: string) {
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const runStartedAt = Date.now();
+    const streamDelay = prompt.includes("цепочку") ? 120 : 30;
     const respond = (id: unknown, command: string, data: Record<string, unknown> = {}) =>
       this.emitAgent(agentId, { type: "response", id, command, success: true, data });
     void respond;
@@ -150,14 +170,18 @@ class MockBackend implements Backend {
     this.emitAgent(agentId, { type: "message_start" });
     await sleep(200);
     const think = "Пользователь просит продемонстрировать интерфейс. Покажу стриминг, вызов инструмента и markdown.";
+    let thinkAcc = "";
     for (const ch of chunks(think, 24)) {
-      this.emitAgent(agentId, { type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: ch } });
-      await sleep(30);
+      thinkAcc += ch;
+      this.emitAgent(agentId, { type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: ch, partial: { role: "assistant", content: [{ type: "thinking", thinking: thinkAcc }] } } });
+      await sleep(streamDelay);
     }
     const reply = `Это **демо-режим** (mock backend): интерфейс работает без Tauri.\n\nВы написали:\n\n> ${prompt.slice(0, 200)}\n\nПример кода:\n\n\`\`\`typescript\nconst answer: number = 42;\nexport function demo() {\n  return answer;\n}\n\`\`\`\n\nСейчас вызову инструмент bash…`;
+    let replyAcc = "";
     for (const ch of chunks(reply, 18)) {
-      this.emitAgent(agentId, { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: ch } });
-      await sleep(25);
+      replyAcc += ch;
+      this.emitAgent(agentId, { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: ch, partial: { role: "assistant", content: [{ type: "thinking", thinking: think }, { type: "text", text: replyAcc }] } } });
+      await sleep(Math.max(25, streamDelay - 10));
     }
     this.emitAgent(agentId, {
       type: "message_end",
@@ -168,7 +192,7 @@ class MockBackend implements Backend {
           { type: "text", text: reply },
           { type: "toolCall", id: "call_demo1", name: "bash", arguments: { command: "ls -la src/" } },
         ],
-        model: "qwen-local",
+        model: "qwen-local", provider: "ollama",
         usage: { input: 1200, output: 180, cost: { total: 0 } },
       },
     });
@@ -204,6 +228,33 @@ class MockBackend implements Backend {
       },
     });
 
+    // Второй шаг создаёт настоящую цепочку действий для compact run-summary.
+    const editArgs = { path: "src/lib/reducer.ts", oldText: "function old(): void {}", newText: "function applyEvent(): void {}" };
+    this.emitAgent(agentId, { type: "message_start" });
+    this.emitAgent(agentId, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Проверяю результат и вношу точечную правку." },
+          { type: "toolCall", id: "call_demo2", name: "edit", arguments: editArgs },
+        ],
+        model: "qwen-local", provider: "ollama",
+      },
+    });
+    this.emitAgent(agentId, { type: "tool_execution_start", toolCallId: "call_demo2", toolName: "edit", args: editArgs });
+    await sleep(220);
+    this.emitAgent(agentId, {
+      type: "tool_execution_end",
+      toolCallId: "call_demo2",
+      isError: false,
+      result: { content: [{ type: "text", text: "Updated src/lib/reducer.ts" }] },
+    });
+    this.emitAgent(agentId, {
+      type: "message_end",
+      message: { role: "toolResult", toolCallId: "call_demo2", toolName: "edit", content: [{ type: "text", text: "Updated src/lib/reducer.ts" }] },
+    });
+
     // обработать steer, если пользователь вмешался во время рана
     if (this.steerQueue.length > 0) {
       const steer = this.steerQueue.splice(0);
@@ -217,7 +268,7 @@ class MockBackend implements Backend {
         this.emitAgent(agentId, { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: ch, partial: { role: "assistant", content: [{ type: "text", text: ack }] } } });
         await sleep(30);
       }
-      this.emitAgent(agentId, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: ack }], model: "qwen-local" } });
+      this.emitAgent(agentId, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: ack }], model: "qwen-local", provider: "ollama" } });
     }
 
     this.emitAgent(agentId, { type: "message_start" });
@@ -227,12 +278,26 @@ class MockBackend implements Backend {
     let acc = "";
     for (const ch of chunks(tail, 12)) {
       acc += ch;
-      this.emitAgent(agentId, { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: ch, partial: { role: "assistant", content: [{ type: "text", text: acc }] } } });
+      this.emitAgent(agentId, { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: ch, partial: { role: "assistant", content: [{ type: "text", text: acc }], model: "qwen-local", provider: "ollama" } } });
       await sleep(30);
     }
+    // финал хода — как pi-claude-style-tools: ANSI-строка тайминга в хвосте
+    // последнего текстового блока + message-level метаданные
+    const workedMs = Date.now() - runStartedAt;
+    this.workedTotalMs += workedMs;
+    this.turnCount += 1;
+    const timingLine = `\u001b[38;2;140;140;140m✻ Turn took ${mockDuration(workedMs)} (Total time ${mockDuration(this.workedTotalMs)} · ${this.turnCount} turn${this.turnCount === 1 ? "" : "s"})\u001b[0m`;
     this.emitAgent(agentId, {
       type: "message_end",
-      message: { role: "assistant", content: [{ type: "text", text: tail }], model: "qwen-local", usage: { input: 1500, output: 40, cost: { total: 0 } } },
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: `${tail}\n\n${timingLine}` }],
+        model: "qwen-local", provider: "ollama",
+        usage: { input: 1500, output: 40, cost: { total: 0 } },
+        _piClaudeStyleWorkedDurationMs: workedMs,
+        _piClaudeStyleWorkedSessionTotalMs: this.workedTotalMs,
+        _piClaudeStyleWorkedTurns: this.turnCount,
+      },
     });
     this.emitAgent(agentId, { type: "turn_end" });
     this.emitAgent(agentId, { type: "agent_end" });
@@ -245,9 +310,22 @@ class MockBackend implements Backend {
       case "resolve_pi":
         return { path: "/opt/homebrew/bin/pi", version: "0.80.3 (mock)", agentDir: "~/.pi/agent" } satisfies PiInfo as T;
       case "read_app_config":
-        return { editor: "code", processLimit: 2, idleKillSecs: 900, theme: "system", uiScale: 1, displayName: "Nikita", piRetryStallTimeoutMs: 0 } satisfies AppConfig as T;
+        return { editor: "code", processLimit: 2, processLimitAuto: true, idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, displayName: "Nikita", piRetryStallTimeoutMs: 0, modelAliases: { "ollama/qwen-local": "Claude Opus 4.7" }, modelAvatars: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: true } satisfies AppConfig as T;
       case "write_app_config":
         return undefined as T;
+      case "read_avatar_data": {
+        // Реальный бэкенд читает файл и отдаёт data-URL. В моке файловой системы
+        // нет, поэтому по расширению отдаём образцы: так путь «анимированный SVG /
+        // Lottie» проверяем в браузерном превью без Tauri.
+        const path = String(args.path);
+        const ext = path.split(".").pop()?.toLowerCase() ?? "";
+        if (ext === "svg") return `data:image/svg+xml;base64,${btoa(MOCK_ANIMATED_SVG)}` as T;
+        if (ext === "json") return `data:application/json;base64,${btoa(MOCK_LOTTIE_JSON)}` as T;
+        if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
+          return `data:image/svg+xml;base64,${btoa(MOCK_ANIMATED_SVG)}` as T;
+        }
+        throw new Error("поддерживаются PNG, JPEG, GIF, WebP, анимированный SVG и Lottie (JSON)");
+      }
       case "list_projects":
         return [
           { dir: "/mock/a", cwd: "/Users/dev/pi-app", name: "pi-app", sessionCount: 4, lastModifiedMs: Date.now() - 3600e3 },
@@ -313,10 +391,43 @@ class MockBackend implements Backend {
         return undefined as T;
       case "read_session_thread": {
         const p = String(args.path);
-        return [
-          { type: "message", message: { role: "user", content: [{ type: "text", text: `Открыта сессия ${p} (mock)` }] } },
-          { type: "message", message: { role: "assistant", content: [{ type: "text", text: `Это содержимое файла ${p}. **Markdown** работает.` }], model: "qwen-local" } },
-        ] as T;
+        const now = Date.now();
+        // как реальный pi 0.80.x: assistant несёт provider/model, у финального
+        // сообщения — метаданные pi-claude-style-tools и ANSI-строка тайминга
+        // ОДИН ход = user → серия assistant-сообщений (мысли/инструменты) →
+        // финальный ответ. Финальный текст ВСЕГДА последним: GUI сворачивает всё
+        // до него в «Worked for» (Codex-стиль). Проверка группировки хода.
+        const messages: Record<string, unknown>[] = [
+          { type: "message", timestamp: now - 60_000, message: { role: "user", content: [{ type: "text", text: `Открыта сессия ${p} (mock)` }] } },
+          { type: "message", timestamp: now - 55_000, message: {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "Смотрю reducer и прогоняю тесты, чтобы убедиться в отсутствии регрессий." },
+              { type: "text", text: "Смотрю проект и прогоняю тесты…" },
+              { type: "toolCall", id: "hist-1", name: "read", arguments: { path: "src/lib/reducer.ts" } },
+              { type: "toolCall", id: "hist-2", name: "bash", arguments: { command: "npm test" } },
+            ],
+            model: "qwen-local", provider: "ollama",
+          } },
+          { type: "message", timestamp: now - 53_000, message: { role: "toolResult", toolCallId: "hist-1", toolName: "read", content: [{ type: "text", text: "export function applyAgentEvent(…) { /* 300 строк */ }" }], isError: false } },
+          { type: "message", timestamp: now - 49_000, message: { role: "toolResult", toolCallId: "hist-2", toolName: "bash", content: [{ type: "text", text: "Test Files  8 passed (8)\nTests  57 passed (57)" }], isError: false } },
+        ];
+        if (p.endsWith("/s3.jsonl")) {
+          messages.push(
+            { type: "message", timestamp: now - 52_000, message: { role: "assistant", content: [{ type: "toolCall", id: "seq-3", name: "mcp", arguments: { tool: "sequential-thinking_sequentialthinking", args: JSON.stringify({ thought: "Проверяю границы ответственности и риск гонки при завершении дочерних процессов.", thoughtNumber: 3, totalThoughts: 7, nextThoughtNeeded: true, isRevision: true, revisesThought: 2 }) } }] }, model: "qwen-local", provider: "ollama" },
+            { type: "message", timestamp: now - 51_000, message: { role: "toolResult", toolCallId: "seq-3", toolName: "mcp", content: [{ type: "text", text: "{\"thoughtNumber\":3,\"totalThoughts\":7,\"nextThoughtNeeded\":true}" }], isError: false } },
+          );
+        }
+        // финальный ответ — всегда последним; несёт метаданные и ANSI-строку тайминга
+        messages.push({ type: "message", timestamp: now - 48_000, message: {
+          role: "assistant",
+          content: [{ type: "text", text: `Это содержимое файла ${p}. **Markdown** работает.\n\n\u001b[38;2;140;140;140m✻ Turn took 12s (Total time 47s · 2 turns)\u001b[0m` }],
+          model: "qwen-local", provider: "ollama",
+          _piClaudeStyleWorkedDurationMs: 12_400,
+          _piClaudeStyleWorkedSessionTotalMs: 47_000,
+          _piClaudeStyleWorkedTurns: 2,
+        } });
+        return messages as T;
       }
       case "search_sessions":
         return [
@@ -326,20 +437,22 @@ class MockBackend implements Backend {
         const days: AnalyticsOverview["perDay"] = [];
         for (let i = 180; i >= 0; i--) {
           const d = new Date(Date.now() - i * 86400e3);
-          if (Math.random() > 0.35) {
-            const messages = Math.floor(Math.random() * 40) + 1;
+          // Mock analytics must be deterministic: otherwise every visual run
+          // produces a different heatmap and hides real UI regressions in noise.
+          if ((i * 17 + 3) % 20 > 6) {
+            const messages = ((i * 29 + 11) % 40) + 1;
             days.push({
               date: d.toISOString().slice(0, 10),
-              cost: Math.random() * 2,
+              cost: ((i * 13 + 5) % 200) / 100,
               messages,
               input: messages * 40000,
               output: messages * 3000,
-              sessions: Math.random() > 0.6 ? 1 + Math.floor(Math.random() * 2) : 0,
+              sessions: (i * 7 + 1) % 10 > 5 ? 1 + (i % 2) : 0,
             });
           }
         }
         const perHour = Array.from({ length: 24 }, (_, h) =>
-          Math.floor((h >= 9 && h <= 23 ? 1 : 0.15) * (30 + Math.random() * 120)),
+          Math.floor((h >= 9 && h <= 23 ? 1 : 0.15) * (30 + ((h * 47 + 19) % 120))),
         );
         return {
           totals: { cost: 12.34, input: 38200000, output: 500000, cacheRead: 900000, cacheWrite: 20000, sessions: 64, messages: 33901 },
@@ -365,7 +478,13 @@ class MockBackend implements Backend {
           { name: "mitsupi", version: "1.6.0", description: "Armin's pi coding agent commands, skills, extensions, and themes.", author: "mitsuhiko", downloadsMonthly: 4188, npmUrl: "https://www.npmjs.com/package/mitsupi", repoUrl: "https://github.com/mitsuhiko/agent-stuff", homepage: null, keywords: ["pi-skill", "pi-theme"], updated: new Date().toISOString(), popularity: 0.7 },
           { name: "pi-skill-code-review", version: "0.2.0", description: "Review the current diff for correctness bugs and cleanups.", author: "community", downloadsMonthly: 1200, npmUrl: "https://www.npmjs.com/package/pi-skill-code-review", repoUrl: null, homepage: null, keywords: ["pi-skill"], updated: new Date().toISOString(), popularity: 0.5 },
         ];
-        const list = kind === "skill" ? skill : ext;
+        const theme: PiPackage[] = [
+          { name: "pi-theme-aurora", version: "1.3.0", description: "A polished low-contrast theme for long coding sessions.", author: "community", downloadsMonthly: 3400, npmUrl: "https://www.npmjs.com/package/pi-theme-aurora", repoUrl: null, homepage: null, keywords: ["pi-theme"], updated: new Date().toISOString(), popularity: 0.65 },
+        ];
+        const prompt: PiPackage[] = [
+          { name: "pi-prompts-review", version: "0.8.0", description: "Focused review and implementation prompt presets for pi.", author: "community", downloadsMonthly: 1900, npmUrl: "https://www.npmjs.com/package/pi-prompts-review", repoUrl: null, homepage: null, keywords: ["pi-prompt"], updated: new Date().toISOString(), popularity: 0.55 },
+        ];
+        const list = kind === "skill" ? skill : kind === "theme" ? theme : kind === "prompt" ? prompt : ext;
         return { total: list.length, objects: from > 0 ? [] : list } satisfies PackageSearch as T;
       }
       case "pi_packages_meta": {
@@ -374,9 +493,12 @@ class MockBackend implements Backend {
         return names
           .filter((s) => s.startsWith("npm:"))
           .map((s) => s.slice(4))
-          .map((name) => ({
+          .map((name, index) => ({
             name,
-            version: "1.0.0",
+            version: index === 0 ? "2.1.0" : "1.0.0",
+            installedVersion: index === 0 ? "2.0.0" : "1.0.0",
+            updateAvailable: index === 0,
+            pinned: false,
             description: `Установленный пакет ${name} (mock-метаданные).`,
             author: name.startsWith("@") ? name.slice(1).split("/")[0] : "community",
             downloadsMonthly: 0,
@@ -388,6 +510,29 @@ class MockBackend implements Backend {
             popularity: 0,
           })) satisfies PiPackage[] as T;
       }
+      case "pi_package_details":
+        await sleep(160);
+        return {
+          readme: `# ${String(args.name)}\n\nГотовый пакет экосистемы pi.dev.\n\n## Возможности\n\n- Нативная интеграция с pi\n- Настройка через Library`,
+          changelog: "## 1.0.0\n\n- Первый стабильный релиз.",
+        } satisfies PackageDetails as T;
+      case "list_pi_themes":
+        return [
+          {
+            name: "midnight-aurora",
+            path: "/mock/themes/midnight-aurora.json",
+            source: "global",
+            packageName: null,
+            colors: { accent: "#62d6b5", border: "#34504b", borderMuted: "#283d3a", success: "#4ade80", error: "#fb7185", warning: "#fbbf24", muted: "#94a3b8", text: "#f8fafc", selectedBg: "#223532", userMessageBg: "#1d2928", customMessageBg: "#111918", toolPendingBg: "#111918" },
+            resolvedColors: { accent: "#62d6b5", border: "#34504b", borderMuted: "#283d3a", success: "#4ade80", error: "#fb7185", warning: "#fbbf24", muted: "#94a3b8", text: "#f8fafc", selectedBg: "#223532", userMessageBg: "#1d2928", customMessageBg: "#111918", toolPendingBg: "#111918" },
+            valid: true,
+            error: null,
+          },
+        ] as T;
+      case "save_pi_theme":
+        return `/Users/dev/.pi/agent/themes/${String((args.draft as { name?: string })?.name ?? "custom")}.json` as T;
+      case "export_pi_theme_package":
+        return `${String(args.destination ?? "/Users/dev/Desktop")}/pi-theme-custom` as T;
       case "preview_configs":
         return [
           { name: "pi-app-ui", runtimeExecutable: "npm", runtimeArgs: ["run", "dev"], port: 1420 },
@@ -406,11 +551,21 @@ class MockBackend implements Backend {
       }
       case "preview_stop":
         return undefined as T;
+      case "preview_touch":
+        return undefined as T;
       case "read_pi_config": {
         const name = String(args.name);
         const content = name === "settings" ? this.settings : name === "mcp" ? this.mcp : this.models;
         return { path: `~/.pi/agent/${name}.json`, content, exists: true } satisfies ConfigFile as T;
       }
+      case "read_project_settings":
+        return { path: `/Users/dev/pi-app/.pi/settings.json`, content: JSON.stringify({ packages: ["npm:pi-skill-code-review"] }, null, 2), exists: true } satisfies ConfigFile as T;
+      case "write_project_settings":
+        return undefined as T;
+      case "read_project_pi_config":
+        return { path: `/Users/dev/pi-app/.pi/${String(args.name)}.json`, content: "{}", exists: false } satisfies ConfigFile as T;
+      case "write_project_pi_config":
+        return undefined as T;
       case "write_pi_config": {
         const name = String(args.name);
         const content = String(args.content);
@@ -438,9 +593,9 @@ class MockBackend implements Backend {
         ] as T;
       case "process_stats":
         return [
-          { kind: "agent", id: "mock-agent-1", label: "/Users/demo/pi-app", pid: 4242, rssMb: 412.5, procs: 6 },
-          { kind: "preview", id: "srv-1", label: "/Users/demo/pi-app", pid: 4310, rssMb: 156.2, procs: 3 },
-          { kind: "app", id: "app", label: "pi-app (процесс приложения)", pid: 100, rssMb: 220.7, procs: 1 },
+          { kind: "agent", id: "mock-agent-1", label: "/Users/demo/pi-app", pid: 4242, rssMb: 412.5, procs: 6, uptimeMs: 754000 },
+          { kind: "preview", id: "srv-1", label: "/Users/demo/pi-app", pid: 4310, rssMb: 156.2, procs: 3, uptimeMs: 182000 },
+          { kind: "app", id: "app", label: "pi-app (процесс приложения)", pid: 100, rssMb: 220.7, procs: 1, uptimeMs: 3600000 },
         ] as T;
       case "spawn_agent": {
         const id = `mock-agent-${this.agentSeq++}`;
@@ -500,7 +655,7 @@ class MockBackend implements Backend {
                       ? {
                           messages: [
                             { role: "user", content: [{ type: "text", text: "Восстановленная сессия: что мы делали?" }] },
-                            { role: "assistant", content: [{ type: "text", text: "Мы чинили гонку в супервизоре. История загружена через `get_messages` — можно продолжать." }], model: "qwen-local" },
+                            { role: "assistant", content: [{ type: "text", text: "Мы чинили гонку в супервизоре. История загружена через `get_messages` — можно продолжать." }], model: "qwen-local", provider: "ollama" },
                           ],
                         }
                       : {};
@@ -568,8 +723,19 @@ class MockBackend implements Backend {
           latest: "def5678", latestKind: "commit",
           notes: "def5678 feat: self-update, dialog fixes\nc0ffee0 fix: statusline layout",
           htmlUrl: "https://github.com/NickLitwinow/pi-app", updateAvailable: true,
+          assetUrl: "https://github.com/NickLitwinow/pi-app/releases/download/v0.2.0/Pi-universal.dmg",
           checked: true, behind: 2, ahead: 0, error: null,
         } as T;
+      }
+      case "check_pi_update": {
+        await sleep(220);
+        return {
+          currentVersion: "0.80.3",
+          latestVersion: "0.80.6",
+          updateAvailable: true,
+          checked: true,
+          error: null,
+        } satisfies PiUpdateInfo as T;
       }
       case "app_update_run": {
         const runId = `upd-${Date.now()}`;
@@ -579,6 +745,17 @@ class MockBackend implements Backend {
             this.emit("app-update-output", { runId, line: l, done: false });
           }
           await sleep(400);
+          this.emit("app-update-output", { runId, done: true, code: 0 });
+        })();
+        return runId as T;
+      }
+      case "app_update_install_release": {
+        const runId = `release-${Date.now()}`;
+        void (async () => {
+          for (const l of ["▶ Фоновая загрузка и установка готового релиза", "Downloading Pi-universal.dmg…", "✓ Новая версия установлена. Перезапустите приложение, когда будет удобно."]) {
+            await sleep(350);
+            this.emit("app-update-output", { runId, line: l, done: false });
+          }
           this.emit("app-update-output", { runId, done: true, code: 0 });
         })();
         return runId as T;
@@ -623,6 +800,7 @@ class MockBackend implements Backend {
           "",
         ].join("\n") as T;
       case "git_checkout_file":
+      case "git_restore_run_files":
       case "open_in_editor":
       case "reveal_in_finder":
       case "open_external":
@@ -648,6 +826,48 @@ function chunks(s: string, n: number): string[] {
   const out: string[] = [];
   for (let i = 0; i < s.length; i += n) out.push(s.slice(i, i + n));
   return out;
+}
+
+/** Образец анимированного SVG (SMIL) — проверка пути «векторный аватар» в моке. */
+const MOCK_ANIMATED_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">' +
+  '<g fill="none" stroke="#d97757" stroke-width="8" stroke-linecap="round">' +
+  '<line x1="50" y1="50" x2="50" y2="10"/><line x1="50" y1="50" x2="90" y2="50"/>' +
+  '<line x1="50" y1="50" x2="50" y2="90"/><line x1="50" y1="50" x2="10" y2="50"/>' +
+  '<animateTransform attributeName="transform" type="rotate" from="0 50 50" to="360 50 50" dur="3s" repeatCount="indefinite"/>' +
+  "</g></svg>";
+
+/** Минимальный валидный Lottie: квадрат меняет прозрачность (проверка плеера). */
+const MOCK_LOTTIE_JSON = JSON.stringify({
+  v: "5.7.4", fr: 30, ip: 0, op: 60, w: 100, h: 100, nm: "mock", ddd: 0, assets: [],
+  layers: [{
+    ddd: 0, ind: 1, ty: 4, nm: "sq", sr: 1,
+    ks: {
+      o: { a: 1, k: [{ t: 0, s: [100], e: [20] }, { t: 60, s: [20] }] },
+      r: { a: 0, k: 0 }, p: { a: 0, k: [50, 50, 0] }, a: { a: 0, k: [0, 0, 0] }, s: { a: 0, k: [100, 100, 100] },
+    },
+    ao: 0,
+    shapes: [{
+      ty: "gr",
+      it: [
+        { ty: "rc", d: 1, s: { a: 0, k: [60, 60] }, p: { a: 0, k: [0, 0] }, r: { a: 0, k: 12 } },
+        { ty: "fl", c: { a: 0, k: [0.85, 0.47, 0.34, 1] }, o: { a: 0, k: 100 } },
+        { ty: "tr", p: { a: 0, k: [0, 0] }, a: { a: 0, k: [0, 0] }, s: { a: 0, k: [100, 100] }, r: { a: 0, k: 0 }, o: { a: 0, k: 100 } },
+      ],
+    }],
+    ip: 0, op: 60, st: 0, bm: 0,
+  }],
+});
+
+/** Формат длительности как у pi-claude-style-tools: 6s / 2m 57s / 1h 2m 3s. */
+function mockDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
 let backendPromise: Promise<Backend> | null = null;

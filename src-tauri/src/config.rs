@@ -39,6 +39,51 @@ pub fn read_pi_config(name: String) -> Result<ConfigFile, String> {
     })
 }
 
+#[tauri::command]
+pub fn read_project_settings(cwd: String) -> Result<ConfigFile, String> {
+    read_project_pi_config(cwd, "settings".into())
+}
+
+#[tauri::command]
+pub fn read_project_pi_config(cwd: String, name: String) -> Result<ConfigFile, String> {
+    if !matches!(name.as_str(), "settings" | "mcp") {
+        return Err(format!("unknown project config: {name}"));
+    }
+    let root = PathBuf::from(cwd);
+    if !root.is_dir() {
+        return Err("workspace не существует".into());
+    }
+    let path = root.join(".pi").join(format!("{name}.json"));
+    let exists = path.exists();
+    let content = if exists {
+        fs::read_to_string(&path).map_err(|error| error.to_string())?
+    } else {
+        "{}".into()
+    };
+    Ok(ConfigFile {
+        path: path.to_string_lossy().into_owned(),
+        content,
+        exists,
+    })
+}
+
+#[tauri::command]
+pub fn write_project_settings(cwd: String, content: String) -> Result<(), String> {
+    write_project_pi_config(cwd, "settings".into(), content)
+}
+
+#[tauri::command]
+pub fn write_project_pi_config(cwd: String, name: String, content: String) -> Result<(), String> {
+    if !matches!(name.as_str(), "settings" | "mcp") {
+        return Err(format!("unknown project config: {name}"));
+    }
+    let root = PathBuf::from(cwd);
+    if !root.is_dir() {
+        return Err("workspace не существует".into());
+    }
+    write_json_atomic(&root.join(".pi").join(format!("{name}.json")), &content)
+}
+
 /// Validate JSON, back up the previous version, then write atomically (tmp + rename).
 pub fn write_json_atomic(path: &Path, content: &str) -> Result<(), String> {
     serde_json::from_str::<Value>(content).map_err(|e| format!("невалидный JSON: {e}"))?;
@@ -74,7 +119,10 @@ pub fn write_pi_config(name: String, content: String) -> Result<(), String> {
 pub struct AppConfig {
     pub editor: String,
     pub process_limit: u32,
+    /// При локальном endpoint ограничивать параллелизм одним агентом.
+    pub process_limit_auto: bool,
     pub idle_kill_secs: u64,
+    pub preview_idle_kill_secs: u64,
     pub theme: String,
     pub ui_scale: f64,
     /// Явно заданный пользователем путь к бинарю pi (приоритетнее авто-детекта).
@@ -83,8 +131,12 @@ pub struct AppConfig {
     pub sidebar_width: u32,
     /// Каталог исходников pi-app для локального самообновления (ребилд из исходников).
     pub source_repo_path: Option<String>,
+    /// Автоматически скачать и установить готовый GitHub Release в фоне.
+    pub automatic_updates: bool,
     /// Имя для приветствия на стартовом экране (как в Claude for Mac).
     pub display_name: Option<String>,
+    /// Язык интерфейса. None сохраняет автоопределение по системной локали.
+    pub lang: Option<String>,
     /// Таймаут «сторожа зависаний» провайдера (@narumitw/pi-retry), мс.
     /// 0 (по умолчанию) — сторож ВЫКЛЮЧЕН: локальные reasoning-модели думают
     /// непредсказуемо долго, и любой конечный таймаут рано или поздно ложно
@@ -93,6 +145,35 @@ pub struct AppConfig {
     /// работать. Ненулевое значение осмысленно для облачных провайдеров.
     /// Прокидывается в pi как PI_RETRY_STALL_TIMEOUT_MS.
     pub pi_retry_stall_timeout_ms: u64,
+    /// UI-only aliases: provider/model-id -> friendly display name.
+    /// Never written to models.json and never sent to the provider.
+    pub model_aliases: HashMap<String, String>,
+    pub accent_color: String,
+    pub icon_color: String,
+    /// UI surface preset; independent from runtime model/provider selection.
+    pub appearance_preset: String,
+    pub visual_effects: bool,
+    pub interface_density: String,
+    pub transcript_mode: String,
+    /// Composer send shortcut: "enter" or "mod-enter" (Cmd/Ctrl+Enter).
+    pub send_key_behavior: String,
+    /// Resolved GUI palette derived from a pi theme. Kept separate from the
+    /// original pi theme JSON because ANSI indexes are resolved for WebView.
+    pub custom_theme: Option<HashMap<String, String>>,
+    /// The Library explains package scopes and trust boundaries on first use.
+    pub library_onboarding_seen: bool,
+    /// Per-model visual identity keyed by provider/model-id. Image paths stay
+    /// in app config and are never copied into the user's repository.
+    pub model_avatars: HashMap<String, AvatarConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AvatarConfig {
+    pub kind: Option<String>,
+    pub value: Option<String>,
+    pub working_kind: Option<String>,
+    pub working_value: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -100,22 +181,70 @@ impl Default for AppConfig {
         Self {
             editor: "code".into(),
             process_limit: 2,
+            process_limit_auto: true,
             idle_kill_secs: 900,
+            preview_idle_kill_secs: 600,
             theme: "system".into(),
             ui_scale: 1.0,
             pi_path: None,
             sidebar_collapsed: false,
             sidebar_width: 240,
             source_repo_path: None,
+            automatic_updates: true,
             display_name: None,
+            lang: None,
             pi_retry_stall_timeout_ms: 0, // сторож зависаний выключен по умолчанию
+            model_aliases: HashMap::new(),
+            accent_color: "#8b5cf6".into(),
+            icon_color: "#8b5cf6".into(),
+            appearance_preset: "chatgpt".into(),
+            visual_effects: true,
+            interface_density: "comfortable".into(),
+            transcript_mode: "normal".into(),
+            send_key_behavior: "enter".into(),
+            custom_theme: None,
+            library_onboarding_seen: false,
+            model_avatars: HashMap::new(),
         }
     }
 }
 
+/// Локальный provider обычно делит один GPU/model server; два параллельных pi
+/// процесса дают swap/очередь без выигрыша. Не делаем HTTP-запросов — читаем
+/// только models.json.
+pub fn local_provider_configured() -> bool {
+    local_provider_configured_in(&agent_dir())
+}
+
+fn local_provider_configured_in(dir: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(dir.join("models.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    let Some(providers) = value.get("providers").and_then(Value::as_object) else {
+        return false;
+    };
+    providers.iter().any(|(name, cfg)| {
+        let name = name.to_ascii_lowercase();
+        let base = cfg
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        matches!(name.as_str(), "ollama" | "omlx" | "lmstudio" | "lm-studio")
+            || base.contains("127.0.0.1")
+            || base.contains("localhost")
+            || base.contains("0.0.0.0")
+    })
+}
+
 /// Имя пользователя ОС с заглавной буквы — дефолт для приветствия.
 fn os_display_name() -> Option<String> {
-    let raw = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok()?;
+    let raw = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()?;
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -271,7 +400,10 @@ const PERMISSION_EXT_ID: &str = "pi-permission-system";
 /// global — ~/.pi/agent/extensions/pi-permission-system/config.json,
 /// project — <cwd>/.pi/extensions/pi-permission-system/config.json.
 fn project_permission_dir(cwd: &str) -> PathBuf {
-    Path::new(cwd).join(".pi").join("extensions").join(PERMISSION_EXT_ID)
+    Path::new(cwd)
+        .join(".pi")
+        .join("extensions")
+        .join(PERMISSION_EXT_ID)
 }
 
 /// Move a legacy policy file out of the extension's detection path: into the
@@ -290,7 +422,11 @@ fn migrate_legacy_file(legacy: &Path, new: &Path, log: &mut Vec<String>) {
     // new config already exists — just get the legacy file out of the way
     let backup = legacy.with_extension("jsonc.migrated-by-pi-app");
     if fs::rename(legacy, &backup).is_ok() {
-        log.push(format!("{} → {} (новый конфиг уже существует)", legacy.display(), backup.display()));
+        log.push(format!(
+            "{} → {} (новый конфиг уже существует)",
+            legacy.display(),
+            backup.display()
+        ));
     }
 }
 
@@ -308,7 +444,10 @@ pub fn migrate_permission_configs_in(agent_dir: &Path, cwd: Option<String>) -> V
     // global: <agent_dir>/pi-permissions.jsonc
     migrate_legacy_file(
         &agent_dir.join("pi-permissions.jsonc"),
-        &agent_dir.join("extensions").join(PERMISSION_EXT_ID).join("config.json"),
+        &agent_dir
+            .join("extensions")
+            .join(PERMISSION_EXT_ID)
+            .join("config.json"),
         &mut log,
     );
 
@@ -339,7 +478,10 @@ fn migrate_project_permission_files(cwd: &str, log: &mut Vec<String>) {
         }
     }
     // старые артефакты pi-app в legacy-каталоге больше не нужны
-    for stale in ["pi-permissions.json.pi-app.bak", "pi-permissions.user-backup.jsonc"] {
+    for stale in [
+        "pi-permissions.json.pi-app.bak",
+        "pi-permissions.user-backup.jsonc",
+    ] {
         let p = legacy_dir.join(stale);
         if p.exists() && fs::remove_file(&p).is_ok() {
             log.push(format!("удалён {}", p.display()));
@@ -355,7 +497,11 @@ pub fn write_permission_preset(cwd: String, mode: String) -> Result<Option<Strin
     write_permission_preset_in(&agent_dir(), &cwd, &mode)
 }
 
-pub fn write_permission_preset_in(agent_dir: &Path, cwd: &str, mode: &str) -> Result<Option<String>, String> {
+pub fn write_permission_preset_in(
+    agent_dir: &Path,
+    cwd: &str,
+    mode: &str,
+) -> Result<Option<String>, String> {
     let content = match mode {
         "ask" => PRESET_ASK,
         "accept-edits" => PRESET_ACCEPT_EDITS,
@@ -392,14 +538,28 @@ pub fn write_permission_preset_in(agent_dir: &Path, cwd: &str, mode: &str) -> Re
 const GUARDRAILS_OFF: &str = "{\n  \"enabled\": false\n}\n";
 
 fn guardrails_local_config(cwd: &str) -> PathBuf {
-    Path::new(cwd).join(".pi").join("extensions").join("guardrails.json")
+    Path::new(cwd)
+        .join(".pi")
+        .join("extensions")
+        .join("guardrails.json")
+}
+
+fn guardrails_override_marker(cwd: &str) -> PathBuf {
+    Path::new(cwd)
+        .join(".pi")
+        .join("extensions")
+        .join(".pi-app-guardrails-override")
 }
 
 /// Файл — наш bypass-override: ровно один ключ, `{"enabled": false}`.
 /// Всё остальное считается пользовательским конфигом и не трогается.
 fn is_pi_app_guardrails_override(path: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(path) else { return false };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else { return false };
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
     v.as_object()
         .is_some_and(|m| m.len() == 1 && m.get("enabled").and_then(|b| b.as_bool()) == Some(false))
 }
@@ -413,7 +573,8 @@ fn guardrails_installed(agent_dir: &Path, cwd: &str) -> bool {
             .and_then(|v| v.get("packages").map(|pkgs| pkgs.to_string()))
             .is_some_and(|s| s.contains("pi-guardrails"))
     };
-    listed(&agent_dir.join("settings.json")) || listed(&Path::new(cwd).join(".pi").join("settings.json"))
+    listed(&agent_dir.join("settings.json"))
+        || listed(&Path::new(cwd).join(".pi").join("settings.json"))
 }
 
 /// bypass → отключить guardrails project-locally; другие режимы → снять наш
@@ -421,11 +582,15 @@ fn guardrails_installed(agent_dir: &Path, cwd: &str) -> bool {
 /// для тоста: info об отключении или warning о чужом конфиге.
 fn sync_gate_configs(agent_dir: &Path, cwd: &str, mode: &str) -> Option<String> {
     let path = guardrails_local_config(cwd);
+    let marker = guardrails_override_marker(cwd);
     if mode == "bypass" {
         if !guardrails_installed(agent_dir, cwd) {
             return None;
         }
-        if path.exists() && !is_pi_app_guardrails_override(&path) {
+        // Ownership is proven by a separate marker. Content alone is insufficient:
+        // a user may legitimately maintain the same {enabled:false} config.
+        if path.exists() && (!marker.exists() || !is_pi_app_guardrails_override(&path)) {
+            let _ = fs::remove_file(&marker);
             return Some(
                 "Bypass: найден пользовательский .pi/extensions/guardrails.json — pi-app его не трогает, guardrails может продолжать блокировать (например, .env)".into(),
             );
@@ -434,13 +599,19 @@ fn sync_gate_configs(agent_dir: &Path, cwd: &str, mode: &str) -> Option<String> 
             let _ = fs::create_dir_all(parent);
         }
         if fs::write(&path, GUARDRAILS_OFF).is_ok() {
-            return Some("Bypass: pi-guardrails отключён для этого проекта (.pi/extensions/guardrails.json)".into());
+            if fs::write(&marker, "managed-by=pi-app\n").is_ok() {
+                return Some("Bypass: pi-guardrails отключён для этого проекта (.pi/extensions/guardrails.json)".into());
+            }
+            // Не оставляем неотличимый от пользовательского файл, если ownership
+            // marker записать не удалось.
+            let _ = fs::remove_file(&path);
         }
         None
     } else {
-        if path.exists() && is_pi_app_guardrails_override(&path) {
+        if marker.exists() && path.exists() && is_pi_app_guardrails_override(&path) {
             let _ = fs::remove_file(&path);
         }
+        let _ = fs::remove_file(&marker);
         None
     }
 }
@@ -449,7 +620,10 @@ fn sync_gate_configs(agent_dir: &Path, cwd: &str, mode: &str) -> Option<String> 
 #[tauri::command]
 pub fn read_permission_mode(cwd: String) -> Option<String> {
     let new_marker = project_permission_dir(&cwd).join(".pi-app-mode");
-    let legacy_marker = Path::new(&cwd).join(".pi").join("agent").join(".pi-app-permission-mode");
+    let legacy_marker = Path::new(&cwd)
+        .join(".pi")
+        .join("agent")
+        .join(".pi-app-permission-mode");
     fs::read_to_string(new_marker)
         .or_else(|_| fs::read_to_string(legacy_marker))
         .ok()
@@ -526,7 +700,9 @@ pub fn list_skills() -> Vec<SkillInfo> {
 
     for dir_str in &dirs_list {
         let dir = expand_tilde(dir_str);
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let p = entry.path();
             if !p.is_dir() {
@@ -537,7 +713,10 @@ pub fn list_skills() -> Vec<SkillInfo> {
                 let (name, description) = parse_skill_md(&skill_md);
                 out.push(SkillInfo {
                     name: name.unwrap_or_else(|| {
-                        p.file_name().unwrap_or_default().to_string_lossy().into_owned()
+                        p.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
                     }),
                     description: description.unwrap_or_default(),
                     path: skill_md.to_string_lossy().into_owned(),
@@ -581,7 +760,47 @@ mod tests {
         let c = AppConfig::default();
         assert_eq!(c.editor, "code");
         assert_eq!(c.process_limit, 2);
+        assert!(c.process_limit_auto);
         assert_eq!(c.idle_kill_secs, 900);
+        assert_eq!(c.preview_idle_kill_secs, 600);
+        assert!(c.lang.is_none());
+        assert!(c.model_aliases.is_empty());
+        assert!(c.model_avatars.is_empty());
+        assert_eq!(c.accent_color, "#8b5cf6");
+        assert_eq!(c.appearance_preset, "chatgpt");
+        assert!(c.visual_effects);
+        assert_eq!(c.interface_density, "comfortable");
+        assert_eq!(c.transcript_mode, "normal");
+    }
+
+    #[test]
+    fn app_config_new_fields_default_for_existing_files() {
+        let c: AppConfig = serde_json::from_str(r#"{"editor":"zed","processLimit":3}"#).unwrap();
+        assert!(c.process_limit_auto);
+        assert_eq!(c.preview_idle_kill_secs, 600);
+        assert_eq!(c.editor, "zed");
+        assert_eq!(c.process_limit, 3);
+        assert!(c.model_aliases.is_empty());
+        assert!(c.model_avatars.is_empty());
+        assert_eq!(c.appearance_preset, "chatgpt");
+        assert_eq!(c.transcript_mode, "normal");
+    }
+
+    #[test]
+    fn detects_local_model_provider_without_network_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("models.json"),
+            r#"{"providers":{"custom":{"baseUrl":"http://127.0.0.1:8003/v1"}}}"#,
+        )
+        .unwrap();
+        assert!(local_provider_configured_in(tmp.path()));
+        fs::write(
+            tmp.path().join("models.json"),
+            r#"{"providers":{"cloud":{"baseUrl":"https://api.example.com/v1"}}}"#,
+        )
+        .unwrap();
+        assert!(!local_provider_configured_in(tmp.path()));
     }
 
     #[test]
@@ -590,29 +809,59 @@ mod tests {
         let cwd = tmp.path().join("proj");
         let legacy_dir = cwd.join(".pi").join("agent");
         fs::create_dir_all(&legacy_dir).unwrap();
-        fs::write(legacy_dir.join("pi-permissions.jsonc"), r#"{"yoloMode":true}"#).unwrap();
+        fs::write(
+            legacy_dir.join("pi-permissions.jsonc"),
+            r#"{"yoloMode":true}"#,
+        )
+        .unwrap();
         fs::write(legacy_dir.join(".pi-app-permission-mode"), "bypass").unwrap();
         // глобальный legacy-файл в изолированном agent_dir
         let fake_agent = tmp.path().join("agent");
         fs::create_dir_all(&fake_agent).unwrap();
-        fs::write(fake_agent.join("pi-permissions.jsonc"), r#"{"yoloMode":false}"#).unwrap();
+        fs::write(
+            fake_agent.join("pi-permissions.jsonc"),
+            r#"{"yoloMode":false}"#,
+        )
+        .unwrap();
 
-        let log = migrate_permission_configs_in(&fake_agent, Some(cwd.to_string_lossy().into_owned()));
+        let log =
+            migrate_permission_configs_in(&fake_agent, Some(cwd.to_string_lossy().into_owned()));
         assert!(!log.is_empty());
         assert!(!fake_agent.join("pi-permissions.jsonc").exists());
-        assert!(fake_agent.join("extensions").join(PERMISSION_EXT_ID).join("config.json").exists());
+        assert!(fake_agent
+            .join("extensions")
+            .join(PERMISSION_EXT_ID)
+            .join("config.json")
+            .exists());
         assert!(!legacy_dir.join("pi-permissions.jsonc").exists());
-        let new_cfg = cwd.join(".pi").join("extensions").join(PERMISSION_EXT_ID).join("config.json");
-        assert_eq!(fs::read_to_string(&new_cfg).unwrap(), r#"{"yoloMode":true}"#);
+        let new_cfg = cwd
+            .join(".pi")
+            .join("extensions")
+            .join(PERMISSION_EXT_ID)
+            .join("config.json");
+        assert_eq!(
+            fs::read_to_string(&new_cfg).unwrap(),
+            r#"{"yoloMode":true}"#
+        );
         // маркер переехал и режим читается
-        assert_eq!(read_permission_mode(cwd.to_string_lossy().into_owned()).as_deref(), Some("bypass"));
+        assert_eq!(
+            read_permission_mode(cwd.to_string_lossy().into_owned()).as_deref(),
+            Some("bypass")
+        );
 
         // повторный вызов — no-op
-        assert!(migrate_permission_configs_in(&fake_agent, Some(cwd.to_string_lossy().into_owned())).is_empty());
+        assert!(migrate_permission_configs_in(
+            &fake_agent,
+            Some(cwd.to_string_lossy().into_owned())
+        )
+        .is_empty());
 
         // пресет пишется в новый путь
         write_permission_preset(cwd.to_string_lossy().into_owned(), "ask".into()).unwrap();
-        assert_eq!(read_permission_mode(cwd.to_string_lossy().into_owned()).as_deref(), Some("ask"));
+        assert_eq!(
+            read_permission_mode(cwd.to_string_lossy().into_owned()).as_deref(),
+            Some("ask")
+        );
         let content = fs::read_to_string(&new_cfg).unwrap();
         assert!(content.contains("\"write\": \"ask\""));
     }
@@ -622,20 +871,29 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let agent = tmp.path().join("agent");
         fs::create_dir_all(&agent).unwrap();
-        fs::write(agent.join("settings.json"), r#"{"packages":["npm:@aliou/pi-guardrails"]}"#).unwrap();
+        fs::write(
+            agent.join("settings.json"),
+            r#"{"packages":["npm:@aliou/pi-guardrails"]}"#,
+        )
+        .unwrap();
         let proj = tmp.path().join("proj");
         fs::create_dir_all(&proj).unwrap();
         let cwd = proj.to_string_lossy().into_owned();
         let gpath = proj.join(".pi").join("extensions").join("guardrails.json");
+        let marker = guardrails_override_marker(&cwd);
 
         // bypass выключает guardrails своим override-файлом
         let notice = write_permission_preset_in(&agent, &cwd, "bypass").unwrap();
         assert!(notice.unwrap().contains("отключён"));
         assert!(is_pi_app_guardrails_override(&gpath));
+        assert!(marker.exists());
 
         // возврат в ask снимает наш override
-        assert!(write_permission_preset_in(&agent, &cwd, "ask").unwrap().is_none());
+        assert!(write_permission_preset_in(&agent, &cwd, "ask")
+            .unwrap()
+            .is_none());
         assert!(!gpath.exists());
+        assert!(!marker.exists());
 
         // пользовательский конфиг: не трогаем и предупреждаем
         fs::create_dir_all(gpath.parent().unwrap()).unwrap();
@@ -646,15 +904,37 @@ mod tests {
         assert!(gpath.exists(), "чужой файл сохранён");
         fs::remove_file(&gpath).unwrap();
 
+        // Даже идентичный нашему по содержанию пользовательский файл не наш:
+        // без marker он сохраняется при входе и выходе из bypass.
+        fs::write(&gpath, GUARDRAILS_OFF).unwrap();
+        let notice = write_permission_preset_in(&agent, &cwd, "bypass").unwrap();
+        assert!(notice.unwrap().contains("не трогает"));
+        assert!(!marker.exists());
+        write_permission_preset_in(&agent, &cwd, "ask").unwrap();
+        assert!(gpath.exists(), "идентичный пользовательский файл сохранён");
+        fs::remove_file(&gpath).unwrap();
+
         // guardrails не установлен → bypass не создаёт файл и молчит
-        fs::write(agent.join("settings.json"), r#"{"packages":["npm:pi-mcp-adapter"]}"#).unwrap();
-        assert!(write_permission_preset_in(&agent, &cwd, "bypass").unwrap().is_none());
+        fs::write(
+            agent.join("settings.json"),
+            r#"{"packages":["npm:pi-mcp-adapter"]}"#,
+        )
+        .unwrap();
+        assert!(write_permission_preset_in(&agent, &cwd, "bypass")
+            .unwrap()
+            .is_none());
         assert!(!gpath.exists());
 
         // ...но проектные packages тоже учитываются
         fs::create_dir_all(proj.join(".pi")).unwrap();
-        fs::write(proj.join(".pi").join("settings.json"), r#"{"packages":["npm:@aliou/pi-guardrails"]}"#).unwrap();
-        assert!(write_permission_preset_in(&agent, &cwd, "bypass").unwrap().is_some());
+        fs::write(
+            proj.join(".pi").join("settings.json"),
+            r#"{"packages":["npm:@aliou/pi-guardrails"]}"#,
+        )
+        .unwrap();
+        assert!(write_permission_preset_in(&agent, &cwd, "bypass")
+            .unwrap()
+            .is_some());
         assert!(gpath.exists());
     }
 
@@ -662,9 +942,24 @@ mod tests {
     fn parses_skill_frontmatter() {
         let tmp = tempfile::tempdir().unwrap();
         let md = tmp.path().join("SKILL.md");
-        fs::write(&md, "---\nname: my-skill\ndescription: Does things\n---\n# body\n").unwrap();
+        fs::write(
+            &md,
+            "---\nname: my-skill\ndescription: Does things\n---\n# body\n",
+        )
+        .unwrap();
         let (name, desc) = parse_skill_md(&md);
         assert_eq!(name.as_deref(), Some("my-skill"));
         assert_eq!(desc.as_deref(), Some("Does things"));
+    }
+
+    #[test]
+    fn project_config_is_scoped_and_rejects_unknown_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        write_project_pi_config(cwd.clone(), "mcp".into(), "{\"mcpServers\":{}}".into()).unwrap();
+        let read = read_project_pi_config(cwd.clone(), "mcp".into()).unwrap();
+        assert!(read.path.ends_with(".pi/mcp.json"));
+        assert!(read.content.contains("mcpServers"));
+        assert!(read_project_pi_config(cwd, "../models".into()).is_err());
     }
 }

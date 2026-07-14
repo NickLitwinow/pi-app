@@ -1,20 +1,17 @@
 //! End-to-end test of the production agent pipeline: a mock Tauri app hosts the
 //! real Supervisor, which spawns the actual `pi --mode rpc` binary, talks JSONL
-//! to it, and (when the local model server is up) drives a full prompt turn.
+//! to it, and (when explicitly requested) drives a full prompt turn.
 //!
-//! Skips gracefully when pi is not installed; skips the LLM round-trip when the
-//! model server at 127.0.0.1:8003 is down.
+//! The LLM leg is opt-in (`PI_APP_RUN_LLM_E2E=1`). A listening TCP port does not
+//! prove that the configured model is loaded or has enough memory, and treating
+//! it as readiness made ordinary `cargo test` hang for three minutes.
 
 use pi_app_lib::supervisor::{self, SpawnOpts, Supervisor};
 use std::time::Duration;
 use tauri::Manager;
 
-fn model_server_up() -> bool {
-    "127.0.0.1:8003"
-        .parse()
-        .ok()
-        .and_then(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(800)).ok())
-        .is_some()
+fn run_llm_e2e() -> bool {
+    std::env::var("PI_APP_RUN_LLM_E2E").as_deref() == Ok("1")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -82,8 +79,8 @@ async fn real_pi_agent_roundtrip() {
         "session stored in our --session-dir: {session_path}"
     );
 
-    // --- full prompt round-trip through the local model (if it is running) ---
-    if model_server_up() {
+    // --- full prompt round-trip through the configured model (explicit opt-in) ---
+    if run_llm_e2e() {
         supervisor::agent_send_impl(
             sup.inner(),
             agent_id.clone(),
@@ -110,7 +107,10 @@ async fn real_pi_agent_roundtrip() {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        assert!(saw_streaming, "agent_start was observed (event pipeline works)");
+        assert!(
+            saw_streaming,
+            "agent_start was observed (event pipeline works)"
+        );
         assert!(turn_done, "agent_end was observed (turn completed)");
 
         // the assistant's reply must be persisted in the pi session file
@@ -126,7 +126,7 @@ async fn real_pi_agent_roundtrip() {
         );
         eprintln!("LLM round-trip OK");
     } else {
-        eprintln!("SKIP LLM round-trip: model server at 127.0.0.1:8003 is down");
+        eprintln!("SKIP LLM round-trip: set PI_APP_RUN_LLM_E2E=1 to exercise the configured model");
     }
 
     // --- teardown through the production kill path ---

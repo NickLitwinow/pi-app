@@ -30,6 +30,7 @@ import {
   GearIcon,
   GroupIcon,
   PlusIcon,
+  PackageIcon,
   ReviewIcon,
   SidebarIcon,
   UpdateIcon,
@@ -39,6 +40,7 @@ import UpdateModal from "./UpdateModal";
 const NAV: { view: View; label: string; icon: (p: { size?: number }) => ReactElement }[] = [
   { view: "chat", label: "Чат", icon: ChatIcon },
   { view: "review", label: "Code Review", icon: ReviewIcon },
+  { view: "library", label: "Library", icon: PackageIcon },
   { view: "settings", label: "Настройки", icon: GearIcon },
 ];
 
@@ -440,9 +442,18 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
         title={cwd}
       >
         <span className="ws-name">
-          {ws?.liveStreaming ? <span className="spinner" /> : ws?.alive ? <span className="dot live" /> : <ChevronIcon open={expanded} />}
+          <ChevronIcon open={expanded} />
           {name}
           <span className="ws-count">{count > 0 ? count : ""}</span>
+          {/* Индикатор есть всегда — три состояния одного слота. Пустой слот
+              оставлял дыру справа от счётчика, и цифра читалась как сбитая. */}
+          <span className="project-state-slot">
+            {ws?.liveStreaming
+              ? <span className="spinner project-state" title="Модель работает" />
+              : ws?.alive
+                ? <span className="dot live project-state" title="Агент запущен" />
+                : <span className="dot idle project-state" title="Агент не запущен" />}
+          </span>
         </span>
         <button
           className="sess-more"

@@ -1,63 +1,71 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { getBackend } from "../lib/backend";
 import { messageDialog } from "../lib/dialog";
-import type { AppUpdateInfo } from "../lib/types";
+import type { AppUpdateInfo, PiPackage, PiUpdateInfo } from "../lib/types";
 import { openExternalUrl, updateAppConfig, useStore } from "../state/store";
-import { CheckIcon, ExternalIcon, FolderIcon, RefreshIcon } from "./icons";
+import { CheckIcon, ExternalIcon, FolderIcon, PackageIcon, RefreshIcon } from "./icons";
+import { useInstalledPackages, useRunPi } from "./Marketplace";
 
 export default function UpdateModal({ onClose }: { onClose: () => void }) {
   const configuredRepo = useStore((s) => s.appConfig.sourceRepoPath ?? null);
-  const [info, setInfo] = useState<AppUpdateInfo | null>(null);
+  const automaticUpdates = useStore((s) => s.appConfig.automaticUpdates !== false);
+  const [appInfo, setAppInfo] = useState<AppUpdateInfo | null>(null);
+  const [piInfo, setPiInfo] = useState<PiUpdateInfo | null>(null);
+  const [packageInfo, setPackageInfo] = useState<PiPackage[]>([]);
   const [checking, setChecking] = useState(true);
-  const [running, setRunning] = useState(false);
-  const [done, setDone] = useState(false);
-  const [ok, setOk] = useState(false);
-  const [log, setLog] = useState<string[]>([]);
+  const [appRunning, setAppRunning] = useState(false);
+  const [appDone, setAppDone] = useState(false);
+  const [appOk, setAppOk] = useState(false);
+  const [appLog, setAppLog] = useState<string[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
-
-  const repoPath = info?.sourceRepo ?? configuredRepo ?? null;
+  const { specs, reload: reloadInstalled } = useInstalledPackages();
+  const specsKey = specs.join("\u0000");
 
   const check = useCallback(async () => {
     setChecking(true);
     const be = await getBackend();
-    const res = await be
-      .invoke<AppUpdateInfo>("check_app_update", { sourceRepo: configuredRepo })
-      .catch(() => null);
-    setInfo(res);
+    const [app, pi, packages] = await Promise.all([
+      be.invoke<AppUpdateInfo>("check_app_update", { sourceRepo: configuredRepo }).catch(() => null),
+      be.invoke<PiUpdateInfo>("check_pi_update").catch(() => null),
+      specs.length > 0
+        ? be.invoke<PiPackage[]>("pi_packages_meta", { names: specs }).catch(() => [])
+        : Promise.resolve([] as PiPackage[]),
+    ]);
+    setAppInfo(app);
+    setPiInfo(pi);
+    setPackageInfo(packages);
     setChecking(false);
-  }, [configuredRepo]);
+    // specsKey intentionally makes installed package changes retrigger the check.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [configuredRepo, specsKey]);
 
-  useEffect(() => {
+  const piRun = useRunPi(() => {
+    reloadInstalled();
     void check();
-  }, [check]);
+  });
 
-  useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-  }, [log]);
+  useEffect(() => void check(), [check]);
+  useEffect(() => logRef.current?.scrollTo({ top: logRef.current.scrollHeight }), [appLog]);
+
+  const repoPath = appInfo?.sourceRepo ?? configuredRepo ?? null;
+  const packageUpdates = packageInfo.filter((item) => item.updateAvailable);
 
   const pickRepo = async () => {
     const be = await getBackend();
     if (be.isMock) {
       await updateAppConfig({ sourceRepoPath: "/Users/dev/pi-app" });
-      void check();
       return;
     }
     const { open } = await import("@tauri-apps/plugin-dialog");
     const dir = await open({ directory: true, multiple: false, title: "Каталог исходников pi-app" }).catch(() => null);
-    if (typeof dir === "string" && dir) {
-      await updateAppConfig({ sourceRepoPath: dir });
-      void check();
-    }
+    if (typeof dir === "string" && dir) await updateAppConfig({ sourceRepoPath: dir });
   };
 
-  const runUpdate = async () => {
-    if (!repoPath) {
-      await messageDialog("Не задан каталог исходников pi-app — укажите его, чтобы пересобрать приложение.", { kind: "warning" });
-      return;
-    }
-    setRunning(true);
-    setDone(false);
-    setLog([]);
+  const runAppCommand = async (command: "app_update_run" | "app_update_install_release", args: Record<string, unknown>) => {
+    setAppRunning(true);
+    setAppDone(false);
+    setAppLog([]);
     const be = await getBackend();
     let un: (() => void) | null = null;
     try {
@@ -65,32 +73,44 @@ export default function UpdateModal({ onClose }: { onClose: () => void }) {
       const buffered: Record<string, unknown>[] = [];
       let finish: () => void = () => {};
       const donePromise = new Promise<void>((resolve) => (finish = resolve));
-      const handle = (p: Record<string, unknown>) => {
+      const handle = (payload: Record<string, unknown>) => {
         if (runId == null) {
-          buffered.push(p);
+          buffered.push(payload);
           return;
         }
-        if (p.runId !== runId) return;
-        if (p.done) {
-          setOk(p.code === 0);
-          setDone(true);
+        if (payload.runId !== runId) return;
+        if (payload.done) {
+          setAppOk(payload.code === 0);
+          setAppDone(true);
           finish();
-        } else if (p.line) {
-          setLog((l) => [...l.slice(-500), String(p.line)]);
+        } else if (payload.line) {
+          setAppLog((lines) => [...lines.slice(-500), String(payload.line)]);
         }
       };
       un = await be.listen("app-update-output", handle);
-      runId = await be.invoke<string>("app_update_run", { sourceRepo: repoPath });
-      for (const p of buffered.splice(0)) handle(p);
+      runId = await be.invoke<string>(command, args);
+      for (const payload of buffered.splice(0)) handle(payload);
       await donePromise;
-    } catch (e) {
-      setLog((l) => [...l, `ошибка: ${String(e)}`]);
-      setDone(true);
-      setOk(false);
+    } catch (error) {
+      setAppLog((lines) => [...lines, `ошибка: ${String(error)}`]);
+      setAppDone(true);
+      setAppOk(false);
     } finally {
       un?.();
-      setRunning(false);
+      setAppRunning(false);
     }
+  };
+
+  const updateApp = async () => {
+    if (appInfo?.assetUrl) {
+      await runAppCommand("app_update_install_release", { assetUrl: appInfo.assetUrl });
+      return;
+    }
+    if (!repoPath) {
+      await messageDialog("Нет готового DMG и не задан каталог исходников pi-app.", { kind: "warning" });
+      return;
+    }
+    await runAppCommand("app_update_run", { sourceRepo: repoPath });
   };
 
   const relaunch = async () => {
@@ -98,139 +118,113 @@ export default function UpdateModal({ onClose }: { onClose: () => void }) {
     await be.invoke("relaunch_app").catch(() => {});
   };
 
-  const available = info?.updateAvailable ?? false;
-
-  return (
-    <div className="app-modal-overlay" onMouseDown={(e) => e.target === e.currentTarget && !running && onClose()}>
-      <div className="app-modal">
+  const modal = (
+    <div className="app-modal-overlay" onMouseDown={(e) => e.target === e.currentTarget && !appRunning && !piRun.running && onClose()}>
+      <div className="app-modal update-center">
         <div className="am-head">
-          <span className="am-title">Обновление Pi</span>
+          <div>
+            <div className="am-title">Центр обновлений</div>
+            <div className="hint">Приложение, pi CLI и community-пакеты в одном месте</div>
+          </div>
           <div className="grow" />
-          {!running && (
-            <button className="hint" onClick={onClose}>
-              ✕
-            </button>
-          )}
+          <button className="iconbtn" disabled={appRunning || piRun.running} onClick={onClose} aria-label="Закрыть">✕</button>
         </div>
 
-        <div className="am-body">
-          {checking ? (
-            <div className="row" style={{ gap: 8 }}>
-              <span className="spinner" /> Проверка обновлений…
-            </div>
-          ) : !info ? (
-            <div className="muted">Не удалось проверить обновления.</div>
-          ) : (
-            <>
-              <div className="am-row">
-                <span className="hint">Текущая версия</span>
-                <span className="grow" />
-                <span style={{ fontFamily: "var(--font-mono)" }}>
-                  {info.currentVersion} · {info.currentSha}
+        <div className="am-body update-sections">
+          <section className="update-section">
+            <div className="update-section-head">
+              <div className="update-section-icon">✦</div>
+              <div className="update-section-copy">
+                <strong>Pi App</strong>
+                <span className="hint">
+                  {checking && !appInfo ? "Проверка…" : appInfo ? `${appInfo.currentVersion} · ${appInfo.currentSha}` : "Статус недоступен"}
                 </span>
               </div>
-              <div className="am-row">
-                <span className="hint">Последняя</span>
-                <span className="grow" />
-                {info.checked ? (
-                  <span style={{ fontFamily: "var(--font-mono)" }}>
-                    {info.latest ?? "—"} {info.latestKind === "release" ? "(релиз)" : info.latestKind === "commit" ? "(коммит)" : ""}
-                  </span>
-                ) : (
-                  <span className="hint" style={{ color: "var(--warn)" }}>{info.error ?? "GitHub недоступен"}</span>
-                )}
-              </div>
-
-              {info.checked && (info.behind > 0 || info.ahead > 0) && (
-                <div className="am-row">
-                  <span className="hint">Относительно upstream</span>
-                  <span className="grow" />
-                  <span style={{ fontFamily: "var(--font-mono)" }}>
-                    {info.behind > 0 ? `↓${info.behind} позади` : ""}
-                    {info.behind > 0 && info.ahead > 0 ? " · " : ""}
-                    {info.ahead > 0 ? `↑${info.ahead} впереди` : ""}
-                  </span>
+              {appInfo?.updateAvailable ? <span className="badge update">Доступно</span> : appInfo?.checked ? <span className="badge installed">Актуально</span> : null}
+            </div>
+            {appInfo && (
+              <>
+                <div className="update-detail-row">
+                  <span className="hint">Последняя версия</span>
+                  <span className="mono">{appInfo.latest ?? "—"}{appInfo.latestKind !== "none" ? ` · ${appInfo.latestKind === "release" ? "релиз" : "коммит"}` : ""}</span>
                 </div>
-              )}
-
-              {info.checked && (
-                <div className="am-status" style={{ color: available ? "var(--warn)" : "var(--ok)" }}>
-                  {available
-                    ? `● Доступно обновление${info.behind > 0 ? ` (${info.behind} коммит(ов))` : ""}`
-                    : info.ahead > 0
-                      ? "✓ Ваша версия новее удалённой"
-                      : "✓ Установлена последняя версия"}
-                </div>
-              )}
-
-              {info.notes && (
-                <div className="am-notes">{info.notes}</div>
-              )}
-
-              {info.htmlUrl && (
-                <button className="hint am-link" onClick={() => void openExternalUrl(info.htmlUrl)}>
-                  <ExternalIcon size={12} /> Открыть репозиторий на GitHub
-                </button>
-              )}
-
-              <div className="am-repo">
-                <span className="hint">Исходники для сборки</span>
-                <div className="row" style={{ marginTop: 4 }}>
-                  <span
-                    style={{ fontFamily: "var(--font-mono)", fontSize: 11, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                    title={repoPath ?? ""}
+                {appInfo.notes && <div className="am-notes">{appInfo.notes}</div>}
+                <div className="update-inline-actions">
+                  {appInfo.htmlUrl && <button className="hint" onClick={() => void openExternalUrl(appInfo.htmlUrl)}><ExternalIcon size={12} /> GitHub</button>}
+                  <button
+                    className="primary"
+                    disabled={appRunning || (!appInfo.assetUrl && !appInfo.sourceRepoValid)}
+                    onClick={() => void updateApp()}
                   >
-                    {repoPath ?? "не задан"}
-                  </span>
-                  <button onClick={() => void pickRepo()}>
-                    <FolderIcon size={13} /> Изменить
+                    {appRunning ? <><span className="spinner" /> Установка…</> : <><CheckIcon size={13} /> {appInfo.assetUrl ? "Установить в фоне" : "Обновить из исходников"}</>}
                   </button>
                 </div>
-                {repoPath && info.sourceRepoValid === false && (
-                  <div className="hint" style={{ color: "var(--danger)", marginTop: 4 }}>
-                    Это не похоже на репозиторий pi-app — ребилд недоступен.
-                  </div>
-                )}
+              </>
+            )}
+            <label className="update-auto-row">
+              <span><strong>Автообновление в фоне</strong><small>Готовый релиз установится без закрытия приложения и drag&amp;drop DMG.</small></span>
+              <input type="checkbox" checked={automaticUpdates} onChange={(e) => void updateAppConfig({ automaticUpdates: e.target.checked })} />
+            </label>
+            <details className="update-advanced">
+              <summary>Пересборка из исходников</summary>
+              <div className="row update-repo-row">
+                <span className="mono" title={repoPath ?? ""}>{repoPath ?? "каталог не задан"}</span>
+                <button onClick={() => void pickRepo()}><FolderIcon size={13} /> Изменить</button>
               </div>
+            </details>
+          </section>
 
-              {log.length > 0 && (
-                <div className="console" ref={logRef} style={{ marginTop: 12, maxHeight: 220 }}>
-                  {log.join("\n")}
-                </div>
-              )}
-            </>
+          <section className="update-section">
+            <div className="update-section-head">
+              <div className="update-section-icon"><PackageIcon size={16} /></div>
+              <div className="update-section-copy">
+                <strong>pi CLI</strong>
+                <span className="hint">{piInfo?.currentVersion ?? "Версия не определена"}{piInfo?.latestVersion ? ` → ${piInfo.latestVersion}` : ""}</span>
+              </div>
+              {piInfo?.updateAvailable ? <span className="badge update">Доступно</span> : piInfo?.checked ? <span className="badge installed">Актуально</span> : null}
+              <button className="primary" disabled={piRun.running || !piInfo?.updateAvailable} onClick={() => void piRun.runPi(["update", "--self"])}>
+                {piRun.running ? <span className="spinner" /> : <RefreshIcon size={13} />} Обновить pi
+              </button>
+            </div>
+          </section>
+
+          <section className="update-section">
+            <div className="update-section-head">
+              <div className="update-section-icon"><PackageIcon size={16} /></div>
+              <div className="update-section-copy">
+                <strong>Расширения и skills</strong>
+                <span className="hint">{specs.length} установлено · {packageUpdates.length} обновлений</span>
+              </div>
+              <button className="primary" disabled={piRun.running || packageUpdates.length === 0} onClick={() => void piRun.runPi(["update", "--extensions"])}>
+                Обновить всё
+              </button>
+            </div>
+            {packageUpdates.length > 0 ? (
+              <div className="update-package-list">
+                {packageUpdates.map((pkg) => (
+                  <div className="update-package-row" key={pkg.name}>
+                    <span className="mono">{pkg.name}</span>
+                    <span className="hint">{pkg.installedVersion ?? "?"} → {pkg.version}</span>
+                    <button disabled={piRun.running} onClick={() => void piRun.runPi(["update", `npm:${pkg.name}`])}>Обновить</button>
+                  </div>
+                ))}
+              </div>
+            ) : !checking && <div className="hint update-empty">Все незакреплённые community-пакеты актуальны.</div>}
+          </section>
+
+          {(appLog.length > 0 || piRun.log.length > 0) && (
+            <div className="console update-console" ref={logRef}>{[...appLog, ...piRun.log].join("\n")}</div>
           )}
         </div>
 
         <div className="am-actions">
-          <button disabled={checking || running} onClick={() => void check()}>
-            <RefreshIcon size={13} /> Проверить снова
-          </button>
+          <button disabled={checking || appRunning || piRun.running} onClick={() => void check()}><RefreshIcon size={13} /> Проверить всё</button>
           <div className="grow" />
-          {done && ok ? (
-            <button className="primary" onClick={() => void relaunch()}>
-              Перезапустить Pi
-            </button>
-          ) : (
-            <button
-              className="primary"
-              disabled={running || checking || !info?.sourceRepoValid}
-              title={!info?.sourceRepoValid ? "Укажите каталог исходников pi-app" : "git pull → npm install → tauri build → замена приложения"}
-              onClick={() => void runUpdate()}
-            >
-              {running ? (
-                <>
-                  <span className="spinner" /> Обновление…
-                </>
-              ) : (
-                <>
-                  <CheckIcon size={13} /> {available ? "Обновить и пересобрать" : "Пересобрать из исходников"}
-                </>
-              )}
-            </button>
-          )}
+          {appDone && appOk && <button className="primary" onClick={() => void relaunch()}>Перезапустить Pi App</button>}
         </div>
       </div>
     </div>
   );
+
+  return createPortal(modal, document.body);
 }

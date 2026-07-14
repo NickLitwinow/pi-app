@@ -1,16 +1,19 @@
 pub mod app_update;
+pub mod avatars;
 pub mod config;
 pub mod editor;
 pub mod gitops;
 pub mod jsonl;
 pub mod packages;
+pub mod perf;
 pub mod pi_cli;
 pub mod preview;
 pub mod sessions;
 pub mod supervisor;
+pub mod themes;
 pub mod watcher;
 
-use tauri::menu::{Menu, MenuItemBuilder, MenuItemKind, SubmenuBuilder};
+use tauri::menu::{Menu, MenuItemBuilder, SubmenuBuilder};
 use tauri::{Emitter, Manager};
 
 pub fn run() {
@@ -23,29 +26,94 @@ pub fn run() {
             watcher::start_sessions_watcher(app.handle().clone());
             watcher::start_config_watcher(app.handle().clone());
 
-            // системное меню: View → Toggle Sidebar (⌘B)
+            // Нативное меню повторяет карту действий web-view. Источником
+            // истины остаются action id — App.tsx обрабатывает и menu, и keydown.
             let menu = Menu::default(app.handle())?;
+            let new_session = MenuItemBuilder::with_id("new-session", "New Session")
+                .accelerator("CmdOrCtrl+T")
+                .build(app)?;
+            let close_session = MenuItemBuilder::with_id("close-session", "Close Session")
+                .accelerator("CmdOrCtrl+W")
+                .build(app)?;
+            let find_session = MenuItemBuilder::with_id("find-session", "Find in Session")
+                .accelerator("CmdOrCtrl+F")
+                .build(app)?;
+            let focus_composer = MenuItemBuilder::with_id("focus-composer", "Focus Composer")
+                .accelerator("CmdOrCtrl+L")
+                .build(app)?;
+            let copy_last = MenuItemBuilder::with_id("copy-last-answer", "Copy Last Answer")
+                .accelerator("CmdOrCtrl+Shift+C")
+                .build(app)?;
+            let session_menu = SubmenuBuilder::new(app, "Session")
+                .items(&[
+                    &new_session,
+                    &close_session,
+                    &find_session,
+                    &focus_composer,
+                    &copy_last,
+                ])
+                .build()?;
+            menu.append(&session_menu)?;
+
             let toggle = MenuItemBuilder::with_id("toggle-sidebar", "Toggle Sidebar")
                 .accelerator("CmdOrCtrl+B")
                 .build(app)?;
-            let mut appended = false;
-            for item in menu.items()? {
-                if let MenuItemKind::Submenu(sub) = item {
-                    if sub.text().unwrap_or_default() == "View" {
-                        sub.append(&toggle)?;
-                        appended = true;
-                        break;
-                    }
-                }
-            }
-            if !appended {
-                let view = SubmenuBuilder::new(app, "View").item(&toggle).build()?;
-                menu.append(&view)?;
+            let code_review = MenuItemBuilder::with_id("code-review", "Code Review")
+                .accelerator("CmdOrCtrl+R")
+                .build(app)?;
+            let preview = MenuItemBuilder::with_id("toggle-preview", "Toggle Live Preview")
+                .accelerator("CmdOrCtrl+E")
+                .build(app)?;
+            let palette = MenuItemBuilder::with_id("command-palette", "Command Palette")
+                .accelerator("CmdOrCtrl+K")
+                .build(app)?;
+            let hotkeys = MenuItemBuilder::with_id("hotkeys", "Keyboard Shortcuts")
+                .accelerator("CmdOrCtrl+/")
+                .build(app)?;
+            let settings = MenuItemBuilder::with_id("settings", "Settings")
+                .accelerator("CmdOrCtrl+,")
+                .build(app)?;
+            let navigate_menu = SubmenuBuilder::new(app, "Navigate")
+                .items(&[
+                    &toggle,
+                    &code_review,
+                    &preview,
+                    &palette,
+                    &hotkeys,
+                    &settings,
+                ])
+                .build()?;
+            menu.append(&navigate_menu)?;
+
+            for number in 1..=9 {
+                let id = format!("workspace-{number}");
+                let label = format!("Workspace {number}");
+                let accelerator = format!("CmdOrCtrl+{number}");
+                let item = MenuItemBuilder::with_id(id, label)
+                    .accelerator(accelerator)
+                    .build(app)?;
+                // Workspace navigation lives in Navigate after its fixed actions.
+                navigate_menu.append(&item)?;
             }
             app.set_menu(menu)?;
             app.on_menu_event(|app, event| {
-                if event.id() == "toggle-sidebar" {
-                    let _ = app.emit("menu-toggle-sidebar", serde_json::json!({}));
+                let action = event.id().as_ref();
+                if matches!(
+                    action,
+                    "new-session"
+                        | "close-session"
+                        | "find-session"
+                        | "focus-composer"
+                        | "copy-last-answer"
+                        | "toggle-sidebar"
+                        | "code-review"
+                        | "toggle-preview"
+                        | "command-palette"
+                        | "hotkeys"
+                        | "settings"
+                ) || action.starts_with("workspace-")
+                {
+                    let _ = app.emit("menu-action", serde_json::json!({ "action": action }));
                 }
             });
             Ok(())
@@ -68,6 +136,10 @@ pub fn run() {
             sessions::search_sessions,
             sessions::analytics_overview,
             config::read_pi_config,
+            config::read_project_settings,
+            config::write_project_settings,
+            config::read_project_pi_config,
+            config::write_project_pi_config,
             config::read_session_flags,
             config::write_session_flags,
             config::write_pi_config,
@@ -78,19 +150,24 @@ pub fn run() {
             config::migrate_permission_configs,
             config::list_skills,
             pi_cli::pi_cli_run,
+            pi_cli::check_pi_update,
             pi_cli::probe_url,
             packages::search_pi_packages,
             packages::pi_packages_meta,
+            packages::pi_package_details,
+            perf::perf_ready,
             preview::preview_configs,
             preview::preview_save_config,
             preview::preview_start,
             preview::preview_stop,
+            preview::preview_touch,
             gitops::git_is_repo,
             gitops::list_workspace_files,
             gitops::git_status,
             gitops::git_checkpoint,
             gitops::git_review_diff,
             gitops::git_checkout_file,
+            gitops::git_restore_run_files,
             gitops::git_summary,
             gitops::git_open_pr,
             gitops::git_branches,
@@ -112,8 +189,13 @@ pub fn run() {
             editor::reveal_in_finder,
             editor::read_file_base64,
             app_update::check_app_update,
+            avatars::read_avatar_data,
             app_update::app_update_run,
+            app_update::app_update_install_release,
             app_update::relaunch_app,
+            themes::list_pi_themes,
+            themes::save_pi_theme,
+            themes::export_pi_theme_package,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -124,6 +206,8 @@ pub fn run() {
                 let sup = app_handle.state::<supervisor::Supervisor<tauri::Wry>>();
                 tauri::async_runtime::block_on(supervisor::kill_all_agents(&sup));
                 preview::stop_all_servers();
+                pi_cli::stop_all_runs();
+                app_update::stop_all_runs();
             }
         });
 }

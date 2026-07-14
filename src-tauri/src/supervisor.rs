@@ -17,6 +17,7 @@ use crate::jsonl::LineFramer;
 /// path or install can be picked up without restarting the app).
 static PI_PATH: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
 static LOGIN_PATH: OnceLock<Option<String>> = OnceLock::new();
+static APP_STARTED: OnceLock<std::time::Instant> = OnceLock::new();
 
 /// GUI apps launched from Finder inherit a bare PATH (/usr/bin:/bin) with no
 /// Homebrew/nvm entries — so `pi` (a Node script) can't find `node` and dies
@@ -111,7 +112,12 @@ fn resolve_pi_uncached() -> Option<String> {
         }
     }
     if let Some(home) = dirs::home_dir() {
-        for rel in [".local/bin/pi", ".pi/bin/pi", ".bun/bin/pi", ".npm-global/bin/pi"] {
+        for rel in [
+            ".local/bin/pi",
+            ".pi/bin/pi",
+            ".bun/bin/pi",
+            ".npm-global/bin/pi",
+        ] {
             let p = home.join(rel);
             if p.exists() {
                 return Some(p.to_string_lossy().into_owned());
@@ -145,7 +151,12 @@ pub async fn resolve_pi() -> Result<PiInfo, String> {
     let path = find_pi_binary();
     let mut version = None;
     if let Some(ref p) = path {
-        if let Ok(out) = Command::new(p).arg("--version").env("PATH", child_path()).output().await {
+        if let Ok(out) = Command::new(p)
+            .arg("--version")
+            .env("PATH", child_path())
+            .output()
+            .await
+        {
             if out.status.success() {
                 version = Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
             }
@@ -200,6 +211,7 @@ struct Agent {
     child: Arc<Mutex<Child>>,
     streaming: Arc<AtomicBool>,
     last_activity: Arc<AtomicI64>,
+    started_at_ms: i64,
 }
 
 pub struct Supervisor<R: Runtime> {
@@ -361,10 +373,16 @@ pub async fn spawn_agent_impl<R: Runtime>(
     sup: &Supervisor<R>,
     opts: SpawnOpts,
 ) -> Result<String, String> {
-    let pi = find_pi_binary().ok_or("pi binary not found — install pi first (brew install pi or see pi.dev)")?;
+    let pi = find_pi_binary()
+        .ok_or("pi binary not found — install pi first (brew install pi or see pi.dev)")?;
 
     // Enforce the process limit: evict the longest-idle non-streaming agent if needed.
-    let limit = load_app_config().process_limit.max(1) as usize;
+    let app_config = load_app_config();
+    let limit = if app_config.process_limit_auto && crate::config::local_provider_configured() {
+        1
+    } else {
+        app_config.process_limit.max(1) as usize
+    };
     loop {
         let (count, oldest_idle) = {
             let map = sup.agents.lock().await;
@@ -421,7 +439,9 @@ pub async fn spawn_agent_impl<R: Runtime>(
             Ok(())
         });
     }
-    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn pi: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn pi: {e}"))?;
 
     let stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
@@ -441,6 +461,7 @@ pub async fn spawn_agent_impl<R: Runtime>(
         child: Arc::new(Mutex::new(child)),
         streaming: Arc::new(AtomicBool::new(false)),
         last_activity: Arc::new(AtomicI64::new(now_ms())),
+        started_at_ms: now_ms(),
     };
 
     // stdout reader: strict JSONL framing, event fan-out to the WebView.
@@ -463,8 +484,12 @@ pub async fn spawn_agent_impl<R: Runtime>(
                             match serde_json::from_str::<serde_json::Value>(&line) {
                                 Ok(event) => {
                                     match event.get("type").and_then(|t| t.as_str()) {
-                                        Some("agent_start") => streaming.store(true, Ordering::Relaxed),
-                                        Some("agent_end") => streaming.store(false, Ordering::Relaxed),
+                                        Some("agent_start") => {
+                                            streaming.store(true, Ordering::Relaxed)
+                                        }
+                                        Some("agent_end") => {
+                                            streaming.store(false, Ordering::Relaxed)
+                                        }
                                         // Sniff the session path from get_state responses.
                                         Some("response")
                                             if event.get("command").and_then(|c| c.as_str())
@@ -482,7 +507,10 @@ pub async fn spawn_agent_impl<R: Runtime>(
                                     }
                                     let _ = app.emit(
                                         "agent-event",
-                                        AgentEventPayload { agent_id: id.clone(), event },
+                                        AgentEventPayload {
+                                            agent_id: id.clone(),
+                                            event,
+                                        },
                                     );
                                 }
                                 Err(_) => {
@@ -490,7 +518,10 @@ pub async fn spawn_agent_impl<R: Runtime>(
                                         "agent-stderr",
                                         AgentStderrPayload {
                                             agent_id: id.clone(),
-                                            line: format!("[unparseable] {}", &line[..line.len().min(500)]),
+                                            line: format!(
+                                                "[unparseable] {}",
+                                                &line[..line.len().min(500)]
+                                            ),
                                         },
                                     );
                                 }
@@ -511,7 +542,13 @@ pub async fn spawn_agent_impl<R: Runtime>(
             while let Ok(Some(line)) = lines.next_line().await {
                 let mut l = line;
                 l.truncate(4000);
-                let _ = app.emit("agent-stderr", AgentStderrPayload { agent_id: id.clone(), line: l });
+                let _ = app.emit(
+                    "agent-stderr",
+                    AgentStderrPayload {
+                        agent_id: id.clone(),
+                        line: l,
+                    },
+                );
             }
         });
     }
@@ -555,11 +592,19 @@ pub async fn spawn_agent_impl<R: Runtime>(
 }
 
 #[tauri::command]
-pub async fn agent_send(sup: State<'_, Supervisor<tauri::Wry>>, agent_id: String, line: String) -> Result<(), String> {
+pub async fn agent_send(
+    sup: State<'_, Supervisor<tauri::Wry>>,
+    agent_id: String,
+    line: String,
+) -> Result<(), String> {
     agent_send_impl(&sup, agent_id, line).await
 }
 
-pub async fn agent_send_impl<R: Runtime>(sup: &Supervisor<R>, agent_id: String, line: String) -> Result<(), String> {
+pub async fn agent_send_impl<R: Runtime>(
+    sup: &Supervisor<R>,
+    agent_id: String,
+    line: String,
+) -> Result<(), String> {
     let (stdin, last_activity) = {
         let map = sup.agents.lock().await;
         let agent = map.get(&agent_id).ok_or("agent not found")?;
@@ -569,7 +614,9 @@ pub async fn agent_send_impl<R: Runtime>(sup: &Supervisor<R>, agent_id: String, 
         return Err("RPC command must be a single JSONL line".into());
     }
     let mut w = stdin.lock().await;
-    w.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+    w.write_all(line.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
     w.write_all(b"\n").await.map_err(|e| e.to_string())?;
     w.flush().await.map_err(|e| e.to_string())?;
     last_activity.store(now_ms(), Ordering::Relaxed);
@@ -577,11 +624,19 @@ pub async fn agent_send_impl<R: Runtime>(sup: &Supervisor<R>, agent_id: String, 
 }
 
 #[tauri::command]
-pub async fn kill_agent(app: AppHandle, sup: State<'_, Supervisor<tauri::Wry>>, agent_id: String) -> Result<(), String> {
+pub async fn kill_agent(
+    app: AppHandle,
+    sup: State<'_, Supervisor<tauri::Wry>>,
+    agent_id: String,
+) -> Result<(), String> {
     kill_agent_impl(app, &sup, agent_id).await
 }
 
-pub async fn kill_agent_impl<R: Runtime>(app: AppHandle<R>, sup: &Supervisor<R>, agent_id: String) -> Result<(), String> {
+pub async fn kill_agent_impl<R: Runtime>(
+    app: AppHandle<R>,
+    sup: &Supervisor<R>,
+    agent_id: String,
+) -> Result<(), String> {
     kill_by_id(&sup.agents, &app, &agent_id, "killed").await;
     Ok(())
 }
@@ -626,6 +681,8 @@ pub struct ProcStat {
     pub rss_mb: f64,
     /// Сколько процессов в группе (pi + его MCP-дети и т.д.)
     pub procs: u32,
+    /// Время жизни процесса/группы с момента запуска.
+    pub uptime_ms: u64,
 }
 
 /// Разбор вывода `ps -axo pid=,pgid=,rss=` (rss в КБ).
@@ -638,7 +695,9 @@ fn parse_ps(text: &str) -> (HashMap<u32, (u64, u32)>, HashMap<u32, u64>) {
         let (Some(pid), Some(pgid), Some(rss)) = (it.next(), it.next(), it.next()) else {
             continue;
         };
-        let (Ok(pid), Ok(pgid), Ok(rss)) = (pid.parse::<u32>(), pgid.parse::<u32>(), rss.parse::<u64>()) else {
+        let (Ok(pid), Ok(pgid), Ok(rss)) =
+            (pid.parse::<u32>(), pgid.parse::<u32>(), rss.parse::<u64>())
+        else {
             continue;
         };
         let e = by_group.entry(pgid).or_insert((0, 0));
@@ -650,7 +709,9 @@ fn parse_ps(text: &str) -> (HashMap<u32, (u64, u32)>, HashMap<u32, u64>) {
 }
 
 fn ps_snapshot() -> (HashMap<u32, (u64, u32)>, HashMap<u32, u64>) {
-    let out = std::process::Command::new("ps").args(["-axo", "pid=,pgid=,rss="]).output();
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "pid=,pgid=,rss="])
+        .output();
     match out {
         Ok(o) => parse_ps(&String::from_utf8_lossy(&o.stdout)),
         Err(_) => (HashMap::new(), HashMap::new()),
@@ -662,7 +723,9 @@ const KB_IN_MB: f64 = 1024.0;
 /// Снимок памяти: агенты pi (вся process group — включая MCP-детей),
 /// dev-серверы превью (группа) и собственный процесс приложения.
 #[tauri::command]
-pub async fn process_stats(sup: State<'_, Supervisor<tauri::Wry>>) -> Result<Vec<ProcStat>, String> {
+pub async fn process_stats(
+    sup: State<'_, Supervisor<tauri::Wry>>,
+) -> Result<Vec<ProcStat>, String> {
     process_stats_impl(&sup).await
 }
 
@@ -674,7 +737,10 @@ pub async fn process_stats_impl<R: Runtime>(sup: &Supervisor<R>) -> Result<Vec<P
         let map = sup.agents.lock().await;
         for (id, a) in map.iter() {
             let pid = a.child.lock().await.id();
-            let (kb, n) = pid.and_then(|p| by_group.get(&p)).copied().unwrap_or((0, 0));
+            let (kb, n) = pid
+                .and_then(|p| by_group.get(&p))
+                .copied()
+                .unwrap_or((0, 0));
             out.push(ProcStat {
                 kind: "agent".into(),
                 id: id.clone(),
@@ -682,12 +748,16 @@ pub async fn process_stats_impl<R: Runtime>(sup: &Supervisor<R>) -> Result<Vec<P
                 pid,
                 rss_mb: kb as f64 / KB_IN_MB,
                 procs: n,
+                uptime_ms: now_ms().saturating_sub(a.started_at_ms) as u64,
             });
         }
     }
 
-    for (id, label, pid) in crate::preview::server_list() {
-        let (kb, n) = pid.and_then(|p| by_group.get(&p)).copied().unwrap_or((0, 0));
+    for (id, label, pid, started_at_ms) in crate::preview::server_list() {
+        let (kb, n) = pid
+            .and_then(|p| by_group.get(&p))
+            .copied()
+            .unwrap_or((0, 0));
         out.push(ProcStat {
             kind: "preview".into(),
             id,
@@ -695,6 +765,7 @@ pub async fn process_stats_impl<R: Runtime>(sup: &Supervisor<R>) -> Result<Vec<P
             pid,
             rss_mb: kb as f64 / KB_IN_MB,
             procs: n,
+            uptime_ms: now_ms().saturating_sub(started_at_ms) as u64,
         });
     }
 
@@ -708,6 +779,10 @@ pub async fn process_stats_impl<R: Runtime>(sup: &Supervisor<R>) -> Result<Vec<P
         pid: Some(own),
         rss_mb: own_kb as f64 / KB_IN_MB,
         procs: 1,
+        uptime_ms: APP_STARTED
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64,
     });
 
     Ok(out)
@@ -715,16 +790,47 @@ pub async fn process_stats_impl<R: Runtime>(sup: &Supervisor<R>) -> Result<Vec<P
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ps;
+    use super::{kill_group, parse_ps};
+    use std::process::Stdio;
+    use std::sync::Arc;
+    use tokio::process::Command;
+    use tokio::sync::Mutex;
 
     #[test]
     fn parse_ps_sums_groups_and_pids() {
-        let text = "  101  100  2048\n  100  100  1024\n  200  200  512\nмусор строка\n  300  300  abc\n";
+        let text =
+            "  101  100  2048\n  100  100  1024\n  200  200  512\nмусор строка\n  300  300  abc\n";
         let (groups, pids) = parse_ps(text);
         assert_eq!(groups.get(&100), Some(&(3072, 2)));
         assert_eq!(groups.get(&200), Some(&(512, 1)));
         assert_eq!(groups.get(&300), None, "нечисловой rss пропущен");
         assert_eq!(pids.get(&101), Some(&2048));
         assert_eq!(pids.get(&100), Some(&1024));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_group_removes_leader_and_child() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30 & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn process group");
+        let pid = child.id().expect("leader pid");
+        let child = Arc::new(Mutex::new(child));
+        kill_group(&child).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Signal 0 succeeds while any process in the group still exists.
+        let alive = unsafe { libc::kill(-(pid as i32), 0) } == 0;
+        assert!(!alive, "process group {pid} survived kill_group");
     }
 }

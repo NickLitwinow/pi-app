@@ -43,6 +43,7 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
   const [logs, setLogs] = useState<string[]>([]);
   const [showLogs, setShowLogs] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
   // зеркалим serverId в ref, чтобы гасить процесс из cleanup/при смене проекта
   const serverRef = useRef<string | null>(null);
 
@@ -90,13 +91,14 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
         if (server && p.serverId !== server.serverId) return;
         if (p.done) {
           setLogs((l) => [...l, `— сервер остановлен (код ${String(p.code ?? "?")})`]);
+          if (serverRef.current === p.serverId) applyServer(null);
         } else if (p.line) {
           setLogs((l) => [...l.slice(-300), String(p.line)]);
         }
       });
     })();
     return () => un?.();
-  }, [server]);
+  }, [server, applyServer]);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -147,6 +149,25 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
     applyServer(null);
   }, [killServer, applyServer]);
 
+  const touchServer = useCallback(() => {
+    const id = serverRef.current;
+    if (!id) return;
+    void getBackend().then((be) => be.invoke("preview_touch", { serverId: id })).catch(() => {});
+  }, []);
+
+  // События внутри cross-origin iframe не всплывают в React-дерево. Пока
+  // iframe в фокусе, отправляем редкий heartbeat, иначе активный просмотр мог
+  // бы ошибочно считаться бездействием.
+  useEffect(() => {
+    if (!server) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible" && document.activeElement === iframeRef.current) {
+        touchServer();
+      }
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, [server, touchServer]);
+
   const reload = () => setIframeKey((k) => k + 1);
   const go = () => {
     setUrl(address);
@@ -160,7 +181,7 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="preview-pane">
+    <div className="preview-pane" onPointerDown={touchServer} onKeyDown={touchServer}>
       <div className="pv-header">
         <PreviewIcon size={14} />
         <span className="pv-title">Превью</span>
@@ -240,7 +261,16 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
 
       <div className="pv-stage">
         {url ? (
-          <iframe key={iframeKey} className="pv-frame" src={url} title="preview" style={{ width: DEVICE_WIDTH[device], maxWidth: "100%" }} />
+          <iframe
+            ref={iframeRef}
+            key={iframeKey}
+            className="pv-frame"
+            src={url}
+            title="preview"
+            style={{ width: DEVICE_WIDTH[device], maxWidth: "100%" }}
+            onPointerEnter={touchServer}
+            onLoad={touchServer}
+          />
         ) : (
           <div className="empty" style={{ height: "100%" }}>
             <div className="e-icon">

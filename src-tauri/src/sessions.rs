@@ -12,7 +12,10 @@ pub fn agent_dir() -> PathBuf {
             return PathBuf::from(dir);
         }
     }
-    dirs::home_dir().unwrap_or_default().join(".pi").join("agent")
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".pi")
+        .join("agent")
 }
 
 pub fn sessions_root() -> PathBuf {
@@ -25,7 +28,13 @@ pub fn project_dir_name_for_cwd(cwd: &str) -> String {
     let stripped = cwd.trim_start_matches(['/', '\\']);
     let safe: String = stripped
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c == ':' { '-' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c == ':' {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
     format!("--{safe}--")
 }
@@ -97,7 +106,12 @@ pub fn list_projects_in(root: &Path) -> Vec<ProjectInfo> {
         }
         let cwd = newest_file
             .and_then(|p| read_header_cwd(&p))
-            .unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
+            .unwrap_or_else(|| {
+                dir.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
         let name = Path::new(&cwd)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -174,7 +188,8 @@ pub fn parse_session_meta_cached(path: &Path) -> Option<SessionMeta> {
         let map = cache.get_or_insert_with(HashMap::new);
         // держим кэш в рамках: при переполнении выбрасываем самые старые файлы
         if map.len() > 2048 {
-            let mut entries: Vec<(String, i64)> = map.iter().map(|(k, (m, _, _))| (k.clone(), *m)).collect();
+            let mut entries: Vec<(String, i64)> =
+                map.iter().map(|(k, (m, _, _))| (k.clone(), *m)).collect();
             entries.sort_by_key(|(_, m)| *m);
             for (k, _) in entries.into_iter().take(map.len() / 2) {
                 map.remove(&k);
@@ -211,16 +226,33 @@ pub fn parse_session_meta(path: &Path) -> Option<SessionMeta> {
         };
         match v.get("type").and_then(|t| t.as_str()) {
             Some("session") => {
-                meta.id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                meta.cwd = v.get("cwd").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                meta.created_at = v.get("timestamp").and_then(|x| x.as_str()).map(|s| s.to_string());
+                meta.id = v
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                meta.cwd = v
+                    .get("cwd")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                meta.created_at = v
+                    .get("timestamp")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
             }
             Some("session_info") => {
-                meta.name = v.get("name").and_then(|x| x.as_str()).map(|s| s.to_string());
+                meta.name = v
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
             }
             Some("message") => {
                 meta.message_count += 1;
-                let role = v.pointer("/message/role").and_then(|r| r.as_str()).unwrap_or("");
+                let role = v
+                    .pointer("/message/role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("");
                 if role == "user" && meta.user_snippet.is_none() {
                     if let Some(text) = first_text(v.pointer("/message/content")) {
                         let mut s: String = text.chars().take(160).collect();
@@ -230,7 +262,10 @@ pub fn parse_session_meta(path: &Path) -> Option<SessionMeta> {
                 }
                 if role == "assistant" {
                     if let Some(u) = v.pointer("/message/usage") {
-                        meta.cost_total += u.pointer("/cost/total").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                        meta.cost_total += u
+                            .pointer("/cost/total")
+                            .and_then(|x| x.as_f64())
+                            .unwrap_or(0.0);
                         meta.tokens_in += u.get("input").and_then(|x| x.as_u64()).unwrap_or(0);
                         meta.tokens_out += u.get("output").and_then(|x| x.as_u64()).unwrap_or(0);
                     }
@@ -250,7 +285,9 @@ fn first_text(content: Option<&Value>) -> Option<String> {
         Value::String(s) => Some(s.clone()),
         Value::Array(arr) => arr.iter().find_map(|b| {
             if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                b.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
             } else {
                 None
             }
@@ -359,11 +396,15 @@ pub fn fork_session(path: String, up_to_entry_id: Option<String>) -> Result<Sess
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(mut v) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(mut v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if i == 0 {
             // header: новая идентичность сессии
             v["id"] = Value::String(new_id.clone());
-            v["timestamp"] = Value::String(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+            v["timestamp"] = Value::String(
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            );
             out_lines.push(v.to_string());
             continue;
         }
@@ -373,7 +414,10 @@ pub fn fork_session(path: String, up_to_entry_id: Option<String>) -> Result<Sess
             }
         }
         if v.get("type").and_then(|t| t.as_str()) == Some("session_info") {
-            orig_name = v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+            orig_name = v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string());
         }
         if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
             last_entry_id = Some(id.to_string());
@@ -437,7 +481,10 @@ pub fn rename_session(path: String, name: String) -> Result<(), String> {
         "name": name,
     });
 
-    let mut file = fs::OpenOptions::new().append(true).open(p).map_err(|e| e.to_string())?;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(p)
+        .map_err(|e| e.to_string())?;
     let needs_newline = !content.is_empty() && !content.ends_with('\n');
     let line = format!("{}{}\n", if needs_newline { "\n" } else { "" }, entry);
     file.write_all(line.as_bytes()).map_err(|e| e.to_string())
@@ -463,7 +510,9 @@ pub fn read_session_thread_entries(path: &Path) -> Result<Vec<Value>, String> {
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         match v.get("id").and_then(|i| i.as_str()) {
             Some(id) => {
                 let id = id.to_string();
@@ -540,13 +589,17 @@ pub fn search_sessions_in(root: &Path, query: &str, limit: usize) -> Vec<SearchH
         if !dir.is_dir() {
             continue;
         }
-        let Ok(files) = fs::read_dir(&dir) else { continue };
+        let Ok(files) = fs::read_dir(&dir) else {
+            continue;
+        };
         for f in files.flatten() {
             let p = f.path();
             if !p.extension().map(|e| e == "jsonl").unwrap_or(false) {
                 continue;
             }
-            let Ok(file) = fs::File::open(&p) else { continue };
+            let Ok(file) = fs::File::open(&p) else {
+                continue;
+            };
             let reader = BufReader::new(file);
             let mut cwd = String::new();
             for line in reader.lines() {
@@ -554,7 +607,11 @@ pub fn search_sessions_in(root: &Path, query: &str, limit: usize) -> Vec<SearchH
                 if cwd.is_empty() {
                     if let Ok(v) = serde_json::from_str::<Value>(&line) {
                         if v.get("type").and_then(|t| t.as_str()) == Some("session") {
-                            cwd = v.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                            cwd = v
+                                .get("cwd")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             continue;
                         }
                     }
@@ -562,30 +619,49 @@ pub fn search_sessions_in(root: &Path, query: &str, limit: usize) -> Vec<SearchH
                 if !line.to_lowercase().contains(&q) {
                     continue;
                 }
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
                 if v.get("type").and_then(|t| t.as_str()) != Some("message") {
                     continue;
                 }
-                let role = v.pointer("/message/role").and_then(|r| r.as_str()).unwrap_or("");
+                let role = v
+                    .pointer("/message/role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("");
                 if role != "user" && role != "assistant" {
                     continue;
                 }
-                let Some(text) = collect_text(v.pointer("/message/content")) else { continue };
+                let Some(text) = collect_text(v.pointer("/message/content")) else {
+                    continue;
+                };
                 let lower = text.to_lowercase();
                 let Some(idx) = lower.find(&q) else { continue };
-                let start = text[..idx].char_indices().rev().nth(60).map(|(i, _)| i).unwrap_or(0);
+                let start = text[..idx]
+                    .char_indices()
+                    .rev()
+                    .nth(60)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
                 let end_byte = (idx + q.len() + 100).min(text.len());
                 let end = if text.is_char_boundary(end_byte) {
                     end_byte
                 } else {
-                    text[..end_byte].char_indices().last().map(|(i, _)| i).unwrap_or(end_byte)
+                    text[..end_byte]
+                        .char_indices()
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(end_byte)
                 };
                 let snippet = text[start..end].replace('\n', " ");
                 hits.push(SearchHit {
                     path: p.to_string_lossy().into_owned(),
                     cwd: cwd.clone(),
                     entry_id: v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()),
-                    timestamp: v.get("timestamp").and_then(|t| t.as_str()).map(|s| s.to_string()),
+                    timestamp: v
+                        .get("timestamp")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string()),
                     role: role.to_string(),
                     snippet,
                 });
@@ -606,7 +682,9 @@ fn collect_text(content: Option<&Value>) -> Option<String> {
                 .iter()
                 .filter_map(|b| {
                     if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        b.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
                     } else {
                         None
                     }
@@ -698,22 +776,35 @@ fn analyze_session_file(p: &Path) -> FileAgg {
     // (cost, messages, input, output)
     let mut per_day: BTreeMap<String, (f64, usize, u64, u64)> = BTreeMap::new();
     let mut per_model: BTreeMap<String, (f64, u64, u64, usize)> = BTreeMap::new();
-    let Ok(file) = fs::File::open(p) else { return agg };
+    let Ok(file) = fs::File::open(p) else {
+        return agg;
+    };
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { break };
         // cheap pre-filter: only message entries matter
         if !line.contains("\"message\"") {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         if v.get("type").and_then(|t| t.as_str()) != Some("message") {
             continue;
         }
         agg.messages += 1;
-        let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or_default();
+        let ts = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default();
         let day: String = ts.chars().take(10).collect();
         // час суток из ISO-таймстампа: "YYYY-MM-DDTHH:..." → байты 11..13
-        if let Ok(hour) = ts.chars().skip(11).take(2).collect::<String>().parse::<usize>() {
+        if let Ok(hour) = ts
+            .chars()
+            .skip(11)
+            .take(2)
+            .collect::<String>()
+            .parse::<usize>()
+        {
             if hour < 24 {
                 agg.per_hour[hour] += 1;
             }
@@ -721,18 +812,37 @@ fn analyze_session_file(p: &Path) -> FileAgg {
         let e = per_day.entry(day).or_insert((0.0, 0, 0, 0));
         e.1 += 1;
         if v.pointer("/message/role").and_then(|r| r.as_str()) == Some("assistant") {
-            let cost = v.pointer("/message/usage/cost/total").and_then(|x| x.as_f64()).unwrap_or(0.0);
-            let input = v.pointer("/message/usage/input").and_then(|x| x.as_u64()).unwrap_or(0);
-            let output = v.pointer("/message/usage/output").and_then(|x| x.as_u64()).unwrap_or(0);
+            let cost = v
+                .pointer("/message/usage/cost/total")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
+            let input = v
+                .pointer("/message/usage/input")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            let output = v
+                .pointer("/message/usage/output")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
             agg.cost += cost;
             agg.input += input;
             agg.output += output;
-            agg.cache_read += v.pointer("/message/usage/cacheRead").and_then(|x| x.as_u64()).unwrap_or(0);
-            agg.cache_write += v.pointer("/message/usage/cacheWrite").and_then(|x| x.as_u64()).unwrap_or(0);
+            agg.cache_read += v
+                .pointer("/message/usage/cacheRead")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            agg.cache_write += v
+                .pointer("/message/usage/cacheWrite")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
             e.0 += cost;
             e.2 += input;
             e.3 += output;
-            let model = v.pointer("/message/model").and_then(|m| m.as_str()).unwrap_or("unknown").to_string();
+            let model = v
+                .pointer("/message/model")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown")
+                .to_string();
             let m = per_model.entry(model).or_insert((0.0, 0, 0, 0));
             m.0 += cost;
             m.1 += input;
@@ -740,8 +850,14 @@ fn analyze_session_file(p: &Path) -> FileAgg {
             m.3 += 1;
         }
     }
-    agg.per_day = per_day.into_iter().map(|(d, (c, n, i, o))| (d, c, n, i, o)).collect();
-    agg.per_model = per_model.into_iter().map(|(m, (c, i, o, n))| (m, c, i, o, n)).collect();
+    agg.per_day = per_day
+        .into_iter()
+        .map(|(d, (c, n, i, o))| (d, c, n, i, o))
+        .collect();
+    agg.per_model = per_model
+        .into_iter()
+        .map(|(m, (c, i, o, n))| (m, c, i, o, n))
+        .collect();
     agg
 }
 
@@ -763,7 +879,8 @@ fn analyze_session_file_cached(p: &Path) -> FileAgg {
         let map = cache.get_or_insert_with(HashMap::new);
         // ограничиваем рост кэша: при переполнении выбрасываем половину старых по mtime
         if map.len() > 4096 {
-            let mut entries: Vec<(String, i64)> = map.iter().map(|(k, (m, _, _))| (k.clone(), *m)).collect();
+            let mut entries: Vec<(String, i64)> =
+                map.iter().map(|(k, (m, _, _))| (k.clone(), *m)).collect();
             entries.sort_by_key(|(_, m)| *m);
             for (k, _) in entries.into_iter().take(map.len() / 2) {
                 map.remove(&k);
@@ -787,7 +904,9 @@ pub fn analytics_in(root: &Path) -> AnalyticsOverview {
             if !dir.is_dir() {
                 continue;
             }
-            let Ok(files) = fs::read_dir(&dir) else { continue };
+            let Ok(files) = fs::read_dir(&dir) else {
+                continue;
+            };
             for f in files.flatten() {
                 let p = f.path();
                 if !p.extension().map(|e| e == "jsonl").unwrap_or(false) {
@@ -829,22 +948,35 @@ pub fn analytics_in(root: &Path) -> AnalyticsOverview {
 
     let per_day = per_day
         .into_iter()
-        .map(|(date, (cost, messages, input, output, sessions))| DayStat {
-            date,
-            cost,
-            messages,
-            input,
-            output,
-            sessions,
-        })
+        .map(
+            |(date, (cost, messages, input, output, sessions))| DayStat {
+                date,
+                cost,
+                messages,
+                input,
+                output,
+                sessions,
+            },
+        )
         .collect();
     let mut per_model: Vec<ModelStat> = per_model
         .into_iter()
-        .map(|(model, (cost, input, output, messages))| ModelStat { model, cost, input, output, messages })
+        .map(|(model, (cost, input, output, messages))| ModelStat {
+            model,
+            cost,
+            input,
+            output,
+            messages,
+        })
         .collect();
     per_model.sort_by_key(|m| std::cmp::Reverse(m.messages));
 
-    AnalyticsOverview { totals, per_day, per_model, per_hour: per_hour.to_vec() }
+    AnalyticsOverview {
+        totals,
+        per_day,
+        per_model,
+        per_hour: per_hour.to_vec(),
+    }
 }
 
 #[tauri::command]
@@ -949,7 +1081,11 @@ mod session_ops_tests {
         assert_ne!(meta.id, "orig01");
         assert_eq!(meta.message_count, 3);
         assert_eq!(meta.name.as_deref(), Some("Форк: Orig"));
-        assert!(meta.id.len() == 36 && meta.id.chars().nth(14) == Some('7'), "uuid v7-style: {}", meta.id);
+        assert!(
+            meta.id.len() == 36 && meta.id.chars().nth(14) == Some('7'),
+            "uuid v7-style: {}",
+            meta.id
+        );
 
         // частичный форк: всё строго до e3 (второго сообщения пользователя)
         let meta2 = fork_session(file.to_string_lossy().into_owned(), Some("e3".into())).unwrap();
@@ -983,7 +1119,10 @@ mod session_ops_tests {
 
         let thread = read_session_thread_entries(&file).unwrap();
         // активная ветка = h, u1, a1, u2 (u2b — заброшенный форк, исключён)
-        let ids: Vec<&str> = thread.iter().filter_map(|v| v.get("id").and_then(|i| i.as_str())).collect();
+        let ids: Vec<&str> = thread
+            .iter()
+            .filter_map(|v| v.get("id").and_then(|i| i.as_str()))
+            .collect();
         assert_eq!(ids, vec!["h", "u1", "a1", "u2"]);
         let joined = thread.iter().map(|v| v.to_string()).collect::<String>();
         assert!(joined.contains("active-second"));

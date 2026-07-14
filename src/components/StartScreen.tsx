@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Sparkles } from "lucide-react";
 import { getBackend } from "../lib/backend";
+import { modelIdDisplayName } from "../lib/models";
 import type { AnalyticsOverview, DayStat } from "../lib/types";
 import { useStore } from "../state/store";
 
@@ -107,6 +108,7 @@ function Stat({ label, value }: { label: string; value: string }) {
 }
 
 export default function StartScreen() {
+  const modelAliases = useStore((s) => s.appConfig.modelAliases ?? {});
   const displayName = useStore((s) => s.appConfig.displayName);
   const [data, setData] = useState<AnalyticsOverview | null>(null);
   const [range, setRange] = useState<Range>("all");
@@ -139,9 +141,9 @@ export default function StartScreen() {
       current,
       longest,
       peak: peakHourLabel(data.perHour),
-      favorite: data.perModel[0]?.model ? shortModel(data.perModel[0].model) : "—",
+      favorite: data.perModel[0]?.model ? shortModel(modelIdDisplayName(data.perModel[0].model, modelAliases)) : "—",
     };
-  }, [data, range]);
+  }, [data, range, modelAliases]);
 
   const greeting = displayName ? `Чем займёмся, ${displayName}?` : "Чем займёмся дальше?";
 
@@ -203,7 +205,9 @@ export default function StartScreen() {
             <tbody>
               {data.perModel.map((m) => (
                 <tr key={m.model}>
-                  <td style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{m.model}</td>
+                  <td title={m.model} style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>
+                    {modelIdDisplayName(m.model, modelAliases)}
+                  </td>
                   <td>{fmt(m.messages)}</td>
                   <td>{fmt(m.input)}</td>
                   <td>{fmt(m.output)}</td>

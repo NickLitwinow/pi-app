@@ -7,3 +7,5 @@ src-tauri/gen/
 # локальное состояние pi этого проекта (permission-режим и т.п.)
 .pi/
 bench/results/
+test-results/
+playwright-report/

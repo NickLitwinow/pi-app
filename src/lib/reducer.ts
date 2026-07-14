@@ -1,6 +1,8 @@
-import { emptyChatState, type ChatMessage, type ChatState, type ExtUiRequest, type ToolExec } from "./types";
+import { workedDurationMs } from "./turn-timing";
+import { emptyChatState, type ChatMessage, type ChatState, type ExtUiRequest, type RunMeta, type ToolExec } from "./types";
 
 let keyCounter = 0;
+let runCounter = 0;
 function nextKey(): string {
   return `k${++keyCounter}`;
 }
@@ -178,22 +180,60 @@ export function applyAgentEvent(chat: ChatState, ev: Record<string, unknown>): C
     case "agent_start": {
       chat.isStreaming = true;
       chat.streamStartedAt = Date.now();
+      chat.activeRunId = `run-${Date.now().toString(36)}-${(++runCounter).toString(36)}`;
+      chat.activeRunToolIds = [];
       chat.lastError = null;
       break;
     }
     case "agent_end": {
+      const durationMs = chat.streamStartedAt ? Math.max(0, Date.now() - chat.streamStartedAt) : 0;
+      // Ход = ровно agent_start … agent_end (проверено захватом живого потока pi,
+      // см. __fixtures__/pi-rpc-turn.jsonl): МЕЖДУ шагами хода (LLM-вызов + инструменты)
+      // pi шлёт turn_end/turn_start, а agent_end приходит ОДИН раз в самом конце.
+      // Поэтому здесь ход честно завершается.
       chat.isStreaming = false;
-      chat.streamStartedAt = null;
       // Defensive: a streamed message that never got its message_end.
       if (chat.streaming && contentText(chat.streaming.content)) {
         finalizeMessage(chat, chat.streaming);
       }
       chat.streaming = null;
+      chat.lastRunId = null;
+      if (chat.activeRunId) {
+        for (let index = chat.items.length - 1; index >= 0; index--) {
+          const item = chat.items[index];
+          // ран прерван до первого ответа — не приписывать его ассистенту ПРОШЛОГО хода
+          if (item.msg.role === "user") break;
+          if (item.msg.role !== "assistant") continue;
+          const items = [...chat.items];
+          items[index] = {
+            ...item,
+            msg: {
+              ...item.msg,
+              run: {
+                id: chat.activeRunId,
+                // pi-claude-style-tools пишет точную длительность в метаданные
+                // финального сообщения; наш таймер — запасной вариант
+                durationMs: workedDurationMs(item.msg) ?? durationMs,
+                toolCallIds: [...chat.activeRunToolIds],
+              },
+            },
+          };
+          chat.items = items;
+          chat.lastRunId = chat.activeRunId;
+          break;
+        }
+      }
+      chat.streamStartedAt = null;
+      chat.activeRunId = null;
+      chat.activeRunToolIds = [];
       break;
     }
     case "message_start": {
       const msg = ev.message as ChatMessage | undefined;
       const role = msg?.role;
+      // ВАЖНО: эхо user-сообщения приходит в НАЧАЛЕ хода (сразу после agent_start),
+      // а не в конце — завершать ход по нему нельзя, иначе процесс схлопывается
+      // на третьем событии, ещё до первого ответа модели.
       if (!role || role === "assistant") {
         chat.streaming = msg ?? { role: "assistant", content: [] };
       }
@@ -219,6 +259,7 @@ export function applyAgentEvent(chat: ChatState, ev: Record<string, unknown>): C
     case "tool_execution_start": {
       const callId = asString(ev.toolCallId ?? ev.id ?? "");
       if (callId) {
+        if (!chat.activeRunToolIds.includes(callId)) chat.activeRunToolIds = [...chat.activeRunToolIds, callId];
         upsertExec(chat, callId, {
           name: asString(ev.toolName ?? ev.name ?? ""),
           args: ev.args,
@@ -318,19 +359,75 @@ export function applyAgentEvent(chat: ChatState, ev: Record<string, unknown>): C
   return chat;
 }
 
-/** Convert persisted session entries (JSONL) into timeline items for read-only view. */
+function entryTimestampMs(e: Record<string, unknown>): number | null {
+  const t = e.timestamp;
+  if (typeof t === "number" && Number.isFinite(t)) return t;
+  if (typeof t === "string") {
+    const ms = Date.parse(t);
+    return Number.isNaN(ms) ? null : ms;
+  }
+  return null;
+}
+
+/**
+ * Convert persisted session entries (JSONL) into timeline items for read-only view.
+ *
+ * Run-мета (сводка «Worked for …») живёт только в памяти приложения — pi её не
+ * пишет. Восстанавливаем при загрузке: ход = от user-сообщения до следующего
+ * user; toolCallIds собираем из assistant-блоков, длительность берём из
+ * метаданных pi-claude-style-tools на финальном сообщении, иначе — по разнице
+ * timestamp'ов записей. Так сводки переживают перезапуск приложения.
+ */
 export function entriesToChatState(entries: Record<string, unknown>[]): ChatState {
   const chat = emptyChatState();
+  let runStartMs: number | null = null;
+  let runEndMs: number | null = null;
+  let runWorkedMs: number | null = null;
+  let runToolIds: string[] = [];
+  let runAssistantIndex = -1;
+
+  const finalizeRun = () => {
+    if (runAssistantIndex >= 0 && runToolIds.length > 0) {
+      const item = chat.items[runAssistantIndex];
+      const durationMs =
+        runWorkedMs ??
+        (runStartMs != null && runEndMs != null ? Math.max(0, runEndMs - runStartMs) : 0);
+      const run: RunMeta = { id: `run-file-${runAssistantIndex}`, durationMs, toolCallIds: runToolIds };
+      const items = [...chat.items];
+      items[runAssistantIndex] = { ...item, msg: { ...item.msg, run } };
+      chat.items = items;
+    }
+    runStartMs = null;
+    runEndMs = null;
+    runWorkedMs = null;
+    runToolIds = [];
+    runAssistantIndex = -1;
+  };
+
   for (const e of entries) {
     if (e.type !== "message") continue;
     const msg = e.message as ChatMessage | undefined;
     if (!msg) continue;
     if (msg.role === "toolResult") {
       finalizeMessage(chat, msg);
-    } else if (msg.role === "user" || msg.role === "assistant") {
+      runEndMs = entryTimestampMs(e) ?? runEndMs;
+    } else if (msg.role === "user") {
+      finalizeRun();
       chat.items = [...chat.items, { key: nextKey(), msg }];
+      runStartMs = entryTimestampMs(e);
+    } else if (msg.role === "assistant") {
+      chat.items = [...chat.items, { key: nextKey(), msg }];
+      runAssistantIndex = chat.items.length - 1;
+      runEndMs = entryTimestampMs(e) ?? runEndMs;
+      runWorkedMs = workedDurationMs(msg) ?? runWorkedMs;
+      if (Array.isArray(msg.content)) {
+        for (const b of msg.content) {
+          if (b.type === "toolCall" && typeof b.id === "string") runToolIds = [...runToolIds, b.id];
+        }
+      }
     }
   }
+  finalizeRun();
   return chat;
 }
 

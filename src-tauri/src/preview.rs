@@ -22,16 +22,62 @@ use crate::supervisor::child_path;
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 // serverId → (kill-signal sender, pid лидера группы, label=cwd). Задача-владелец
 // ждёт сигнал; pid нужен для SIGKILL группе при выходе и для процесс-панели.
-static SERVERS: Mutex<Option<HashMap<String, (oneshot::Sender<()>, Option<u32>, String)>>> = Mutex::new(None);
+struct ServerRecord {
+    kill_tx: oneshot::Sender<()>,
+    pid: Option<u32>,
+    label: String,
+    started_at_ms: i64,
+    last_activity_ms: i64,
+}
+
+static SERVERS: Mutex<Option<HashMap<String, ServerRecord>>> = Mutex::new(None);
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn idle_expired(last_activity_ms: i64, current_ms: i64, timeout_secs: u64) -> bool {
+    timeout_secs > 0
+        && current_ms.saturating_sub(last_activity_ms) >= timeout_secs.saturating_mul(1000) as i64
+}
 
 /// Снимок работающих dev-серверов для процесс-панели: (serverId, label, pid).
-pub fn server_list() -> Vec<(String, String, Option<u32>)> {
+pub fn server_list() -> Vec<(String, String, Option<u32>, i64)> {
     SERVERS
         .lock()
         .unwrap()
         .as_ref()
-        .map(|m| m.iter().map(|(id, (_, pid, label))| (id.clone(), label.clone(), *pid)).collect())
+        .map(|m| {
+            m.iter()
+                .map(|(id, record)| {
+                    (
+                        id.clone(),
+                        record.label.clone(),
+                        record.pid,
+                        record.started_at_ms,
+                    )
+                })
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+/// Mark explicit interaction with the preview pane so the idle reaper does not
+/// stop a server the user is actively inspecting.
+#[tauri::command]
+pub fn preview_touch(server_id: String) -> Result<(), String> {
+    if let Some(record) = SERVERS
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|m| m.get_mut(&server_id))
+    {
+        record.last_activity_ms = now_ms();
+    }
+    Ok(())
 }
 
 /// Завершить dev-сервер со всей process group (npm → vite/node): SIGTERM группе,
@@ -54,21 +100,28 @@ async fn kill_child_group(child: &mut tokio::process::Child) {
 /// Аварийная остановка всех dev-серверов при выходе приложения: сигнал задачам
 /// плюс немедленный SIGKILL группам (задачи могут не успеть до завершения процесса).
 pub fn stop_all_servers() {
-    let entries: Vec<(oneshot::Sender<()>, Option<u32>, String)> = SERVERS
+    let entries: Vec<ServerRecord> = SERVERS
         .lock()
         .unwrap()
         .as_mut()
         .map(|m| m.drain().map(|(_, v)| v).collect())
         .unwrap_or_default();
-    for (tx, pid, _label) in entries {
-        let _ = tx.send(());
-        #[cfg(unix)]
-        if let Some(pid) = pid {
+    let pids: Vec<u32> = entries.iter().filter_map(|record| record.pid).collect();
+    for record in entries {
+        let _ = record.kill_tx.send(());
+    }
+    #[cfg(unix)]
+    {
+        for pid in &pids {
+            unsafe { libc::kill(-(*pid as i32), libc::SIGTERM) };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        for pid in pids {
             unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
         }
-        #[cfg(not(unix))]
-        let _ = pid;
     }
+    #[cfg(not(unix))]
+    let _ = pids;
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -96,7 +149,11 @@ pub fn preview_configs(cwd: String) -> Vec<LaunchConfig> {
     };
     v.get("configurations")
         .and_then(|c| c.as_array())
-        .map(|arr| arr.iter().filter_map(|c| serde_json::from_value(c.clone()).ok()).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| serde_json::from_value(c.clone()).ok())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -194,7 +251,12 @@ pub async fn preview_start(
                 line.truncate(4000);
                 let _ = app.emit(
                     "preview-output",
-                    PreviewOutput { server_id: server_id.clone(), line: Some(line), done: false, code: None },
+                    PreviewOutput {
+                        server_id: server_id.clone(),
+                        line: Some(line),
+                        done: false,
+                        code: None,
+                    },
                 );
             }
         });
@@ -206,7 +268,43 @@ pub async fn preview_start(
         .lock()
         .unwrap()
         .get_or_insert_with(HashMap::new)
-        .insert(server_id.clone(), (kill_tx, child_pid, cwd.clone()));
+        .insert(
+            server_id.clone(),
+            ServerRecord {
+                kill_tx,
+                pid: child_pid,
+                label: cwd.clone(),
+                started_at_ms: now_ms(),
+                last_activity_ms: now_ms(),
+            },
+        );
+
+    // Открытая, но забытая панель больше не держит dev-server бесконечно.
+    // 0 отключает reaper; UI по умолчанию выставляет 10 минут.
+    {
+        let server_id = server_id.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let timeout_secs = crate::config::load_app_config().preview_idle_kill_secs;
+                if timeout_secs == 0 {
+                    continue;
+                }
+                let expired = SERVERS.lock().unwrap().as_ref().and_then(|m| {
+                    m.get(&server_id)
+                        .map(|record| idle_expired(record.last_activity_ms, now_ms(), timeout_secs))
+                });
+                match expired {
+                    None => break,
+                    Some(true) => {
+                        let _ = preview_stop(server_id.clone());
+                        break;
+                    }
+                    Some(false) => {}
+                }
+            }
+        });
+    }
 
     {
         let app = app.clone();
@@ -224,20 +322,46 @@ pub async fn preview_start(
             }
             let _ = app.emit(
                 "preview-output",
-                PreviewOutput { server_id, line: None, done: true, code },
+                PreviewOutput {
+                    server_id,
+                    line: None,
+                    done: true,
+                    code,
+                },
             );
         });
     }
 
-    Ok(PreviewHandle { server_id, url: format!("http://localhost:{port}"), port })
+    Ok(PreviewHandle {
+        server_id,
+        url: format!("http://localhost:{port}"),
+        port,
+    })
 }
 
 /// Stop a running dev server started with preview_start.
 #[tauri::command]
 pub fn preview_stop(server_id: String) -> Result<(), String> {
-    let entry = SERVERS.lock().unwrap().as_mut().and_then(|m| m.remove(&server_id));
-    if let Some((tx, _pid, _label)) = entry {
-        let _ = tx.send(());
+    let entry = SERVERS
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|m| m.remove(&server_id));
+    if let Some(record) = entry {
+        let _ = record.kill_tx.send(());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::idle_expired;
+
+    #[test]
+    fn preview_idle_timeout_is_disabled_at_zero_and_saturates() {
+        assert!(!idle_expired(1_000, 99_000, 0));
+        assert!(!idle_expired(1_000, 60_999, 60));
+        assert!(idle_expired(1_000, 61_000, 60));
+        assert!(!idle_expired(10_000, 5_000, 1));
+    }
 }

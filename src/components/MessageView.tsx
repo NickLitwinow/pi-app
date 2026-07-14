@@ -1,33 +1,99 @@
-import { memo, useEffect, useMemo, useState } from "react";
+import { createContext, memo, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { getBackend } from "../lib/backend";
+import { confirmDialog, messageDialog } from "../lib/dialog";
+import { pluralRu } from "../lib/i18n";
 import { stripAnsi } from "../lib/markdown";
+import { modelAliasKey, modelIdDisplayName } from "../lib/models";
 import { contentText } from "../lib/reducer";
-import type { ChatMessage, ContentBlock, ToolExec } from "../lib/types";
+import { parseSequentialThought, type SequentialThought } from "../lib/sequential-thinking";
+import {
+  formatRunDuration,
+  parseTurnTiming,
+  splitTrailingTurnTiming,
+  timingFromWorkedMeta,
+  type TurnTiming,
+} from "../lib/turn-timing";
+import type { AppConfig, ChatMessage, ContentBlock, ModelInfo, RunMeta, ToolExec } from "../lib/types";
+import type { ActivityStep } from "../lib/transcript";
 import { forkFromMessage, msgPinId, notifyChat, rewindToMessage, toggleMessagePin, useStore } from "../state/store";
+import { ModelAvatar } from "./AgentAvatar";
 import {
   CheckIcon,
   ChevronIcon,
   CopyIcon,
   ErrorIcon,
   ExternalIcon,
+  FilesIcon,
   ForkIcon,
   InfoIcon,
   PinIcon,
   PinOffIcon,
   RewindIcon,
+  RevertIcon,
+  ReviewIcon,
   SuccessIcon,
+  TimeIcon,
   WarnIcon,
 } from "./icons";
 import { Markdown } from "./Markdown";
 
+// ---------- expand state shared across virtual scrolling ----------
+
+/**
+ * Лента виртуализирована: Virtuoso размонтирует ушедшие с экрана элементы. Если
+ * держать «раскрыто» в локальном useState, то (1) раскрытая сводка схлопывается
+ * при возврате скроллом и (2) её высота скачет относительно кэша размеров
+ * Virtuoso — лента начинает дёргаться и не даёт долистать до низа. Поэтому
+ * состояние живёт выше списка и переживает размонтирование.
+ */
+const ExpandedCtx = createContext<{ isOpen: (id: string) => boolean; toggle: (id: string) => void } | null>(null);
+
+export function ExpandedProvider({ children }: { children: ReactNode }) {
+  const [openIds, setOpenIds] = useState<ReadonlySet<string>>(() => new Set());
+  const value = useMemo(
+    () => ({
+      isOpen: (id: string) => openIds.has(id),
+      toggle: (id: string) =>
+        setOpenIds((prev) => {
+          const next = new Set(prev);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        }),
+    }),
+    [openIds],
+  );
+  return <ExpandedCtx.Provider value={value}>{children}</ExpandedCtx.Provider>;
+}
+
+/** Раскрытие по стабильному id; без провайдера/id — обычный локальный стейт. */
+function useExpanded(id: string | undefined): [boolean, () => void] {
+  const ctx = useContext(ExpandedCtx);
+  const [local, setLocal] = useState(false);
+  if (!ctx || !id) return [local, () => setLocal((value) => !value)];
+  return [ctx.isOpen(id), () => ctx.toggle(id)];
+}
+
 // ---------- thinking ----------
 
-function ThinkingBlock({ text, streaming }: { text: string; streaming?: boolean }) {
-  const [open, setOpen] = useState(false);
-  const shown = open || streaming;
+function ThinkingBlock({
+  text,
+  streaming,
+  forceOpen,
+  blockId,
+}: {
+  text: string;
+  streaming?: boolean;
+  forceOpen?: boolean;
+  blockId?: string;
+}) {
+  const [open, toggle] = useExpanded(blockId);
+  // forceOpen — идущий ход: рассуждения видны живьём до самого конца хода
+  // (иначе они схлопывались, едва начинал приходить текст), затем уезжают в «Worked for».
+  const shown = open || streaming || forceOpen;
   return (
     <div className="thinking">
-      <div className="t-head" onClick={() => setOpen(!open)}>
+      <div className="t-head" onClick={toggle}>
         <ChevronIcon open={shown} />
         {streaming ? "Размышляет…" : `Размышления (${text.trim().length} символов)`}
       </div>
@@ -85,16 +151,60 @@ async function openPath(cwd: string | undefined, rawPath: string) {
   await be.invoke("open_in_editor", { editor, path, line: null }).catch(() => {});
 }
 
+function SequentialThoughtCard({
+  thought,
+  running,
+  isError,
+  expanded,
+  cardId,
+}: {
+  thought: SequentialThought;
+  running: boolean;
+  isError: boolean;
+  expanded?: boolean;
+  cardId?: string;
+}) {
+  const [open, toggle] = useExpanded(cardId);
+  const shown = open || expanded;
+  return (
+    <div className={`thought-card ${isError ? "error" : ""}`}>
+      <button className="thought-card-head" onClick={toggle} aria-expanded={shown}>
+        <span className="thought-node">{running ? <span className="spinner" /> : thought.thoughtNumber}</span>
+        <span className="thought-title">Мысль {thought.thoughtNumber}/{thought.totalThoughts}</span>
+        {thought.isRevision && <span className="thought-badge revision">ревизия {thought.revisesThought ?? ""}</span>}
+        {thought.branchId && <span className="thought-badge">ветка {thought.branchId}</span>}
+        <span className="thought-preview">{thought.thought}</span>
+        <ChevronIcon open={shown} />
+      </button>
+      {shown && (
+        <div className="thought-card-body">
+          <div>{thought.thought}</div>
+          <footer>
+            {thought.branchFromThought != null && <span>Ответвление от мысли {thought.branchFromThought}</span>}
+            {thought.needsMoreThoughts && <span>Цепочка расширена</span>}
+            <span className={thought.nextThoughtNeeded ? "active" : "done"}>
+              {thought.nextThoughtNeeded ? "Следующий шаг нужен" : "Цепочка завершена"}
+            </span>
+          </footer>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ToolCallCard({
   block,
   exec,
   cwd,
+  expanded,
 }: {
   block: ContentBlock;
   exec: ToolExec | undefined;
   cwd?: string;
+  expanded?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const blockId = typeof block.id === "string" ? block.id : undefined;
+  const [open, toggle] = useExpanded(blockId);
   const name = (block.name as string) || exec?.name || "tool";
   const args = (block.arguments ?? exec?.args) as Record<string, unknown> | undefined;
   const summary = toolSummary(name, args);
@@ -102,13 +212,18 @@ export function ToolCallCard({
   const isError = exec?.isError ?? false;
   const output = exec?.output ?? "";
   const path = argPath(args);
+  const sequentialThought = parseSequentialThought(name, args);
+
+  if (sequentialThought) {
+    return <SequentialThoughtCard thought={sequentialThought} running={running} isError={isError} expanded={expanded} cardId={blockId} />;
+  }
 
   const oldText = typeof args?.oldText === "string" ? (args.oldText as string) : typeof args?.old_string === "string" ? (args.old_string as string) : null;
   const newText = typeof args?.newText === "string" ? (args.newText as string) : typeof args?.new_string === "string" ? (args.new_string as string) : null;
 
   return (
     <div className="toolcard">
-      <div className="tc-head" onClick={() => setOpen(!open)}>
+      <div className="tc-head" onClick={toggle}>
         {running ? (
           <span className="spinner" />
         ) : (
@@ -129,7 +244,7 @@ export function ToolCallCard({
         )}
         <ChevronIcon open={open} />
       </div>
-      {open && (
+      {(open || expanded) && (
         <div className="tc-body">
           {name === "edit" && oldText != null && newText != null ? (
             <MiniDiff oldText={oldText} newText={newText} />
@@ -143,6 +258,139 @@ export function ToolCallCard({
           )}
           {running && !output && <div className="hint">Выполняется…</div>}
         </div>
+      )}
+    </div>
+  );
+}
+
+// Разбор/форматирование тайминга живёт в lib/turn-timing; реэкспорт — для тестов
+// и существующих импортов.
+export { formatRunDuration, parseTurnTiming, type TurnTiming };
+
+
+/**
+ * Свёрнутая сводка хода в стиле Codex: пока модель работает — процесс виден живьём
+ * в ленте; по завершении весь процесс (мысли + выполнение инструментов + промежуточные
+ * реплики) сворачивается сюда, а итоговый ответ показывается отдельно под ней.
+ */
+export function RunActivitySummary({
+  summaryId,
+  steps,
+  durationMs,
+  actionCount,
+  failedCount,
+  cwd,
+}: {
+  /** Стабильный id хода — «раскрыто» переживает виртуальный скролл. */
+  summaryId?: string;
+  steps: ActivityStep[];
+  durationMs: number;
+  actionCount: number;
+  failedCount: number;
+  cwd?: string;
+}) {
+  const [open, toggle] = useExpanded(summaryId);
+  const label = actionCount > 0 ? "Worked for" : "Thought for";
+  const meta = actionCount > 0
+    ? `${actionCount} ${actionCount === 1 ? "action" : "actions"}${failedCount ? ` · ${failedCount} failed` : ""}`
+    : null;
+  return (
+    <section className={`run-summary ${failedCount ? "has-errors" : ""} ${open ? "open" : ""}`}>
+      <button className="run-summary-head" onClick={toggle} aria-expanded={open}>
+        <ChevronIcon open={open} size={12} />
+        <TimeIcon size={13} />
+        <strong>{label} {formatRunDuration(durationMs)}</strong>
+        {meta && <span>· {meta}</span>}
+      </button>
+      {open && (
+        <div className="run-summary-body">
+          {steps.map((step) => {
+            if (step.kind === "thinking") return <ThinkingBlock key={step.key} text={step.text} blockId={step.key} />;
+            if (step.kind === "text") {
+              return <div key={step.key} className="run-step-note"><Markdown source={step.text} final /></div>;
+            }
+            return <ToolCallCard key={step.key} block={step.block} exec={step.exec} cwd={cwd} />;
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function RunFilesCard({ run, cwd }: { run: RunMeta; cwd: string }) {
+  const files = run.files ?? [];
+  const [expanded, setExpanded] = useState(false);
+  const [undoing, setUndoing] = useState(false);
+  const [undone, setUndone] = useState(false);
+  if (files.length === 0) return null;
+  const additions = files.reduce((sum, file) => sum + file.additions, 0);
+  const deletions = files.reduce((sum, file) => sum + file.deletions, 0);
+  const shown = expanded ? files : files.slice(0, 3);
+  return (
+    <section className="run-files-card">
+      <header>
+        <span className="run-files-icon"><FilesIcon size={17} /></span>
+        <div>
+          <strong>Edited {files.length} {files.length === 1 ? "file" : "files"}</strong>
+          <span><b className="add">+{additions}</b> <b className="del">−{deletions}</b></span>
+        </div>
+        {run.checkpoint && (
+          <button
+            className="run-undo"
+            disabled={undoing || undone}
+            onClick={() => void (async () => {
+              if (!(await confirmDialog(`Откатить ${files.length} ${pluralRu(files.length, ["файл", "файла", "файлов"])} к состоянию до этого хода?`, { kind: "warning" }))) return;
+              setUndoing(true);
+              try {
+                const backend = await getBackend();
+                await backend.invoke("git_restore_run_files", { cwd, gitref: run.checkpoint, files: files.map((file) => file.path) });
+                setUndone(true);
+              } catch (error) {
+                void messageDialog(String(error), { kind: "error" });
+              } finally {
+                setUndoing(false);
+              }
+            })()}
+          >
+            <RevertIcon size={14} /> {undone ? "Undone" : undoing ? "Undoing…" : "Undo"}
+          </button>
+        )}
+        <button
+          className="run-review"
+          onClick={() => useStore.getState().set({ view: "review", reviewCheckpoint: run.checkpoint ?? null })}
+        >
+          <ReviewIcon size={14} /> Review
+        </button>
+      </header>
+      <div className="run-files-list">
+        {shown.map((file) => (
+          <button key={file.path} onClick={() => void openPath(cwd, file.path)} title="Открыть в редакторе">
+            <span>{file.path}</span>
+            <b className="add">+{file.additions}</b>
+            <b className="del">−{file.deletions}</b>
+          </button>
+        ))}
+      </div>
+      {files.length > 3 && (
+        <button className="run-files-more" onClick={() => setExpanded((value) => !value)}>
+          {expanded ? "Show less" : `Show ${files.length - 3} more ${files.length - 3 === 1 ? "file" : "files"}`}
+          <ChevronIcon open={expanded} />
+        </button>
+      )}
+    </section>
+  );
+}
+
+function TurnTimingCard({ timing }: { timing: TurnTiming }) {
+  return (
+    <div className="turn-timing-card" title="Длительность хода (pi-claude-style-tools)">
+      <TimeIcon size={12} />
+      <span className="tt-main">{timing.turn}</span>
+      {timing.total != null && <span className="tt-sep">·</span>}
+      {timing.total != null && <span className="tt-dim">итого {timing.total}</span>}
+      {timing.turns != null && <span className="tt-sep">·</span>}
+      {timing.turns != null && (
+        <span className="tt-dim">{timing.turns} {pluralRu(timing.turns, ["ход", "хода", "ходов"])}</span>
       )}
     </div>
   );
@@ -267,6 +515,12 @@ const MessageViewImpl = function MessageView({
   userIndex,
   busy,
   viaExtension,
+  transcriptMode = "normal",
+  hiddenToolIds,
+  showModelHeader,
+  fallbackModel,
+  render = "full",
+  liveTurn,
 }: {
   msg: ChatMessage;
   execs: Record<string, ToolExec>;
@@ -278,8 +532,22 @@ const MessageViewImpl = function MessageView({
   busy?: boolean;
   /** Сообщение отправлено расширением (pi-goal и т.п.), а не пользователем. */
   viaExtension?: boolean;
+  transcriptMode?: NonNullable<AppConfig["transcriptMode"]>;
+  /** Tool calls rendered once in the compact run summary instead. */
+  hiddenToolIds?: ReadonlySet<string>;
+  /** Первый ответ группы: показать аватар и имя модели, написавшей сообщение. */
+  showModelHeader?: boolean;
+  /** Модель для live-сообщения, если partial ещё не несёт provider/model. */
+  fallbackModel?: ModelInfo;
+  /** Codex-режим ленты: "full" — всё живьём; "answer" — только итоговый текст
+   *  (мысли/инструменты уехали в свёрнутую сводку); "hidden" — сообщение целиком
+   *  внутри сводки, в ленте ничего не рисуем. */
+  render?: "full" | "answer" | "hidden";
+  /** Сообщение принадлежит идущему ходу — рассуждения держим раскрытыми. */
+  liveTurn?: boolean;
 }) {
   const pinId = useMemo(() => msgPinId(msg), [msg]);
+  const aliases = useStore((s) => s.appConfig.modelAliases ?? {});
 
   if (msg.role === "user") {
     return (
@@ -297,23 +565,70 @@ const MessageViewImpl = function MessageView({
     );
   }
 
+  // весь процесс сообщения уехал в свёрнутую сводку хода — в ленте ничего не рисуем
+  if (render === "hidden") return null;
+
   const blocks: ContentBlock[] = Array.isArray(msg.content)
     ? msg.content
     : [{ type: "text", text: String(msg.content ?? "") }];
 
-  const fullText = contentText(msg.content);
+  // «✻ Turn took…» pi-claude-style-tools дописывает в конец текстового блока —
+  // вырезаем из текста и рисуем структурной карточкой (ChatGPT/Claude-стиль).
+  let timing: TurnTiming | null = null;
+  const displayBlocks = blocks.map((b) => {
+    if (b.type !== "text" || typeof b.text !== "string" || !b.text.includes("Turn took")) return b;
+    const split = splitTrailingTurnTiming(b.text);
+    if (!split.timing) return b;
+    timing = split.timing;
+    return { ...b, text: split.body };
+  });
+  const hasToolCalls = blocks.some((b) => b.type === "toolCall");
+  // строка отключена в конфиге расширения, но метаданные пишутся — используем их
+  // (только на финальном сообщении хода: у промежуточных есть toolCall-блоки)
+  if (!timing && !streaming && !hasToolCalls) timing = timingFromWorkedMeta(msg);
+
+  const fullText = contentText(displayBlocks);
+  const provider = typeof msg.provider === "string" && msg.provider ? msg.provider : fallbackModel?.provider;
+  const modelId = typeof msg.model === "string" && msg.model ? msg.model : fallbackModel?.id;
+  const modelKey = modelId ? (provider ? modelAliasKey(provider, modelId) : modelId) : null;
+  const modelName = modelId ? modelIdDisplayName(modelKey ?? modelId, aliases) : null;
+
+  const hasVisibleContent =
+    Boolean(fullText.trim()) ||
+    hasToolCalls ||
+    blocks.some((b) => b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim());
+
+  if (timing && !hasVisibleContent) {
+    return <div className="msg assistant turn-timing" data-pin={pinId}><TurnTimingCard timing={timing} /></div>;
+  }
 
   return (
-    <div className="msg assistant" data-pin={pinId}>
+    <div className={`msg assistant ${streaming ? "streaming" : ""}`} data-pin={pinId}>
+      {showModelHeader && modelKey && (
+        <div className="msg-model">
+          <ModelAvatar modelKey={modelKey} size={20} title={`Автор ответа: ${provider ? `${provider}/${modelId}` : modelId}`} />
+          <span>{modelName}</span>
+        </div>
+      )}
       {!streaming && fullText.trim() && (
         <div className="msg-tools">
           {cwd != null && <PinMessageButton cwd={cwd} msg={msg} />}
           <CopyMessageButton text={stripAnsi(fullText)} />
         </div>
       )}
-      {blocks.map((b, i) => {
+      {displayBlocks.map((b, i) => {
         if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim()) {
-          return <ThinkingBlock key={i} text={b.thinking} streaming={streaming && i === blocks.length - 1} />;
+          // в "answer" мысли уже в свёрнутой сводке хода
+          if (render === "answer" || transcriptMode === "summary") return null;
+          return (
+            <ThinkingBlock
+              key={i}
+              text={b.thinking}
+              streaming={streaming && i === blocks.length - 1}
+              forceOpen={liveTurn}
+              blockId={`${pinId}-think-${i}`}
+            />
+          );
         }
         if (b.type === "text" && typeof b.text === "string" && stripAnsi(b.text).trim()) {
           return (
@@ -324,11 +639,21 @@ const MessageViewImpl = function MessageView({
           );
         }
         if (b.type === "toolCall") {
+          // в "answer" инструменты уже в свёрнутой сводке хода
+          if (render === "answer") return null;
           const id = typeof b.id === "string" ? b.id : undefined;
-          return <ToolCallCard key={id ?? i} block={b} exec={id ? execs[id] : undefined} cwd={cwd} />;
+          if (id && hiddenToolIds?.has(id)) return null;
+          const exec = id ? execs[id] : undefined;
+          if (transcriptMode === "summary" && exec?.done && !exec.isError) return null;
+          return <ToolCallCard key={id ?? i} block={b} exec={exec} cwd={cwd} expanded={transcriptMode === "verbose"} />;
         }
         return null;
       })}
+      {timing && (
+        <div className="turn-timing-wrap">
+          <TurnTimingCard timing={timing} />
+        </div>
+      )}
     </div>
   );
 };
@@ -344,6 +669,14 @@ export const MessageView = memo(MessageViewImpl, (prev, next) => {
     prev.busy !== next.busy ||
     prev.userIndex !== next.userIndex ||
     prev.cwd !== next.cwd
+    || prev.transcriptMode !== next.transcriptMode
+    || prev.hiddenToolIds !== next.hiddenToolIds
+    || prev.showModelHeader !== next.showModelHeader
+    || prev.render !== next.render
+    || prev.liveTurn !== next.liveTurn
+    // agentState пересоздаётся при каждом get_state — сравниваем по идентичности модели
+    || prev.fallbackModel?.provider !== next.fallbackModel?.provider
+    || prev.fallbackModel?.id !== next.fallbackModel?.id
   ) {
     return false;
   }

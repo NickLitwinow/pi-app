@@ -1,12 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { getBackend } from "../lib/backend";
-import type { ConfigFile, PiInfo, SkillInfo } from "../lib/types";
-import { confirmDialog } from "../lib/dialog";
+import type { AppThemePalette, ConfigFile, PiInfo, PiThemeInfo, SkillInfo } from "../lib/types";
+import { confirmDialog, messageDialog } from "../lib/dialog";
+import { applyAppThemePalette, applyAppearanceConfig, completePiThemeColors, paletteFromPiColors } from "../lib/theme";
+import { modelAliasKey } from "../lib/models";
 import { updateAppConfig, useStore } from "../state/store";
+import { ModelAvatarPicker } from "./AgentAvatar";
 import Marketplace, { type Recommended } from "./Marketplace";
-import { CheckIcon, ErrorIcon, FolderIcon, RefreshIcon } from "./icons";
+import { AppearanceIcon, CheckIcon, ErrorIcon, FolderIcon, RefreshIcon, SendIcon, UpdateIcon } from "./icons";
 
-type Tab = "general" | "extensions" | "skills" | "mcp" | "models" | "proc" | "app";
+type Tab = "general" | "extensions" | "skills" | "themes" | "prompts" | "mcp" | "models" | "proc" | "app";
 
 /** Текстовое поле с отложенной записью: локальное значение мгновенно, коммит в файл —
  *  после паузы ввода (иначе settings.json переписывается на каждую букву — I/O-шторм
@@ -49,6 +52,7 @@ interface ProcStat {
   pid: number | null;
   rssMb: number;
   procs: number;
+  uptimeMs: number;
 }
 
 const PROC_KIND_LABEL: Record<string, string> = {
@@ -56,6 +60,16 @@ const PROC_KIND_LABEL: Record<string, string> = {
   preview: "Dev-сервер",
   app: "Приложение",
 };
+
+function formatUptime(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) return `${hours}ч ${minutes}м`;
+  if (minutes > 0) return `${minutes}м ${seconds}с`;
+  return `${seconds}с`;
+}
 
 function ProcessesTab() {
   const [rows, setRows] = useState<ProcStat[] | null>(null);
@@ -101,7 +115,7 @@ function ProcessesTab() {
             <div className="c-title" style={{ fontSize: 13 }}>
               {PROC_KIND_LABEL[r.kind] ?? r.kind}
               <span className="muted" style={{ fontWeight: 400, fontSize: 11, marginLeft: 8 }}>
-                {r.pid != null ? `pid ${r.pid}` : "pid —"} · {r.procs} проц.
+                {r.pid != null ? `pid ${r.pid}` : "pid —"} · {r.procs} проц. · {formatUptime(r.uptimeMs)}
               </span>
             </div>
             <div className="c-sub" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -122,15 +136,34 @@ function ProcessesTab() {
   );
 }
 
-const ALL_TABS: { id: Tab; label: string; needsPi: boolean }[] = [
-  { id: "general", label: "Общие", needsPi: false },
-  { id: "extensions", label: "Расширения", needsPi: true },
-  { id: "skills", label: "Skills", needsPi: true },
-  { id: "mcp", label: "MCP", needsPi: true },
-  { id: "models", label: "Модели и эндпоинты", needsPi: true },
-  { id: "proc", label: "Процессы", needsPi: false },
-  { id: "app", label: "Приложение", needsPi: false },
+const ALL_TABS: { id: Tab; label: string; desc: string; needsPi: boolean }[] = [
+  { id: "general", label: "Основные", desc: "Модель, thinking и контекст", needsPi: false },
+  { id: "app", label: "Интерфейс", desc: "Вид, поведение и процессы", needsPi: false },
+  { id: "models", label: "Провайдеры", desc: "Модели и эндпоинты", needsPi: true },
+  { id: "themes", label: "Редактор тем", desc: "Палитра, импорт и экспорт", needsPi: true },
+  { id: "mcp", label: "MCP", desc: "Подключённые серверы", needsPi: true },
+  { id: "proc", label: "Процессы", desc: "Память и активность", needsPi: false },
 ];
+
+function SettingsGroup({
+  title,
+  description,
+  children,
+}: {
+  title: string;
+  description?: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="settings-group">
+      <div className="settings-group-head">
+        <strong>{title}</strong>
+        {description && <span>{description}</span>}
+      </div>
+      <div className="settings-group-body">{children}</div>
+    </section>
+  );
+}
 
 // ---------- pi installation card (детект / ручной выбор пути) ----------
 
@@ -259,8 +292,16 @@ function RawJsonEditor({
   };
 
   return (
-    <div style={{ marginTop: 16 }}>
-      <div className="row" style={{ marginBottom: 6 }}>
+    <details className="advanced-editor">
+      <summary>
+        <span>
+          <strong>Advanced · raw {name}.json</strong>
+          <small>Для параметров, которых пока нет в визуальном редакторе</small>
+        </span>
+        <span className={dirty ? "advanced-state dirty" : "advanced-state"}>{dirty ? "Не сохранено" : "Открыть"}</span>
+      </summary>
+      <div className="advanced-editor-body">
+      <div className="row advanced-toolbar">
         <span className="muted" style={{ fontFamily: "var(--font-mono)", fontSize: 11 }}>
           {file?.path ?? ""}
         </span>
@@ -287,7 +328,8 @@ function RawJsonEditor({
         }}
       />
       <div className="hint">Запись атомарная, предыдущая версия сохраняется в *.pi-app.bak. Активному агенту нужен перезапуск сессии, чтобы подхватить изменения.</div>
-    </div>
+      </div>
+    </details>
   );
 }
 
@@ -337,57 +379,92 @@ function useSettingsJson(): [PiSettings | null, (patch: Partial<PiSettings>) => 
 
 function GeneralTab() {
   const [parsed, update, reload] = useSettingsJson();
+  const [modelCatalog, setModelCatalog] = useState<Record<string, { models?: { id?: string }[] }>>({});
   const compaction = parsed?.compaction ?? {};
   const compactionEnabled = compaction.enabled !== false;
   const [prov, setProv] = useDebouncedField(String(parsed?.defaultProvider ?? ""), (v) => void update({ defaultProvider: v }));
   const [model, setModel] = useDebouncedField(String(parsed?.defaultModel ?? ""), (v) => void update({ defaultModel: v }));
   const [tuiTheme, setTuiTheme] = useDebouncedField(String(parsed?.theme ?? ""), (v) => void update({ theme: v }));
 
+  useEffect(() => {
+    void (async () => {
+      const be = await getBackend();
+      const file = await be.invoke<ConfigFile>("read_pi_config", { name: "models" }).catch(() => null);
+      try {
+        const next = JSON.parse(file?.content ?? "{}") as { providers?: Record<string, { models?: { id?: string }[] }> };
+        setModelCatalog(next.providers ?? {});
+      } catch {
+        setModelCatalog({});
+      }
+    })();
+  }, []);
+
+  const providerOptions = Array.from(new Set([prov, ...Object.keys(modelCatalog)].filter(Boolean)));
+  const modelOptions = Array.from(new Set([
+    model,
+    ...(modelCatalog[prov]?.models ?? []).map((entry) => entry.id ?? ""),
+  ].filter(Boolean)));
+
   return (
-    <div>
+    <div className="settings-page">
       <PiInstallCard />
 
       {parsed && (
         <>
-          <div className="section-title" style={{ padding: "12px 2px 8px" }}>Значения по умолчанию</div>
+          <SettingsGroup title="Новая сессия" description="Применяется автоматически при следующем запуске агента">
           <div className="form-row">
-            <label>Провайдер по умолчанию</label>
-            <input value={prov} onChange={(e) => setProv(e.target.value)} />
+            <label>Провайдер <small>Ключ из models.json</small></label>
+            <select aria-label="Провайдер по умолчанию" value={prov} onChange={(e) => setProv(e.target.value)}>
+              {providerOptions.map((provider) => <option key={provider} value={provider}>{provider}</option>)}
+            </select>
           </div>
           <div className="form-row">
-            <label>Модель по умолчанию</label>
-            <input value={model} onChange={(e) => setModel(e.target.value)} />
+            <label>Модель <small>Runtime ID, без UI-псевдонима</small></label>
+            <select aria-label="Модель по умолчанию" value={model} onChange={(e) => setModel(e.target.value)}>
+              {modelOptions.map((modelId) => <option key={modelId} value={modelId}>{modelId}</option>)}
+            </select>
           </div>
+          {model && (
+            <div className="form-row">
+              <label>Иконка модели <small>Покой и «LLM работает» — как в чате</small></label>
+              <div className="model-avatar-setting">
+                <ModelAvatarPicker modelKey={modelAliasKey(prov, model)} size={30} />
+                <span className="hint">{prov ? `${prov}/${model}` : model}</span>
+              </div>
+            </div>
+          )}
           <div className="form-row">
-            <label>Thinking по умолчанию</label>
-            <select
+            <label>Thinking <small>Глубина рассуждений по умолчанию</small></label>
+            <SegmentedControl
+              label="Thinking по умолчанию"
               value={String(parsed.defaultThinkingLevel ?? "high")}
-              onChange={(e) => void update({ defaultThinkingLevel: e.target.value })}
-            >
-              {["off", "minimal", "low", "medium", "high", "xhigh"].map((l) => (
-                <option key={l}>{l}</option>
+              options={["off", "minimal", "low", "medium", "high", "xhigh"].map((value) => ({ value, label: value }))}
+              onChange={(defaultThinkingLevel) => void update({ defaultThinkingLevel })}
+            />
+          </div>
+          <div className="form-row">
+            <label>Тема pi TUI <small>Отдельна от темы приложения</small></label>
+            <select aria-label="Тема pi TUI" value={tuiTheme} onChange={(e) => setTuiTheme(e.target.value)}>
+              {Array.from(new Set([tuiTheme, "dark", "light"].filter(Boolean))).map((themeName) => (
+                <option key={themeName} value={themeName}>{themeName}</option>
               ))}
             </select>
           </div>
-          <div className="form-row">
-            <label>Тема pi (TUI)</label>
-            <input value={tuiTheme} onChange={(e) => setTuiTheme(e.target.value)} />
-          </div>
+          </SettingsGroup>
 
-          <div className="section-title" style={{ padding: "12px 2px 8px" }}>Компакция контекста</div>
+          <SettingsGroup title="Компакция контекста" description="Изменения пишутся сразу; активной сессии потребуется перезапуск">
           <div className="form-row">
-            <label>Авто-компакция при заполнении окна</label>
-            <select
-              value={compactionEnabled ? "on" : "off"}
-              onChange={(e) => void update({ compaction: { ...compaction, enabled: e.target.value === "on" } })}
-            >
-              <option value="on">Включена (как в Claude Desktop)</option>
-              <option value="off">Выключена (только ручной compact)</option>
-            </select>
+            <label>Авто-компакция <small>Сворачивает старый контекст при заполнении</small></label>
+            <GlassSwitch
+              label="Авто-компакция при заполнении окна"
+              checked={compactionEnabled}
+              onChange={(enabled) => void update({ compaction: { ...compaction, enabled } })}
+            />
           </div>
           <div className="form-row">
-            <label>Резерв под ответ модели (reserveTokens)</label>
+            <label>Резерв ответа <small>reserveTokens</small></label>
             <input
+              aria-label="Резерв под ответ модели"
               type="number"
               min={1024}
               step={1024}
@@ -398,8 +475,9 @@ function GeneralTab() {
             />
           </div>
           <div className="form-row">
-            <label>Свежий контекст без сжатия (keepRecentTokens)</label>
+            <label>Свежий контекст <small>keepRecentTokens</small></label>
             <input
+              aria-label="Свежий контекст без сжатия"
               type="number"
               min={2000}
               step={1000}
@@ -413,6 +491,7 @@ function GeneralTab() {
             Компакция — механизм ядра pi: при переполнении контекстного окна старые сообщения сворачиваются в
             структурированное резюме. Порог: contextWindow − reserveTokens. Изменения подхватываются новыми сессиями.
           </div>
+          </SettingsGroup>
         </>
       )}
 
@@ -567,6 +646,200 @@ function SkillsTab() {
       ))}
       {skills.length === 0 && <div className="muted">Локальные skills не найдены</div>}
     </div>
+  );
+}
+
+function ThemesTab() {
+  const cwd = useStore((s) => s.currentCwd);
+  const appConfig = useStore((s) => s.appConfig);
+  const [themes, setThemes] = useState<PiThemeInfo[]>([]);
+  const [draft, setDraft] = useState<{ name: string; colors: Record<string, string | number> } | null>(null);
+  const [scope, setScope] = useState<"global" | "project">("global");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    const be = await getBackend();
+    setThemes(await be.invoke<PiThemeInfo[]>("list_pi_themes", { cwd }).catch(() => []));
+  }, [cwd]);
+
+  useEffect(() => void load(), [load]);
+
+  const draftResolved = useMemo(
+    () => Object.fromEntries(Object.entries(draft?.colors ?? {}).map(([key, value]) => [key, typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value) ? value : "#8b8b92"])),
+    [draft],
+  );
+  const previewPalette = useMemo(
+    () => draft ? paletteFromPiColors(draft.name, draftResolved) : null,
+    [draft, draftResolved],
+  );
+
+  useEffect(() => {
+    if (!previewPalette) return;
+    applyAppThemePalette(previewPalette);
+    return () => applyAppearanceConfig(useStore.getState().appConfig);
+  }, [previewPalette]);
+
+  const writeActiveTheme = async (name: string) => {
+    const be = await getBackend();
+    const file = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
+    const settings = JSON.parse(file.content || "{}") as Record<string, unknown>;
+    settings.theme = name;
+    await be.invoke("write_pi_config", { name: "settings", content: JSON.stringify(settings, null, 2) });
+  };
+
+  const applyInstalled = async (theme: PiThemeInfo) => {
+    const palette = paletteFromPiColors(theme.name, theme.resolvedColors);
+    await writeActiveTheme(theme.name);
+    await updateAppConfig({ appearancePreset: "custom", accentColor: palette.accent, customTheme: palette });
+  };
+
+  const startEditor = (theme?: PiThemeInfo) => {
+    const seed = theme?.resolvedColors ?? (appConfig.customTheme ? {
+      accent: appConfig.customTheme.accent, borderMuted: appConfig.customTheme.border, success: appConfig.customTheme.success,
+      error: appConfig.customTheme.danger, warning: appConfig.customTheme.warning, muted: appConfig.customTheme.muted,
+      text: appConfig.customTheme.text, selectedBg: appConfig.customTheme.active, userMessageBg: appConfig.customTheme.raised,
+      customMessageBg: appConfig.customTheme.sidebar, toolPendingBg: appConfig.customTheme.background,
+    } : {});
+    setDraft({ name: theme ? `${theme.name}-custom` : "my-theme", colors: completePiThemeColors(seed) });
+  };
+
+  const updateDraftColor = (token: string, value: string) => {
+    setDraft((current) => current ? { ...current, colors: { ...current.colors, [token]: value } } : current);
+  };
+
+  const saveAndApply = async () => {
+    if (!draft || !previewPalette) return;
+    setBusy(true);
+    try {
+      const be = await getBackend();
+      await be.invoke("save_pi_theme", { draft, scope, cwd });
+      await writeActiveTheme(draft.name);
+      await updateAppConfig({ appearancePreset: "custom", accentColor: previewPalette.accent, customTheme: previewPalette });
+      await load();
+      await messageDialog(`Тема «${draft.name}» сохранена и применена к pi и приложению.`, { kind: "info" });
+    } catch (error) {
+      await messageDialog(String(error), { kind: "error" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const exportPackage = async () => {
+    if (!draft) return;
+    const be = await getBackend();
+    let destination = "/Users/dev/Desktop";
+    if (!be.isMock) {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({ directory: true, multiple: false, title: "Куда экспортировать пакет pi-theme" }).catch(() => null);
+      if (typeof selected !== "string") return;
+      destination = selected;
+    }
+    try {
+      const path = await be.invoke<string>("export_pi_theme_package", { destination, draft });
+      await messageDialog(`Пакет экспортирован: ${path}\n\nПеред публикацией добавьте author/repository и выполните npm publish.`, { kind: "info" });
+    } catch (error) {
+      await messageDialog(String(error), { kind: "error" });
+    }
+  };
+
+  const paletteFields: { token: keyof AppThemePalette | string; label: string; piToken: string }[] = [
+    { token: "background", label: "Фон", piToken: "toolPendingBg" },
+    { token: "sidebar", label: "Сайдбар", piToken: "customMessageBg" },
+    { token: "raised", label: "Карточки", piToken: "userMessageBg" },
+    { token: "active", label: "Выделение", piToken: "selectedBg" },
+    { token: "text", label: "Основной текст", piToken: "text" },
+    { token: "muted", label: "Вторичный текст", piToken: "muted" },
+    { token: "border", label: "Границы", piToken: "borderMuted" },
+    { token: "accent", label: "Акцент", piToken: "accent" },
+    { token: "success", label: "Success", piToken: "success" },
+    { token: "warning", label: "Warning", piToken: "warning" },
+    { token: "danger", label: "Error", piToken: "error" },
+  ];
+
+  return (
+    <div className="theme-library">
+      <Marketplace
+        kind="theme"
+        installHint="Темы сообщества pi.dev. Установка добавляет тему в pi; ниже можно применить её одновременно к TUI и интерфейсу приложения."
+      />
+
+      <div className="section-title theme-local-title">
+        Установленные темы · {themes.length}
+        <button className="primary" onClick={() => startEditor()}>Создать тему</button>
+      </div>
+      <div className="theme-local-grid">
+        {themes.map((theme) => {
+          const palette = paletteFromPiColors(theme.name, theme.resolvedColors);
+          return (
+            <div className="card pi-theme-card" key={theme.path}>
+              <div className="pi-theme-preview" style={{ background: palette.background }}>
+                <span style={{ background: palette.sidebar }} />
+                <i style={{ background: palette.accent }} />
+                <b style={{ background: palette.raised, borderColor: palette.border }} />
+              </div>
+              <div className="pi-theme-card-copy">
+                <strong>{theme.name}</strong>
+                <span className="hint">{theme.packageName ?? (theme.source === "project" ? "Проект" : "Глобальная")}</span>
+                {!theme.valid && <span className="hint" style={{ color: "var(--warn)" }}>{theme.error}</span>}
+              </div>
+              <div className="pi-theme-actions">
+                <button onClick={() => startEditor(theme)}>Дублировать</button>
+                <button className="primary" disabled={!theme.valid} onClick={() => void applyInstalled(theme)}>Применить</button>
+              </div>
+            </div>
+          );
+        })}
+        {themes.length === 0 && <div className="muted">Локальных тем пока нет — создайте свою или установите пакет из каталога.</div>}
+      </div>
+
+      {draft && previewPalette && (
+        <section className="theme-editor settings-group">
+          <div className="settings-group-head theme-editor-head">
+            <span><strong>Редактор темы</strong><small>Live preview применяется ко всему приложению, сохранение — только по кнопке.</small></span>
+            <button onClick={() => setDraft(null)}>Закрыть</button>
+          </div>
+          <div className="theme-editor-preview" style={{ background: previewPalette.background, color: previewPalette.text, borderColor: previewPalette.border }}>
+            <div className="theme-editor-preview-sidebar" style={{ background: previewPalette.sidebar }}>
+              <span style={{ background: previewPalette.accent }} />
+              <span /><span />
+            </div>
+            <div className="theme-editor-preview-chat">
+              <strong>{draft.name}</strong>
+              <p style={{ color: previewPalette.muted }}>Pi App · adaptive community theme</p>
+              <div style={{ background: previewPalette.raised, borderColor: previewPalette.border }}>Карточка ответа с синхронной палитрой TUI и приложения.</div>
+              <button style={{ background: previewPalette.accent }}>Продолжить</button>
+            </div>
+          </div>
+          <div className="theme-editor-fields">
+            <label className="theme-name-field">Название<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
+            {paletteFields.map((field) => (
+              <label key={field.piToken}>
+                <span>{field.label}<small>{field.piToken}</small></span>
+                <input type="color" value={String(draft.colors[field.piToken])} onChange={(event) => updateDraftColor(field.piToken, event.target.value)} />
+                <code>{String(draft.colors[field.piToken])}</code>
+              </label>
+            ))}
+          </div>
+          <div className="theme-editor-actions">
+            <select value={scope} onChange={(event) => setScope(event.target.value as "global" | "project")}>
+              <option value="global">Для всех проектов</option>
+              <option value="project" disabled={!cwd}>Только текущий проект</option>
+            </select>
+            <button onClick={() => void exportPackage()}>Экспортировать pi-theme</button>
+            <button className="primary" disabled={busy} onClick={() => void saveAndApply()}>{busy ? "Сохранение…" : "Сохранить и применить"}</button>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function PromptsTab() {
+  return (
+    <Marketplace
+      kind="prompt"
+      installHint="Prompt- и AGENTS.md-пакеты сообщества. После установки пресет доступен новым сессиям; держите активным только нужный набор, чтобы не раздувать системный контекст."
+    />
   );
 }
 
@@ -839,18 +1112,79 @@ function ModelsTab() {
 
 // ---------- app ----------
 
+type AppearancePreset = "chatgpt" | "claude" | "gemini" | "custom";
+
+const APPEARANCE_PRESETS: { id: AppearancePreset; label: string; color: string; color2?: string }[] = [
+  { id: "chatgpt", label: "ChatGPT", color: "#10a37f" },
+  { id: "claude", label: "Claude", color: "#d97757" },
+  { id: "gemini", label: "Gemini", color: "#4e8cff", color2: "#9b72f2" },
+  { id: "custom", label: "Custom color", color: "var(--brand)" },
+];
+
+function SegmentedControl<T extends string>({
+  value,
+  options,
+  onChange,
+  label,
+}: {
+  value: T;
+  options: readonly { value: T; label: string }[];
+  onChange: (value: T) => void;
+  label: string;
+}) {
+  return (
+    <div className="segmented-control" role="group" aria-label={label}>
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          className={value === option.value ? "active" : ""}
+          aria-pressed={value === option.value}
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function GlassSwitch({ checked, onChange, label }: { checked: boolean; onChange: (checked: boolean) => void; label: string }) {
+  return (
+    <button
+      type="button"
+      className={`glass-switch ${checked ? "on" : ""}`}
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      onClick={() => onChange(!checked)}
+    >
+      <span />
+    </button>
+  );
+}
+
 function AppTab() {
   const appConfig = useStore((s) => s.appConfig);
   const [name, setName] = useDebouncedField(appConfig.displayName ?? "", (v) => void updateAppConfig({ displayName: v }));
+  const appearancePreset = appConfig.appearancePreset ?? "chatgpt";
+  const accentColor = appConfig.accentColor ?? "#8b5cf6";
+  const iconColor = appConfig.iconColor ?? accentColor;
+  const setCustomAccent = (color: string) => void updateAppConfig({
+    accentColor: color,
+    appearancePreset: "custom",
+    customTheme: appConfig.customTheme ? { ...appConfig.customTheme, accent: color } : appConfig.customTheme,
+  });
 
   return (
-    <div>
+    <div className="settings-page">
+      <SettingsGroup title="Приложение и runtime" description="Настройки сохраняются сразу; процессы пересчитываются без перезапуска UI">
       <div className="form-row">
-        <label>Имя для приветствия (стартовый экран)</label>
+        <label>Имя для приветствия <small>Стартовый экран</small></label>
         <input placeholder="Как к вам обращаться" value={name} onChange={(e) => setName(e.target.value)} />
       </div>
       <div className="form-row">
-        <label>Внешний редактор</label>
+        <label>Внешний редактор <small>Открытие файлов и diff</small></label>
         <select value={appConfig.editor} onChange={(e) => void updateAppConfig({ editor: e.target.value })}>
           <option value="code">VS Code</option>
           <option value="cursor">Cursor</option>
@@ -861,17 +1195,41 @@ function AppTab() {
         </select>
       </div>
       <div className="form-row">
-        <label>Лимит одновременных агентов</label>
+        <label>Отправка сообщения <small>Перенос строки остаётся на второй комбинации</small></label>
+        <SegmentedControl
+          label="Горячая клавиша отправки"
+          value={appConfig.sendKeyBehavior ?? "enter"}
+          options={[
+            { value: "enter", label: "Enter" },
+            { value: "mod-enter", label: "⌘ Enter" },
+          ]}
+          onChange={(sendKeyBehavior) => void updateAppConfig({ sendKeyBehavior })}
+        />
+      </div>
+      <div className="form-row">
+        <label>Лимит агентов <small>1–8 параллельных процессов</small></label>
         <input
           type="number"
           min={1}
           max={8}
           value={appConfig.processLimit}
           onChange={(e) => void updateAppConfig({ processLimit: Math.max(1, Number(e.target.value) || 1) })}
+          disabled={appConfig.processLimitAuto === true}
         />
       </div>
       <div className="form-row">
-        <label>Останавливать простаивающего агента через (сек)</label>
+        <label>Защита локального GPU <small>Один агент для localhost/Ollama/oMLX</small></label>
+        <GlassSwitch
+          label="Один агент для локальной модели"
+          checked={appConfig.processLimitAuto !== false}
+          onChange={(processLimitAuto) => void updateAppConfig({ processLimitAuto })}
+        />
+      </div>
+      <div className="hint" style={{ marginTop: -4, marginBottom: 10 }}>
+        Если models.json указывает localhost/ollama/oMLX, приложение использует один агент, чтобы процессы не конкурировали за GPU. Снимите флажок для ручного лимита.
+      </div>
+      <div className="form-row">
+        <label>Idle agent timeout <small>Секунды до остановки</small></label>
         <input
           type="number"
           min={60}
@@ -881,7 +1239,17 @@ function AppTab() {
         />
       </div>
       <div className="form-row">
-        <label>Сторож зависаний провайдера, сек (0 — выкл)</label>
+        <label>Idle Preview timeout <small>0 отключает автоостановку</small></label>
+        <input
+          type="number"
+          min={0}
+          step={60}
+          value={appConfig.previewIdleKillSecs ?? 600}
+          onChange={(e) => void updateAppConfig({ previewIdleKillSecs: Math.max(0, Number(e.target.value) || 0) })}
+        />
+      </div>
+      <div className="form-row">
+        <label>Provider watchdog <small>Секунды, 0 — выключен</small></label>
         <input
           type="number"
           min={0}
@@ -899,16 +1267,131 @@ function AppTab() {
         умолчанию <b>0 (выкл)</b> — снимается только stall-обрыв, прочие ретраи расширения работают. Ненулевое значение
         (напр. 300–600с) осмысленно для облачных провайдеров, где зависший стрим — обычно реальная сетевая проблема.
       </div>
+      </SettingsGroup>
+      <div className="settings-section-title">Внешний вид и motion</div>
+      <section className="customization-panel" aria-label="Персонализация интерфейса">
+        <div className="customization-head">
+          <span className="customization-icon"><AppearanceIcon size={17} /></span>
+          <div>
+            <strong>Персонализация</strong>
+            <span>Стиль применяется сразу ко всему приложению</span>
+          </div>
+        </div>
+
+        <div className="theme-preset-grid" role="group" aria-label="Пресет оформления">
+          {APPEARANCE_PRESETS.map((preset) => (
+            <button
+              type="button"
+              key={preset.id}
+              className={`theme-preset ${appearancePreset === preset.id ? "active" : ""}`}
+              aria-pressed={appearancePreset === preset.id}
+              onClick={() => void updateAppConfig({ appearancePreset: preset.id })}
+            >
+              <span
+                className="theme-preset-swatch"
+                style={{
+                  background: preset.id === "custom"
+                    ? accentColor
+                    : preset.color2
+                      ? `linear-gradient(135deg, ${preset.color}, ${preset.color2})`
+                      : preset.color,
+                }}
+              />
+              <span>{preset.label}</span>
+              {appearancePreset === preset.id && <CheckIcon size={13} />}
+            </button>
+          ))}
+        </div>
+
+        <div className={`custom-color-row ${appearancePreset === "custom" ? "visible" : ""}`}>
+          <div className="custom-color-control">
+            <label htmlFor="custom-accent">Акцент кнопок</label>
+            <span className="color-picker-shell" style={{ "--picker-color": accentColor } as CSSProperties}>
+              <input
+                id="custom-accent"
+                type="color"
+                value={accentColor}
+                aria-label="Выбрать цвет кнопок"
+                onChange={(e) => setCustomAccent(e.target.value)}
+              />
+            </span>
+            <code>{accentColor.toUpperCase()}</code>
+          </div>
+          <div className="custom-color-control">
+            <label htmlFor="custom-icons">Цвет иконок</label>
+            <span className="color-picker-shell" style={{ "--picker-color": iconColor } as CSSProperties}>
+              <input
+                id="custom-icons"
+                type="color"
+                value={iconColor}
+                aria-label="Выбрать цвет иконок"
+                onChange={(e) => void updateAppConfig({ iconColor: e.target.value, appearancePreset: "custom" })}
+              />
+            </span>
+            <code>{iconColor.toUpperCase()}</code>
+          </div>
+        </div>
+
+        <div className="customization-row">
+          <div>
+            <strong>Режим</strong>
+            <span>Системная, тёмная или светлая основа</span>
+          </div>
+          <SegmentedControl
+            label="Тема приложения"
+            value={appConfig.theme as "system" | "dark" | "light"}
+            options={[
+              { value: "system", label: "Auto" },
+              { value: "dark", label: "Dark" },
+              { value: "light", label: "Light" },
+            ]}
+            onChange={(theme) => void updateAppConfig({ theme })}
+          />
+        </div>
+
+        <div className="customization-row">
+          <div>
+            <strong>Depth & cursor glow</strong>
+            <span>Сдержанный blur панелей и световой отклик только под курсором</span>
+          </div>
+          <GlassSwitch
+            label="Глубина панелей и контекстный cursor glow"
+            checked={appConfig.visualEffects !== false}
+            onChange={(visualEffects) => void updateAppConfig({ visualEffects })}
+          />
+        </div>
+
+        <div className="customization-row">
+          <div>
+            <strong>Плотность</strong>
+            <span>Больше воздуха или больше контента</span>
+          </div>
+          <SegmentedControl
+            label="Плотность интерфейса"
+            value={appConfig.interfaceDensity ?? "comfortable"}
+            options={[
+              { value: "comfortable", label: "Comfort" },
+              { value: "compact", label: "Compact" },
+            ]}
+            onChange={(interfaceDensity) => void updateAppConfig({ interfaceDensity })}
+          />
+        </div>
+
+        <div className="appearance-preview">
+          <div className="preview-chat">
+            <span className="preview-avatar"><UpdateIcon size={13} /></span>
+            <span className="preview-answer">Готов помочь с проектом</span>
+          </div>
+          <div className="preview-composer">
+            <span>Сообщение для Pi App…</span>
+            <button type="button" tabIndex={-1} aria-hidden="true"><SendIcon size={13} /></button>
+          </div>
+          <span className="preview-caption">Live preview · contextual glow</span>
+        </div>
+      </section>
+      <SettingsGroup title="Доступность и отображение" description="Масштаб применяется в реальном времени">
       <div className="form-row">
-        <label>Тема приложения</label>
-        <select value={appConfig.theme} onChange={(e) => void updateAppConfig({ theme: e.target.value })}>
-          <option value="system">Как в системе</option>
-          <option value="dark">Тёмная</option>
-          <option value="light">Светлая</option>
-        </select>
-      </div>
-      <div className="form-row">
-        <label>Масштаб интерфейса (⌘+ / ⌘− / ⌘0)</label>
+        <label>Масштаб интерфейса <small>⌘+ / ⌘− / ⌘0</small></label>
         <input
           type="range"
           min={0.7}
@@ -919,10 +1402,14 @@ function AppTab() {
         />
         <span className="hint" style={{ width: 44 }}>{Math.round((appConfig.uiScale || 1) * 100)}%</span>
       </div>
-      <div className="hint" style={{ marginTop: 16 }}>
+      <div className="hint">
+        Псевдоним модели задаётся кнопкой ✎ прямо в селекторе модели. Он меняет только название в UI и аналитике — provider/model ID остаётся неизменным.
+      </div>
+      <div className="hint">
         Лимит агентов важен для локальных моделей: каждый агент — отдельный pi-процесс, который делит GPU с
         остальными. Idle-агенты убиваются автоматически; сессия возобновляется прозрачно при следующем сообщении.
       </div>
+      </SettingsGroup>
     </div>
   );
 }
@@ -935,6 +1422,7 @@ export default function SettingsView() {
   const tabs = ALL_TABS.filter((t) => hasPi || !t.needsPi);
   const [tab, setTab] = useState<Tab>("general");
   const effective = tabs.some((t) => t.id === tab) ? tab : "general";
+  const currentTab = tabs.find((t) => t.id === effective) ?? tabs[0];
 
   return (
     <div className="chat">
@@ -942,21 +1430,36 @@ export default function SettingsView() {
         <span className="title">Настройки</span>
         {!hasPi && <span className="sub" style={{ color: "var(--danger)" }}>pi не найден — доступны не все вкладки</span>}
       </div>
-      <div className="view">
-        <div className="tabs">
+      <div className="view settings-view">
+        <div className="settings-shell">
+        <aside className="settings-nav" aria-label="Разделы настроек">
           {tabs.map((t) => (
             <button key={t.id} className={effective === t.id ? "active" : ""} onClick={() => setTab(t.id)}>
-              {t.label}
+              <span>{t.label}</span>
+              <small>{t.desc}</small>
             </button>
           ))}
-        </div>
+          <div className="settings-autosave"><CheckIcon size={13} /> Автосохранение включено</div>
+        </aside>
+        <main className="settings-content">
+          <header className="settings-content-head">
+            <div>
+              <h2>{currentTab.label}</h2>
+              <p>{currentTab.desc}</p>
+            </div>
+            <span className="realtime-pill"><span className="dot live" /> Live</span>
+          </header>
         {effective === "general" && <GeneralTab />}
         {effective === "extensions" && <ExtensionsTab />}
         {effective === "skills" && <SkillsTab />}
+        {effective === "themes" && <ThemesTab />}
+        {effective === "prompts" && <PromptsTab />}
         {effective === "mcp" && <McpTab />}
         {effective === "models" && <ModelsTab />}
         {effective === "proc" && <ProcessesTab />}
         {effective === "app" && <AppTab />}
+        </main>
+        </div>
       </div>
     </div>
   );

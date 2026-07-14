@@ -3,18 +3,43 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
+static RUNNING_GROUPS: LazyLock<Mutex<std::collections::HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// App-exit cleanup for git/npm/cargo/ditto and their descendants.
+pub fn stop_all_runs() {
+    let pids: Vec<u32> = RUNNING_GROUPS
+        .lock()
+        .map(|mut s| s.drain().collect())
+        .unwrap_or_default();
+    #[cfg(unix)]
+    {
+        for pid in &pids {
+            unsafe { libc::kill(-(*pid as i32), libc::SIGTERM) };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        for pid in pids {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
 
 /// Версия текущей сборки (из Cargo) + встроенный git-sha (из build.rs).
 fn current_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 fn current_sha() -> String {
-    option_env!("PI_APP_GIT_SHA").unwrap_or("unknown").to_string()
+    option_env!("PI_APP_GIT_SHA")
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// Каталог исходников, из которого собрано приложение (родитель src-tauri).
@@ -26,7 +51,13 @@ fn embedded_source_repo() -> Option<PathBuf> {
 /// owner/repo для GitHub API: из origin-remote исходников, иначе — репозиторий проекта.
 async fn repo_slug(source_repo: &Path) -> String {
     if let Ok(out) = Command::new("git")
-        .args(["-C", &source_repo.to_string_lossy(), "remote", "get-url", "origin"])
+        .args([
+            "-C",
+            &source_repo.to_string_lossy(),
+            "remote",
+            "get-url",
+            "origin",
+        ])
         .output()
         .await
     {
@@ -58,6 +89,9 @@ pub struct AppUpdateInfo {
     pub latest_kind: String,
     pub notes: String,
     pub html_url: String,
+    /// Готовый macOS .dmg из GitHub Releases. Если есть, приложение можно
+    /// скачать и установить в фоне без локальной сборки и ручного drag&drop.
+    pub asset_url: Option<String>,
     pub update_available: bool,
     /// Удалось ли определить статус (локальный git или GitHub).
     pub checked: bool,
@@ -65,6 +99,32 @@ pub struct AppUpdateInfo {
     pub behind: u64,
     pub ahead: u64,
     pub error: Option<String>,
+}
+
+fn release_dmg(v: &Value) -> Option<String> {
+    let assets = v.get("assets")?.as_array()?;
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x64"
+    };
+    assets
+        .iter()
+        .filter_map(|asset| {
+            let name = asset.get("name")?.as_str()?.to_ascii_lowercase();
+            let url = asset.get("browser_download_url")?.as_str()?.to_string();
+            name.ends_with(".dmg").then_some((name, url))
+        })
+        .max_by_key(|(name, _)| {
+            if name.contains(arch) {
+                3
+            } else if name.contains("universal") {
+                2
+            } else {
+                1
+            }
+        })
+        .map(|(_, url)| url)
 }
 
 /// GET к GitHub API через системный curl (не тянем HTTP-стек в бинарь).
@@ -111,7 +171,17 @@ async fn git_capture(repo: &Path, args: &[&str]) -> Option<String> {
 /// Upstream-ref, который отслеживает репозиторий: @{upstream} текущей ветки,
 /// иначе — ветка по умолчанию origin (origin/HEAD). Напр. "origin/main".
 async fn upstream_ref(repo: &Path) -> Option<String> {
-    if let Some(u) = git_capture(repo, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).await {
+    if let Some(u) = git_capture(
+        repo,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .await
+    {
         if !u.is_empty() && u != "@{upstream}" {
             return Some(u);
         }
@@ -150,15 +220,40 @@ async fn local_update_status(repo: &Path) -> Option<LocalStatus> {
     .await;
 
     // "<ahead> <behind>": слева — коммиты HEAD не в upstream, справа — наоборот
-    let counts = git_capture(repo, &["rev-list", "--left-right", "--count", &format!("HEAD...{upstream}")]).await?;
+    let counts = git_capture(
+        repo,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("HEAD...{upstream}"),
+        ],
+    )
+    .await?;
     let mut it = counts.split_whitespace();
     let ahead: u64 = it.next()?.parse().ok()?;
     let behind: u64 = it.next()?.parse().ok()?;
-    let up_sha = git_capture(repo, &["rev-parse", "--short", &upstream]).await.unwrap_or_default();
-    let notes = git_capture(repo, &["log", "--format=%h %s", "-n", "20", &format!("HEAD..{upstream}")])
+    let up_sha = git_capture(repo, &["rev-parse", "--short", &upstream])
         .await
         .unwrap_or_default();
-    Some(LocalStatus { behind, ahead, up_sha, notes })
+    let notes = git_capture(
+        repo,
+        &[
+            "log",
+            "--format=%h %s",
+            "-n",
+            "20",
+            &format!("HEAD..{upstream}"),
+        ],
+    )
+    .await
+    .unwrap_or_default();
+    Some(LocalStatus {
+        behind,
+        ahead,
+        up_sha,
+        notes,
+    })
 }
 
 /// Web-URL репозитория из origin-remote (для кнопки «Открыть на GitHub»).
@@ -175,7 +270,11 @@ fn source_repo_valid(repo: &Path) -> bool {
     std::fs::read_to_string(repo.join("package.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("name")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string())
+        })
         .map(|n| n == "pi-app")
         .unwrap_or(false)
         && repo.join("src-tauri").join("tauri.conf.json").exists()
@@ -184,9 +283,7 @@ fn source_repo_valid(repo: &Path) -> bool {
 /// Проверить наличие обновления приложения на GitHub (release или новый коммит).
 #[tauri::command]
 pub async fn check_app_update(source_repo: Option<String>) -> AppUpdateInfo {
-    let repo = source_repo
-        .map(PathBuf::from)
-        .or_else(embedded_source_repo);
+    let repo = source_repo.map(PathBuf::from).or_else(embedded_source_repo);
     let repo_valid = repo.as_deref().map(source_repo_valid).unwrap_or(false);
 
     let mut info = AppUpdateInfo {
@@ -216,7 +313,10 @@ pub async fn check_app_update(source_repo: Option<String>) -> AppUpdateInfo {
                 info.notes = if st.behind > 0 {
                     st.notes
                 } else if st.ahead > 0 {
-                    format!("Локальная версия впереди на {} коммит(ов) — обновление не требуется.", st.ahead)
+                    format!(
+                        "Локальная версия впереди на {} коммит(ов) — обновление не требуется.",
+                        st.ahead
+                    )
                 } else {
                     "Установлена последняя версия.".into()
                 };
@@ -234,15 +334,35 @@ pub async fn check_app_update(source_repo: Option<String>) -> AppUpdateInfo {
     };
 
     // 1) последний релиз
-    match github_get(&format!("https://api.github.com/repos/{slug}/releases/latest")).await {
+    match github_get(&format!(
+        "https://api.github.com/repos/{slug}/releases/latest"
+    ))
+    .await
+    {
         Ok((200, body)) => {
             if let Ok(v) = serde_json::from_str::<Value>(&body) {
-                let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("").trim_start_matches('v').to_string();
+                let tag = v
+                    .get("tag_name")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .trim_start_matches('v')
+                    .to_string();
                 info.checked = true;
                 info.latest = Some(tag.clone());
                 info.latest_kind = "release".into();
-                info.notes = v.get("body").and_then(|b| b.as_str()).unwrap_or("").chars().take(4000).collect();
-                info.html_url = v.get("html_url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                info.notes = v
+                    .get("body")
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("")
+                    .chars()
+                    .take(4000)
+                    .collect();
+                info.html_url = v
+                    .get("html_url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                info.asset_url = release_dmg(&v);
                 info.update_available = !tag.is_empty() && tag != info.current_version;
                 return info;
             }
@@ -257,7 +377,11 @@ pub async fn check_app_update(source_repo: Option<String>) -> AppUpdateInfo {
     }
 
     // 2) последний коммит ветки main (по умолчанию)
-    match github_get(&format!("https://api.github.com/repos/{slug}/commits?per_page=1")).await {
+    match github_get(&format!(
+        "https://api.github.com/repos/{slug}/commits?per_page=1"
+    ))
+    .await
+    {
         Ok((200, body)) => {
             if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&body) {
                 if let Some(c) = arr.first() {
@@ -266,10 +390,22 @@ pub async fn check_app_update(source_repo: Option<String>) -> AppUpdateInfo {
                     info.checked = true;
                     info.latest = Some(short.to_string());
                     info.latest_kind = "commit".into();
-                    info.notes = c.pointer("/commit/message").and_then(|m| m.as_str()).unwrap_or("").chars().take(2000).collect();
-                    info.html_url = c.get("html_url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                    info.notes = c
+                        .pointer("/commit/message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("")
+                        .chars()
+                        .take(2000)
+                        .collect();
+                    info.html_url = c
+                        .get("html_url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // сравниваем со встроенным sha (если он известен)
-                    info.update_available = info.current_sha != "unknown" && !short.starts_with(&info.current_sha) && !info.current_sha.starts_with(short);
+                    info.update_available = info.current_sha != "unknown"
+                        && !short.starts_with(&info.current_sha)
+                        && !info.current_sha.starts_with(short);
                     info.error = None;
                 }
             }
@@ -303,7 +439,10 @@ struct UpdateOutput {
 fn current_app_bundle() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         // exe = <Bundle>.app/Contents/MacOS/pi-app
-        if let Some(bundle) = exe.ancestors().find(|p| p.extension().map(|e| e == "app").unwrap_or(false)) {
+        if let Some(bundle) = exe
+            .ancestors()
+            .find(|p| p.extension().map(|e| e == "app").unwrap_or(false))
+        {
             return bundle.to_path_buf();
         }
     }
@@ -317,7 +456,87 @@ pub async fn app_update_run(app: AppHandle, source_repo: String) -> Result<Strin
     app_update_run_impl(app, source_repo).await
 }
 
-pub async fn app_update_run_impl<R: Runtime>(app: AppHandle<R>, source_repo: String) -> Result<String, String> {
+/// Скачать .dmg из GitHub Releases, смонтировать его и атомарно скопировать
+/// .app поверх текущего бандла. Текущее приложение продолжает работать; новая
+/// версия подхватится после обычного перезапуска.
+#[tauri::command]
+pub async fn app_update_install_release(
+    app: AppHandle,
+    asset_url: String,
+) -> Result<String, String> {
+    if !asset_url.starts_with("https://github.com/NickLitwinow/pi-app/releases/download/")
+        || !asset_url.to_ascii_lowercase().ends_with(".dmg")
+    {
+        return Err("разрешена установка только .dmg из официальных GitHub Releases pi-app".into());
+    }
+    let run_id = format!("release-{}", RUN_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let bundle = current_app_bundle();
+    let tmp = std::env::temp_dir().join(format!("pi-app-update-{}", std::process::id()));
+    let dmg = tmp.join("Pi-update.dmg");
+    let mount = tmp.join("mount");
+    let command = format!(
+        "set -e; mounted=0; cleanup() {{ \
+           if [ \"$mounted\" = 1 ]; then /usr/bin/hdiutil detach {mount} >/dev/null 2>&1 || true; fi; \
+           /bin/rm -rf {tmp}; \
+         }}; trap cleanup EXIT; /bin/rm -rf {tmp}; /bin/mkdir -p {mount}; \
+         /usr/bin/curl -fL --progress-bar {url} -o {dmg}; \
+         /usr/bin/hdiutil attach -nobrowse -readonly -mountpoint {mount} {dmg}; mounted=1; \
+         candidate=$(/usr/bin/find {mount} -maxdepth 1 -type d -name '*.app' -print -quit); \
+         test -n \"$candidate\"; \
+         test \"$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \"$candidate/Contents/Info.plist\")\" = 'dev.litwein.piapp'; \
+         /usr/bin/codesign --verify --deep --strict \"$candidate\"; \
+         /usr/bin/ditto \"$candidate\" {bundle}; \
+         /usr/bin/hdiutil detach {mount}; mounted=0",
+        tmp = shell_quote(&tmp.to_string_lossy()),
+        mount = shell_quote(&mount.to_string_lossy()),
+        dmg = shell_quote(&dmg.to_string_lossy()),
+        url = shell_quote(&asset_url),
+        bundle = shell_quote(&bundle.to_string_lossy()),
+    );
+    let app2 = app.clone();
+    let run_id2 = run_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = app2.emit(
+            "app-update-output",
+            UpdateOutput {
+                run_id: run_id2.clone(),
+                line: Some("▶ Фоновая загрузка и установка готового релиза".into()),
+                done: false,
+                code: None,
+            },
+        );
+        let code = stream_shell(&app2, &run_id2, "/", &command).await;
+        let line = if code == 0 {
+            "✓ Новая версия установлена. Перезапустите приложение, когда будет удобно."
+        } else {
+            "✗ Не удалось установить релиз. Можно использовать пересборку из исходников."
+        };
+        let _ = app2.emit(
+            "app-update-output",
+            UpdateOutput {
+                run_id: run_id2.clone(),
+                line: Some(line.into()),
+                done: false,
+                code: None,
+            },
+        );
+        let _ = app2.emit(
+            "app-update-output",
+            UpdateOutput {
+                run_id: run_id2,
+                line: None,
+                done: true,
+                code: Some(code),
+            },
+        );
+    });
+    Ok(run_id)
+}
+
+pub async fn app_update_run_impl<R: Runtime>(
+    app: AppHandle<R>,
+    source_repo: String,
+) -> Result<String, String> {
     let repo = PathBuf::from(&source_repo);
     if !source_repo_valid(&repo) {
         return Err("указанный каталог не является исходниками pi-app (нужен git-репозиторий с package.json name=pi-app)".into());
@@ -332,14 +551,28 @@ pub async fn app_update_run_impl<R: Runtime>(app: AppHandle<R>, source_repo: Str
         let emit_line = |line: String| {
             let _ = app2.emit(
                 "app-update-output",
-                UpdateOutput { run_id: run_id2.clone(), line: Some(line), done: false, code: None },
+                UpdateOutput {
+                    run_id: run_id2.clone(),
+                    line: Some(line),
+                    done: false,
+                    code: None,
+                },
             );
         };
         // шаги пайплайна; каждая команда через login-shell (нужен PATH к node/npm/cargo)
         let steps: Vec<(String, String)> = vec![
-            ("Обновление исходников (git pull)".into(), "git pull --ff-only".into()),
-            ("Установка зависимостей (npm install)".into(), "npm install --no-audit --no-fund".into()),
-            ("Сборка приложения (tauri build) — это займёт несколько минут".into(), "npm run tauri build".into()),
+            (
+                "Обновление исходников (git pull)".into(),
+                "git pull --ff-only".into(),
+            ),
+            (
+                "Установка зависимостей (npm install)".into(),
+                "npm install --no-audit --no-fund".into(),
+            ),
+            (
+                "Сборка приложения (tauri build) — это займёт несколько минут".into(),
+                "npm run tauri build".into(),
+            ),
         ];
 
         for (title, cmd) in steps {
@@ -347,8 +580,18 @@ pub async fn app_update_run_impl<R: Runtime>(app: AppHandle<R>, source_repo: Str
             emit_line(format!("$ {cmd}"));
             let code = stream_shell(&app2, &run_id2, &repo_str, &cmd).await;
             if code != 0 {
-                emit_line(format!("✗ шаг завершился с кодом {code} — обновление прервано"));
-                let _ = app2.emit("app-update-output", UpdateOutput { run_id: run_id2.clone(), line: None, done: true, code: Some(code) });
+                emit_line(format!(
+                    "✗ шаг завершился с кодом {code} — обновление прервано"
+                ));
+                let _ = app2.emit(
+                    "app-update-output",
+                    UpdateOutput {
+                        run_id: run_id2.clone(),
+                        line: None,
+                        done: true,
+                        code: Some(code),
+                    },
+                );
                 return;
             }
         }
@@ -357,18 +600,40 @@ pub async fn app_update_run_impl<R: Runtime>(app: AppHandle<R>, source_repo: Str
         let built = format!("{repo_str}/src-tauri/target/release/bundle/macos/Pi.app");
         if !Path::new(&built).exists() {
             emit_line("✗ собранный Pi.app не найден — проверьте вывод сборки".into());
-            let _ = app2.emit("app-update-output", UpdateOutput { run_id: run_id2.clone(), line: None, done: true, code: Some(1) });
+            let _ = app2.emit(
+                "app-update-output",
+                UpdateOutput {
+                    run_id: run_id2.clone(),
+                    line: None,
+                    done: true,
+                    code: Some(1),
+                },
+            );
             return;
         }
         emit_line(format!("▶ Установка новой версии в {}", bundle.display()));
-        let ditto = format!("/usr/bin/ditto {} {}", shell_quote(&built), shell_quote(&bundle.to_string_lossy()));
+        let ditto = format!(
+            "/usr/bin/ditto {} {}",
+            shell_quote(&built),
+            shell_quote(&bundle.to_string_lossy())
+        );
         let code = stream_shell(&app2, &run_id2, &repo_str, &ditto).await;
         if code != 0 {
             emit_line(format!("✗ установка не удалась (код {code})"));
         } else {
-            emit_line("✓ Готово. Нажмите «Перезапустить», чтобы запустить обновлённую версию.".into());
+            emit_line(
+                "✓ Готово. Нажмите «Перезапустить», чтобы запустить обновлённую версию.".into(),
+            );
         }
-        let _ = app2.emit("app-update-output", UpdateOutput { run_id: run_id2.clone(), line: None, done: true, code: Some(code) });
+        let _ = app2.emit(
+            "app-update-output",
+            UpdateOutput {
+                run_id: run_id2.clone(),
+                line: None,
+                done: true,
+                code: Some(code),
+            },
+        );
     });
 
     Ok(run_id)
@@ -381,21 +646,42 @@ fn shell_quote(s: &str) -> String {
 /// Запустить команду в login-shell с cwd=repo, стримя stdout+stderr. Возвращает код.
 async fn stream_shell<R: Runtime>(app: &AppHandle<R>, run_id: &str, cwd: &str, cmd: &str) -> i32 {
     let full = format!("cd {} && {}", shell_quote(cwd), cmd);
-    let mut child = match Command::new("/bin/zsh")
+    let mut command = Command::new("/bin/zsh");
+    command
         .args(["-lc", &full])
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = app.emit("app-update-output", UpdateOutput { run_id: run_id.to_string(), line: Some(format!("ошибка запуска: {e}")), done: false, code: None });
+            let _ = app.emit(
+                "app-update-output",
+                UpdateOutput {
+                    run_id: run_id.to_string(),
+                    line: Some(format!("ошибка запуска: {e}")),
+                    done: false,
+                    code: None,
+                },
+            );
             return 127;
         }
     };
+    let child_pid = child.id();
+    if let Some(pid) = child_pid {
+        if let Ok(mut groups) = RUNNING_GROUPS.lock() {
+            groups.insert(pid);
+        }
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     for reader in [
@@ -411,11 +697,25 @@ async fn stream_shell<R: Runtime>(app: &AppHandle<R>, run_id: &str, cwd: &str, c
             let mut lines = BufReader::new(reader).lines();
             while let Ok(Some(mut line)) = lines.next_line().await {
                 line.truncate(4000);
-                let _ = app.emit("app-update-output", UpdateOutput { run_id: run_id.clone(), line: Some(line), done: false, code: None });
+                let _ = app.emit(
+                    "app-update-output",
+                    UpdateOutput {
+                        run_id: run_id.clone(),
+                        line: Some(line),
+                        done: false,
+                        code: None,
+                    },
+                );
             }
         });
     }
-    child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1)
+    let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+    if let Some(pid) = child_pid {
+        if let Ok(mut groups) = RUNNING_GROUPS.lock() {
+            groups.remove(&pid);
+        }
+    }
+    code
 }
 
 /// Перезапустить приложение (после установки обновления).
@@ -428,6 +728,20 @@ pub fn relaunch_app(app: AppHandle) {
 mod tests {
     use super::*;
     use std::process::Command as StdCommand;
+
+    #[test]
+    fn selects_arch_specific_release_dmg() {
+        let arch = if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x64"
+        };
+        let value = serde_json::json!({ "assets": [
+            { "name": "Pi-universal.dmg", "browser_download_url": "https://x/universal.dmg" },
+            { "name": format!("Pi-{arch}.dmg"), "browser_download_url": "https://x/native.dmg" }
+        ]});
+        assert_eq!(release_dmg(&value).as_deref(), Some("https://x/native.dmg"));
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let ok = StdCommand::new("git")
@@ -452,7 +766,12 @@ mod tests {
             .unwrap();
         let work = tmp.path().join("work");
         StdCommand::new("git")
-            .args(["clone", "-q", origin.to_str().unwrap(), work.to_str().unwrap()])
+            .args([
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ])
             .output()
             .unwrap();
         git(&work, &["config", "user.email", "t@t.dev"]);
@@ -485,7 +804,10 @@ mod tests {
             .unwrap();
         // первый клон делает коммит и пушит
         let a = tmp.path().join("a");
-        StdCommand::new("git").args(["clone", "-q", origin.to_str().unwrap(), a.to_str().unwrap()]).output().unwrap();
+        StdCommand::new("git")
+            .args(["clone", "-q", origin.to_str().unwrap(), a.to_str().unwrap()])
+            .output()
+            .unwrap();
         git(&a, &["config", "user.email", "t@t.dev"]);
         git(&a, &["config", "user.name", "t"]);
         std::fs::write(a.join("f.txt"), "1\n").unwrap();
@@ -495,7 +817,10 @@ mod tests {
 
         // второй клон отстаёт после нового коммита в origin через первый клон
         let b = tmp.path().join("b");
-        StdCommand::new("git").args(["clone", "-q", origin.to_str().unwrap(), b.to_str().unwrap()]).output().unwrap();
+        StdCommand::new("git")
+            .args(["clone", "-q", origin.to_str().unwrap(), b.to_str().unwrap()])
+            .output()
+            .unwrap();
         git(&b, &["config", "user.email", "t@t.dev"]);
         git(&b, &["config", "user.name", "t"]);
 

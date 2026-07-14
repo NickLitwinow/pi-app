@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { getBackend } from "../lib/backend";
 import { messageDialog } from "../lib/dialog";
 import { stripAnsi } from "../lib/markdown";
 import { contentText } from "../lib/reducer";
+import { modelAliasKey, modelDisplayName, modelIdDisplayName } from "../lib/models";
 import type { ExtUiRequest, GitSummary, ModelInfo } from "../lib/types";
 import {
   abortAgent,
@@ -22,15 +24,20 @@ import {
   setModel,
   setThinkingLevel,
   toggleMessagePin,
+  updateAppConfig,
   useStore,
   emptyWorkspaceChat,
+  effectiveModel,
+  effectiveThinking,
   type AgentMode,
   type WorkspaceChat,
 } from "../state/store";
-import { MessageView, Toasts } from "./MessageView";
+import { ExpandedProvider, MessageView, RunActivitySummary, RunFilesCard, Toasts } from "./MessageView";
+import { buildTranscript } from "../lib/transcript";
 import StartScreen from "./StartScreen";
 import PreviewPane from "./PreviewView";
-import { ImageIcon, MinusIcon, ModelIcon, PaperclipIcon, PinIcon, PlusIcon, PreviewIcon, SendIcon, ShieldIcon, StopIcon } from "./icons";
+import { ModelAvatar, ModelAvatarPicker } from "./AgentAvatar";
+import { ChevronIcon, EditIcon, ImageIcon, MinusIcon, ModelIcon, PaperclipIcon, PinIcon, PlusIcon, PreviewIcon, SendIcon, ShieldIcon, SteerIcon, StopIcon } from "./icons";
 
 // ---------- agent mode selector ----------
 
@@ -41,6 +48,83 @@ const MODES: { id: AgentMode; label: string; desc: string }[] = [
   { id: "auto", label: "Auto mode", desc: "Всё разрешено, опасные команды — с подтверждением" },
   { id: "bypass", label: "Bypass permissions", desc: "Без ограничений (yolo) — на свой риск" },
 ];
+
+const TRANSCRIPT_MODES = [
+  { id: "summary", label: "Summary", title: "Только ответы, активные и ошибочные инструменты" },
+  { id: "normal", label: "Normal", title: "Ответы и свёрнутые карточки инструментов" },
+  { id: "verbose", label: "Verbose", title: "Полный thinking и раскрытые результаты инструментов" },
+] as const;
+
+function PillSelect<T extends string>({
+  value,
+  options,
+  onChange,
+  title,
+  disabled,
+}: {
+  value: T;
+  options: readonly { value: T; label: string; title?: string }[];
+  onChange: (value: T) => void;
+  title: string;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const current = options.find((option) => option.value === value) ?? options[0];
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("mousedown", closeOutside);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("mousedown", closeOutside);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  return (
+    <div className="inline-select" ref={rootRef}>
+      <button type="button" className="chip" disabled={disabled} aria-expanded={open} onClick={() => setOpen(!open)}>
+        {current?.label}<ChevronIcon size={11} open={open} />
+      </button>
+      {open && (
+        <div className="inline-select-menu" role="listbox" aria-label={title}>
+          {options.map((option) => (
+            <button
+              type="button"
+              key={option.value}
+              className={option.value === value ? "active" : ""}
+              role="option"
+              aria-selected={option.value === value}
+              onClick={() => { setOpen(false); onChange(option.value); }}
+            >
+              <span className="inline-select-option"><strong>{option.label}</strong>{option.title && <small>{option.title}</small>}</span>
+              {option.value === value && <span>✓</span>}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TranscriptModeSelector() {
+  const value = useStore((s) => s.appConfig.transcriptMode ?? "normal");
+  return (
+    <PillSelect
+      value={value}
+      title="Режим ленты"
+      options={TRANSCRIPT_MODES.map((mode) => ({ value: mode.id, label: mode.label, title: mode.title }))}
+      onChange={(transcriptMode) => void updateAppConfig({ transcriptMode })}
+    />
+  );
+}
 
 function ModeSelector({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const [open, setOpen] = useState(false);
@@ -168,17 +252,39 @@ function useWorkspace(cwd: string | null): WorkspaceChat {
 function ModelPicker({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
-  const current = ws.agentState?.model;
+  const [aliasModel, setAliasModel] = useState<ModelInfo | null>(null);
+  const [aliasDraft, setAliasDraft] = useState("");
+  const piDefaults = useStore((s) => s.piDefaults);
+  // до старта агента список берём из models.json, а текущую — из дефолтов pi
+  const current = effectiveModel(ws, piDefaults);
+  const aliases = useStore((s) => s.appConfig.modelAliases ?? {});
 
   const filtered = useMemo(() => {
-    const list = ws.models;
+    const list = ws.models.length > 0 ? ws.models : piDefaults.catalog;
     const query = q.toLowerCase();
-    return query ? list.filter((m) => `${m.provider}/${m.id}`.toLowerCase().includes(query)) : list;
-  }, [ws.models, q]);
+    return query
+      ? list.filter((m) => `${m.provider}/${m.id} ${modelDisplayName(m, aliases)}`.toLowerCase().includes(query))
+      : list;
+  }, [ws.models, piDefaults.catalog, q, aliases]);
 
   const pick = async (m: ModelInfo) => {
     setOpen(false);
     await setModel(cwd, m.provider, m.id).catch(() => {});
+  };
+
+  const editAlias = (m: ModelInfo) => {
+    setAliasModel(m);
+    setAliasDraft(aliases[modelAliasKey(m.provider, m.id)] ?? "");
+  };
+
+  const saveAlias = async () => {
+    if (!aliasModel) return;
+    const key = modelAliasKey(aliasModel.provider, aliasModel.id);
+    const next = { ...aliases };
+    if (aliasDraft.trim()) next[key] = aliasDraft.trim();
+    else delete next[key];
+    await updateAppConfig({ modelAliases: next });
+    setAliasModel(null);
   };
 
   return (
@@ -191,27 +297,66 @@ function ModelPicker({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
           if (!open && ws.models.length === 0 && ws.alive) await loadModelsAndCommands(cwd);
         }}
       >
-        <ModelIcon size={12} /> {current ? shortModel(current.id) : "модель"}
+        {current
+          ? <ModelAvatar modelKey={modelAliasKey(current.provider, current.id)} size={17} working={ws.liveStreaming} />
+          : <ModelIcon size={12} motion={open ? "pulse" : undefined} />}
+        {current ? shortModel(modelDisplayName(current, aliases)) : "модель"}
       </button>
       {open && (
         <div className="dropdown" onMouseLeave={() => setOpen(false)}>
           <input autoFocus placeholder="Поиск модели…" value={q} onChange={(e) => setQ(e.target.value)} />
+          {aliasModel && (
+            <div className="model-alias-editor">
+              <ModelAvatarPicker modelKey={modelAliasKey(aliasModel.provider, aliasModel.id)} size={32} working={current?.provider === aliasModel.provider && current?.id === aliasModel.id && ws.liveStreaming} />
+              <div>
+                <strong>Название в интерфейсе</strong>
+                <span>{aliasModel.provider}/{aliasModel.id}</span>
+              </div>
+              <input
+                autoFocus
+                placeholder="Например: Claude Opus 4.7"
+                value={aliasDraft}
+                onChange={(e) => setAliasDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void saveAlias();
+                  if (e.key === "Escape") setAliasModel(null);
+                }}
+              />
+              <div className="row">
+                <button onClick={() => setAliasModel(null)}>Отмена</button>
+                <button className="primary" onClick={() => void saveAlias()}>Сохранить</button>
+              </div>
+            </div>
+          )}
           <div className="dd-list">
-            {filtered.length === 0 && <div className="dd-item">{ws.alive ? "Нет моделей" : "Агент не запущен"}</div>}
+            {filtered.length === 0 && (
+              <div className="dd-item">{ws.alive || piDefaults.catalog.length > 0 ? "Нет моделей" : "Модели не найдены в models.json"}</div>
+            )}
             {filtered.map((m) => (
               <div
                 key={`${m.provider}/${m.id}`}
                 className={`dd-item ${current?.id === m.id ? "sel" : ""}`}
                 onClick={() => void pick(m)}
               >
-                <div>
-                  <div>{m.id}</div>
+                <ModelAvatar modelKey={modelAliasKey(m.provider, m.id)} size={25} working={current?.provider === m.provider && current?.id === m.id && ws.liveStreaming} />
+                <div className="model-option-copy">
+                  <div>{modelDisplayName(m, aliases)}</div>
                   <div className="dd-sub">
-                    {m.provider}
+                    {m.provider}/{m.id}
                     {m.contextWindow ? ` · ${Math.round(m.contextWindow / 1000)}k ctx` : ""}
                     {m.reasoning ? " · reasoning" : ""}
                   </div>
                 </div>
+                <button
+                  className="model-alias-button"
+                  title="Задать отображаемое название"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    editAlias(m);
+                  }}
+                >
+                  <EditIcon size={12} />
+                </button>
               </div>
             ))}
           </div>
@@ -395,8 +540,11 @@ interface Attachment {
 }
 
 function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
+  const piDefaults = useStore((s) => s.piDefaults);
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [contextFiles, setContextFiles] = useState<string[]>([]);
+  const [previewAttachment, setPreviewAttachment] = useState<Attachment | null>(null);
   const [palIdx, setPalIdx] = useState(0);
   // Esc скрывает палитру команд, НЕ стирая ввод; следующее изменение текста показывает снова
   const [palHidden, setPalHidden] = useState(false);
@@ -404,6 +552,9 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const streaming = ws.chat.isStreaming;
   const pendingInsert = useStore((s) => s.pendingInsert);
+  const pendingFiles = useStore((s) => s.pendingFiles);
+  const sendKeyBehavior = useStore((s) => s.appConfig.sendKeyBehavior ?? "enter");
+  const canSendImages = ws.agentState?.model?.input?.includes("image") ?? true;
 
   // автофокус при смене workspace / открытии чата
   useEffect(() => {
@@ -418,6 +569,31 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
       taRef.current?.focus();
     }
   }, [pendingInsert]);
+
+  // Finder drop: vision models receive image blocks; everything else stays as
+  // an explicit path-context chip instead of leaking base64 into the prompt.
+  useEffect(() => {
+    if (!pendingFiles?.length) return;
+    useStore.getState().set({ pendingFiles: null });
+    void (async () => {
+      const be = await getBackend();
+      const imageExtensions = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
+      const paths: string[] = [];
+      for (const path of pendingFiles) {
+        const extension = path.split(".").pop()?.toLowerCase() ?? "";
+        if (canSendImages && imageExtensions.has(extension)) {
+          const file = await be.invoke<{ data: string; mimeType: string }>("read_file_base64", { path }).catch(() => null);
+          if (file) {
+            setAttachments((current) => [...current, { ...file, name: path.split("/").pop() ?? path }]);
+            continue;
+          }
+        }
+        paths.push(path);
+      }
+      if (paths.length) setContextFiles((current) => [...new Set([...current, ...paths])]);
+      taRef.current?.focus();
+    })();
+  }, [pendingFiles, canSendImages]);
 
   // extension prefill (set_editor_text)
   useEffect(() => {
@@ -487,21 +663,25 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   useEffect(() => setPalIdx(0), [paletteItems.length]);
   useEffect(() => setAtIdx(0), [atItems.length]);
 
-  const canSendImages = ws.agentState?.model?.input?.includes("image") ?? true;
-
   const submit = async (followUp = false) => {
     const t = text.trim();
     if (!t) return;
+    const prompt = contextFiles.length > 0
+      ? `${t}\n\n${contextFiles.map((path) => path.includes(" ") ? `"${path}"` : path).join("\n")}`
+      : t;
     setText("");
     const imgs = attachments;
     setAttachments([]);
+    const files = contextFiles;
+    setContextFiles([]);
     try {
-      if (followUp) await sendFollowUp(cwd, t);
-      else await sendPrompt(cwd, t, imgs.length ? imgs : undefined);
+      if (followUp) await sendFollowUp(cwd, prompt);
+      else await sendPrompt(cwd, prompt, imgs.length ? imgs : undefined);
     } catch (e) {
       // вернуть текст и attachments, показать причину (напр. агент занят другой сессией)
       setText(t);
       setAttachments(imgs);
+      setContextFiles(files);
       notifyChat(cwd, "warning", e instanceof Error ? e.message : String(e));
     }
   };
@@ -550,9 +730,27 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         return;
       }
     }
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "ArrowUp" && !text && !streaming) {
+      const last = [...ws.chat.items].reverse().find((item) => item.msg.role === "user" && !item.viaExtension);
+      const previous = last ? contentText(last.msg.content) : "";
+      if (previous) {
+        e.preventDefault();
+        setText(previous);
+      }
+      return;
+    }
+    if (e.key === "Enter" && e.shiftKey && (e.metaKey || e.ctrlKey) && streaming) {
       e.preventDefault();
-      void submit(e.altKey);
+      void submit(false);
+      return;
+    }
+    if (e.key === "Enter") {
+      const mod = e.metaKey || e.ctrlKey;
+      const shouldSend = sendKeyBehavior === "mod-enter" ? mod : !e.shiftKey && !mod;
+      if (shouldSend) {
+        e.preventDefault();
+        void submit(streaming && e.altKey);
+      }
     }
     if (e.key === "Escape" && streaming) {
       void abortAgent(cwd);
@@ -591,11 +789,11 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         const f = await be.invoke<{ data: string; mimeType: string }>("read_file_base64", { path: p }).catch(() => null);
         if (f) setAttachments((a) => [...a, { ...f, name: p.split("/").pop() ?? p }]);
       } else {
-        textParts.push(p.includes(" ") ? `"${p}"` : p);
+        textParts.push(p);
       }
     }
     if (textParts.length) {
-      setText((t) => (t ? `${t} ${textParts.join(" ")}` : textParts.join(" ")));
+      setContextFiles((current) => [...new Set([...current, ...textParts])]);
       taRef.current?.focus();
     }
   };
@@ -610,12 +808,12 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         </div>
       ))}
       {(ws.chat.queue.steering.length > 0 || ws.chat.queue.followUp.length > 0) && (
-        <div className="queue">
+        <div className="queue" aria-label="Очередь сообщений агенту">
           {ws.chat.queue.steering.map((m, i) => (
-            <div key={`s${i}`} className="q-item">steer » {m.slice(0, 120)}</div>
+            <div key={`s${i}`} className="q-item steer"><SteerIcon size={12} /> <span>Вмешательство</span><strong>{m.slice(0, 120)}</strong></div>
           ))}
           {ws.chat.queue.followUp.map((m, i) => (
-            <div key={`f${i}`} className="q-item">затем ↳ {m.slice(0, 120)}</div>
+            <div key={`f${i}`} className="q-item follow"><SendIcon size={12} /> <span>Следом</span><strong>{m.slice(0, 120)}</strong></div>
           ))}
         </div>
       )}
@@ -660,7 +858,7 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
           rows={1}
           placeholder={
             streaming
-              ? "Enter — вмешаться (steer), ⌥Enter — после завершения, Esc — стоп"
+              ? `${sendKeyBehavior === "mod-enter" ? "⌘Enter" : "Enter"} — вмешаться (steer), ⌥ — после завершения, Esc — стоп`
               : `Сообщение для агента в ${cwd.split("/").pop()}… (/ — команды)`
           }
           value={text}
@@ -671,30 +869,37 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         {attachments.length > 0 && (
           <div className="row" style={{ flexWrap: "wrap", marginTop: 4 }}>
             {attachments.map((a, i) => (
-              <span key={i} className="chip" style={{ background: "var(--accent-soft)" }}>
-                <ImageIcon size={12} /> {a.name}
+              <span key={i} className="chip attachment-chip image" style={{ background: "var(--accent-soft)" }}>
+                <button className="attachment-open" title={`Открыть ${a.name}`} onClick={() => setPreviewAttachment(a)}><ImageIcon size={12} /> {a.name}</button>
+                <small className="attachment-mode">vision</small>
                 <button onClick={() => setAttachments(attachments.filter((_, j) => j !== i))}>×</button>
               </span>
+            ))}
+            {contextFiles.map((path) => (
+              <span key={path} className="chip attachment-chip">
+                <PaperclipIcon size={11} /> <span title={path}>{path.split("/").pop()}</span><small className="attachment-mode">path</small>
+                <button onClick={() => setContextFiles(contextFiles.filter((item) => item !== path))}>×</button>
+              </span>
+            ))}
+          </div>
+        )}
+        {attachments.length === 0 && contextFiles.length > 0 && (
+          <div className="row context-file-row">
+            {contextFiles.map((path) => (
+              <span key={path} className="chip attachment-chip"><PaperclipIcon size={11} /><span title={path}>{path.split("/").pop()}</span><small className="attachment-mode">path</small><button onClick={() => setContextFiles(contextFiles.filter((item) => item !== path))}>×</button></span>
             ))}
           </div>
         )}
         <div className="c-row">
           <ModelPicker cwd={cwd} ws={ws} />
           <ModeSelector cwd={cwd} ws={ws} />
-          <select
-            className="chip"
-            style={{ border: "none", background: "none", padding: "3px 4px" }}
-            value={ws.agentState?.thinkingLevel ?? "high"}
-            disabled={!ws.alive}
-            onChange={(e) => void setThinkingLevel(cwd, e.target.value).catch(() => {})}
+          {/* до старта агента доступен: значение из дефолтов pi, выбор применится при спавне */}
+          <PillSelect
+            value={effectiveThinking(ws, piDefaults)}
             title="Уровень размышлений"
-          >
-            {THINKING_LEVELS.map((l) => (
-              <option key={l} value={l}>
-                thinking: {l}
-              </option>
-            ))}
-          </select>
+            options={THINKING_LEVELS.map((level) => ({ value: level, label: `thinking: ${level}` }))}
+            onChange={(level) => void setThinkingLevel(cwd, level).catch(() => {})}
+          />
           <input ref={fileRef} type="file" accept="image/*" multiple hidden onChange={(e) => addFiles(e.target.files)} />
           <button
             title={canSendImages ? "Прикрепить файлы или изображения" : "Прикрепить файлы (пути — модель text-only)"}
@@ -706,16 +911,40 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
           {ws.chat.isCompacting && <span className="hint">Сжатие контекста…</span>}
           {ws.chat.retryInfo && <span className="hint" style={{ color: "var(--warn)" }}>{ws.chat.retryInfo}</span>}
           {streaming ? (
-            <button className="danger" title="Остановить (Esc)" onClick={() => void abortAgent(cwd)}>
-              <StopIcon size={15} />
-            </button>
+            <>
+              <button
+                className="steer-action"
+                title={`Вмешаться в текущий ход (${sendKeyBehavior === "mod-enter" ? "⌘Enter" : "Enter"})`}
+                disabled={!text.trim()}
+                onClick={() => void submit(false)}
+              >
+                <SteerIcon size={14} motion="lift" /> Steer
+              </button>
+              <button
+                title="Поставить сообщение после текущего хода (⌥Enter)"
+                disabled={!text.trim()}
+                onClick={() => void submit(true)}
+              >
+                Затем
+              </button>
+              <button className="danger" title="Остановить (Esc)" onClick={() => void abortAgent(cwd)}>
+                <StopIcon size={15} />
+              </button>
+            </>
           ) : (
-            <button className="primary" title="Отправить (Enter)" disabled={!text.trim()} onClick={() => void submit()}>
-              <SendIcon size={14} />
+            <button className="primary" title={`Отправить (${sendKeyBehavior === "mod-enter" ? "⌘Enter" : "Enter"})`} disabled={!text.trim()} onClick={() => void submit()}>
+              <SendIcon size={14} motion={text.trim() ? "lift" : undefined} />
             </button>
           )}
         </div>
       </div>
+      {previewAttachment && (
+        <div className="attachment-lightbox" role="dialog" aria-modal="true" aria-label={previewAttachment.name} onClick={() => setPreviewAttachment(null)}>
+          <button className="attachment-lightbox-close" title="Закрыть" onClick={() => setPreviewAttachment(null)}>×</button>
+          <img src={`data:${previewAttachment.mimeType};base64,${previewAttachment.data}`} alt={previewAttachment.name} onClick={(event) => event.stopPropagation()} />
+          <span>{previewAttachment.name}</span>
+        </div>
+      )}
       <StatusLine ws={ws} cwd={cwd} />
     </div>
   );
@@ -908,39 +1137,57 @@ function fmtNum(n: number): string {
 
 // ---------- processing indicator ----------
 
-function ProcessingIndicator({ startedAt }: { startedAt: number | null }) {
+export const MODEL_ACTIVITY_LABELS = [
+  "размышляет",
+  "анализирует запрос",
+  "изучает контекст",
+  "осматривается",
+  "планирует шаги",
+  "проверяет детали",
+  "исследует варианты",
+  "сопоставляет данные",
+  "формулирует ответ",
+] as const;
+
+function ProcessingIndicator({ startedAt, model }: { startedAt: number | null; model?: ModelInfo }) {
   const [now, setNow] = useState(Date.now());
+  const [activityIndex, setActivityIndex] = useState(() => Math.floor(Math.random() * MODEL_ACTIVITY_LABELS.length));
+  const aliases = useStore((state) => state.appConfig.modelAliases ?? {});
+  const modelKey = model ? modelAliasKey(model.provider, model.id) : null;
+  const avatarConfig = useStore((state) => modelKey ? state.appConfig.modelAvatars?.[modelKey] : undefined);
+  const hasWorkingAvatar = Boolean(avatarConfig?.workingKind && avatarConfig.workingValue);
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setActivityIndex((current) => {
+        if (MODEL_ACTIVITY_LABELS.length < 2) return current;
+        const next = Math.floor(Math.random() * (MODEL_ACTIVITY_LABELS.length - 1));
+        return next >= current ? next + 1 : next;
+      });
+    }, 3_400);
+    return () => window.clearInterval(timer);
+  }, []);
   const secs = startedAt ? Math.max(0, Math.floor((now - startedAt) / 1000)) : 0;
+  const modelName = model ? modelDisplayName(model, aliases) : "Модель";
   return (
     <div className="processing">
-      <span className="pdots">
-        <i />
-        <i />
-        <i />
-      </span>
-      <span className="p-label">pi работает{secs > 2 ? ` · ${secs} с` : "…"}</span>
+      {modelKey && hasWorkingAvatar ? (
+        <ModelAvatar modelKey={modelKey} size={22} working title={`${modelName} работает`} />
+      ) : (
+        <span className="pdots" aria-hidden="true"><i /><i /><i /></span>
+      )}
+      <span className="p-label">{modelName} {MODEL_ACTIVITY_LABELS[activityIndex]}{secs > 2 ? ` · ${secs} с` : "…"}</span>
     </div>
   );
 }
 
-/** Есть ли у стримящегося сообщения видимый контент (текст/thinking/tool call). */
-function hasLiveContent(ws: WorkspaceChat): boolean {
-  const s = ws.chat.streaming;
-  if (!s) return false;
-  if (contentText(s.content).trim()) return true;
-  if (Array.isArray(s.content)) {
-    return s.content.some(
-      (b) =>
-        (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim()) ||
-        b.type === "toolCall",
-    );
-  }
-  return false;
+function ChatListHeader() {
+  return <div style={{ height: 18 }} />;
 }
+const CHAT_LIST_COMPONENTS = { Header: ChatListHeader };
 
 // ---------- pinned messages widget (компактный, слева сверху — как в Claude for Mac) ----------
 
@@ -1003,37 +1250,21 @@ function PinnedWidget({
 
 // ---------- message list ----------
 
-/** Окно рендера: длинные сессии не раздувают DOM (данные остаются в store). */
-const RENDER_WINDOW = 80;
-
 function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
-  const ref = useRef<HTMLDivElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const virtRef = useRef<VirtuosoHandle>(null);
   const [pinned, setPinned] = useState(true);
-  // сколько сообщений держим в DOM: инкрементально расширяем по «показать
-  // предыдущие», а не рендерим сразу тысячи (подсветка кода раздувает память).
-  const [renderLimit, setRenderLimit] = useState(RENDER_WINDOW);
-
-  useEffect(() => {
-    if (pinned && ref.current) ref.current.scrollTop = ref.current.scrollHeight;
-  }, [ws.chat.seq, pinned]);
-
-  // при смене сессии окно рендера сбрасывается
-  useEffect(() => setRenderLimit(RENDER_WINDOW), [cwd, ws.sessionPath]);
-
-  const onScroll = () => {
-    const el = ref.current;
-    if (!el) return;
-    setPinned(el.scrollHeight - el.scrollTop - el.clientHeight < 80);
-  };
+  const transcriptMode = useStore((s) => s.appConfig.transcriptMode ?? "normal");
 
   const jumpToPin = (pinId: string) => {
-    setRenderLimit(ws.chat.items.length); // раскрыть всё, чтобы долистать до пина
+    const index = ws.chat.items.findIndex((it) => msgPinId(it.msg) === pinId);
+    if (index < 0) return;
     setPinned(false);
-    // после расширения окна нужен коммит React — ждём кадр с запасом
+    virtRef.current?.scrollToIndex({ index, align: "center", behavior: "smooth" });
     setTimeout(() => {
-      const el = ref.current?.querySelector(`[data-pin="${pinId}"]`);
+      const el = rootRef.current?.querySelector(`[data-pin="${pinId}"]`);
       el?.scrollIntoView({ behavior: "smooth", block: "center" });
-    }, 60);
+    }, 120);
   };
 
   // ⌘F: поиск по сообщениям текущей сессии (E5-2)
@@ -1079,7 +1310,15 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
       }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    const onNativeFind = () => {
+      setSearchOpen(true);
+      setTimeout(() => searchInputRef.current?.focus(), 40);
+    };
+    window.addEventListener("pi:find-session", onNativeFind);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("pi:find-session", onNativeFind);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchOpen]);
 
@@ -1090,7 +1329,7 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
     if (!it) return;
     let el: HTMLElement | null = null;
     const t = setTimeout(() => {
-      const found = ref.current?.querySelector(`[data-pin="${msgPinId(it.msg)}"]`);
+      const found = rootRef.current?.querySelector(`[data-pin="${msgPinId(it.msg)}"]`);
       if (found instanceof HTMLElement) {
         el = found;
         el.classList.add("search-hit");
@@ -1105,13 +1344,44 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
 
   const empty = ws.chat.items.length === 0 && !ws.chat.streaming;
   const items = ws.chat.items;
-  const visible = items.length <= renderLimit ? items : items.slice(items.length - renderLimit);
-  const hiddenCount = items.length - visible.length;
-  // rewind/fork оперируют номером среди ВСЕХ пользовательских сообщений ветки
-  let userCounter = items.slice(0, hiddenCount).filter((it) => it.msg.role === "user").length;
+  const displayItems = useMemo(() => (
+    ws.chat.isStreaming || ws.chat.streaming || ws.chat.lastError
+      ? [...items, { key: "__live__", live: true as const }]
+      : items
+  ), [items, ws.chat.isStreaming, ws.chat.streaming, ws.chat.lastError]);
+  const userIndexes = useMemo(() => {
+    let userCounter = 0;
+    return items.map((it) => (it.msg.role === "user" ? userCounter++ : undefined));
+  }, [items]);
+  // Аватар модели — на первом сообщении каждой группы ответов (как в ChatGPT/
+  // Claude): user-сообщение или смена модели начинает новую группу. Модель
+  // берётся из msg.provider/msg.model — pi персистит их в файле сессии, так что
+  // авторство переживает перезапуски и смену активной модели.
+  const modelHeaderFlags = useMemo(() => {
+    let prevKey: string | null = null;
+    return items.map((it) => {
+      if (it.msg.role !== "assistant") {
+        if (it.msg.role === "user") prevKey = null;
+        return false;
+      }
+      const key = `${String(it.msg.provider ?? "")}/${String(it.msg.model ?? "")}`;
+      const show = key !== prevKey;
+      prevKey = key;
+      return show;
+    });
+  }, [items]);
+  // Codex-style сворачивание ходов: раскладку считает чистая buildTranscript
+  // (src/lib/transcript.ts) — её гоняют тесты на РЕАЛЬНОМ потоке событий pi.
+  const toolExecs = ws.chat.toolExecs;
+  const isStreaming = ws.chat.isStreaming;
+  const aliases = useStore((s) => s.appConfig.modelAliases ?? {});
+  const runPresentation = useMemo(
+    () => buildTranscript(items, toolExecs, isStreaming, transcriptMode),
+    [items, toolExecs, isStreaming, transcriptMode],
+  );
 
   return (
-    <div style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}>
+    <div ref={rootRef} style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}>
       {searchOpen && (
         <div className="chat-search">
           <input
@@ -1143,46 +1413,111 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         </div>
       )}
       <PinnedWidget cwd={cwd} ws={ws} onJump={jumpToPin} />
-      <div className="msg-scroll" ref={ref} onScroll={onScroll} style={{ flex: 1 }}>
-        {empty ? (
-          <StartScreen />
-        ) : (
-          <div className="msg-col">
-            {hiddenCount > 0 && (
-              <button className="show-earlier" onClick={() => setRenderLimit((l) => l + 200)}>
-                Показать предыдущие сообщения ({hiddenCount})
-              </button>
-            )}
-            {visible.map((it) => (
+      {empty ? (
+        <div className="msg-scroll" style={{ flex: 1 }}><StartScreen /></div>
+      ) : (
+        // Провайдер ВЫШЕ списка: раскрытые сводки/карточки переживают
+        // размонтирование виртуальных элементов при скролле
+        <ExpandedProvider>
+        <Virtuoso
+          ref={virtRef}
+          className="msg-scroll"
+          style={{ flex: 1 }}
+          data={displayItems}
+          computeItemKey={(_index, it) => it.key}
+          initialTopMostItemIndex={Math.max(0, displayItems.length - 1)}
+          followOutput={pinned ? "auto" : false}
+          atBottomStateChange={setPinned}
+          increaseViewportBy={{ top: 500, bottom: 700 }}
+          itemContent={(index, it) => {
+            if ("live" in it) {
+              return (
+                <div className="virtual-message virtual-footer">
+                  {ws.chat.streaming && (
+                    <MessageView
+                      msg={ws.chat.streaming}
+                      execs={ws.chat.toolExecs}
+                      streaming
+                      cwd={cwd}
+                      transcriptMode={transcriptMode}
+                      /* пока идёт ход, модель представляет «рабочий» аватар в индикаторе ниже */
+                      showModelHeader={false}
+                      liveTurn
+                      fallbackModel={ws.agentState?.model}
+                    />
+                  )}
+                  {/* Персистентный индикатор работы: держим его всё время стрима,
+                      чтобы «модель думает» не мигало между сообщениями хода. */}
+                  {ws.chat.isStreaming && (
+                    <ProcessingIndicator startedAt={ws.chat.streamStartedAt} model={ws.agentState?.model} />
+                  )}
+                  {ws.chat.lastError && (
+                    <div className="card" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
+                      {ws.chat.lastError}
+                    </div>
+                  )}
+                </div>
+              );
+            }
+            const mode = runPresentation.renderMode.get(index) ?? "full";
+            const summary = runPresentation.summaryAt.get(index);
+            const filesRun = runPresentation.filesAt.get(index);
+            return (
+            <div className="virtual-message">
+              {summary && (
+                <>
+                  {summary.modelId && (
+                    <div className="msg-model">
+                      <ModelAvatar
+                        modelKey={summary.provider ? modelAliasKey(summary.provider, summary.modelId) : summary.modelId}
+                        size={20}
+                        title={`Автор ответа: ${summary.provider ? `${summary.provider}/${summary.modelId}` : summary.modelId}`}
+                      />
+                      <span>
+                        {modelIdDisplayName(
+                          summary.provider ? modelAliasKey(summary.provider, summary.modelId) : summary.modelId,
+                          aliases,
+                        )}
+                      </span>
+                    </div>
+                  )}
+                  {/* id сводки = ключ первого сообщения хода: состояние «раскрыто»
+                      живёт в MessageList и переживает размонтирование виртуального
+                      элемента при скролле */}
+                  <RunActivitySummary
+                    summaryId={it.key}
+                    steps={summary.steps}
+                    durationMs={summary.durationMs}
+                    actionCount={summary.actionCount}
+                    failedCount={summary.failedCount}
+                    cwd={cwd}
+                  />
+                </>
+              )}
               <MessageView
-                key={it.key}
                 msg={it.msg}
                 execs={ws.chat.toolExecs}
                 cwd={cwd}
-                userIndex={it.msg.role === "user" ? userCounter++ : undefined}
+                userIndex={userIndexes[index]}
                 busy={ws.chat.isStreaming}
                 viaExtension={it.viaExtension}
+                transcriptMode={transcriptMode}
+                showModelHeader={!summary && modelHeaderFlags[index] && !runPresentation.liveTurnIndexes.has(index)}
+                liveTurn={runPresentation.liveTurnIndexes.has(index)}
+                render={mode}
               />
-            ))}
-            {ws.chat.streaming && (
-              <MessageView msg={ws.chat.streaming} execs={ws.chat.toolExecs} streaming cwd={cwd} />
-            )}
-            {ws.chat.isStreaming && !hasLiveContent(ws) && (
-              <ProcessingIndicator startedAt={ws.chat.streamStartedAt} />
-            )}
-            {ws.chat.lastError && (
-              <div className="card" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
-                {ws.chat.lastError}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+              {filesRun && <RunFilesCard run={filesRun} cwd={cwd} />}
+            </div>
+          );}}
+          components={CHAT_LIST_COMPONENTS}
+        />
+        </ExpandedProvider>
+      )}
       {!pinned && (
         <button
           className="newmsg-pill"
           onClick={() => {
-            if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+            virtRef.current?.scrollToIndex({ index: Math.max(0, displayItems.length - 1), align: "end", behavior: "smooth" });
             setPinned(true);
           }}
         >
@@ -1201,6 +1536,7 @@ export default function ChatView() {
   const previewOpen = useStore((s) => s.previewOpen);
   const set = useStore((s) => s.set);
   const uiScale = useStore((s) => s.appConfig.uiScale || 1);
+  const piDefaults = useStore((s) => s.piDefaults);
   const [previewWidth, setPreviewWidth] = useState(560);
 
   // drag-resize границы сплита чат/превью (физические координаты → делим на uiScale)
@@ -1228,7 +1564,7 @@ export default function ChatView() {
   // Агент НЕ спавнится при простом открытии workspace (pi-процесс с расширениями —
   // сотни МБ): ленивый спавн происходит в sendPrompt/ensureAgent по первому сообщению.
 
-  // drag&drop файлов из Finder → пути вставляются в composer
+  // drag&drop файлов из Finder → composer выбирает image block или path chip
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
@@ -1241,10 +1577,7 @@ export default function ChatView() {
           if (event.payload.type === "drop") {
             const paths = event.payload.paths ?? [];
             if (paths.length > 0) {
-              useStore.getState().set({
-                pendingInsert: paths.map((p) => (p.includes(" ") ? `"${p}"` : p)).join(" "),
-                view: "chat",
-              });
+              useStore.getState().set({ pendingFiles: paths, view: "chat" });
             }
           }
         });
@@ -1271,13 +1604,17 @@ export default function ChatView() {
 
   const sessionName = ws.agentState?.sessionName ?? (ws.sessionPath ? "Сессия" : "Новая сессия");
   const browsing = isBrowsingAway(ws);
+  // до старта агента — модель из дефолтов pi, чтобы аватар не пропадал
+  const currentModel = effectiveModel(ws, piDefaults);
 
   return (
     <div className="chat">
       <div className="topbar" data-tauri-drag-region>
+        {currentModel && <ModelAvatarPicker modelKey={modelAliasKey(currentModel.provider, currentModel.id)} size={20} working={ws.liveStreaming} />}
         <span className="title">{cwd.split("/").pop()}</span>
         <span className="sub">{String(sessionName)}</span>
         <div className="spacer" data-tauri-drag-region />
+        <TranscriptModeSelector />
         <button
           className={`chip ${previewOpen ? "active" : ""}`}
           onClick={() => set({ previewOpen: !previewOpen })}

@@ -1,7 +1,7 @@
 # Аудит скиллов pi и автоподбор под задачу
 
-**Дата:** 2026-07-11 · Дополняет [ROADMAP.md](ROADMAP.md) §5.1 (harness) и [AGENT-ENV.md](AGENT-ENV.md) (аудит окружения).
-**Модель:** [Qwable-v2](https://huggingface.co/lordx64/Qwable-v2) — см. §4 про её особенности; AGENTS.md переписан под неё (бэкап `~/.pi/agent/AGENTS.md.bak-20260711`).
+**Дата исходного среза:** 2026-07-11 · Дополняет [ROADMAP.md](ROADMAP.md) §5.1 (harness) и [AGENT-ENV.md](AGENT-ENV.md) (аудит окружения).
+**Актуализация:** полный повторный аудит 2026-07-13 — [HARNESS-EXTENSIONS-AUDIT-2026-07-13.md](HARNESS-EXTENSIONS-AUDIT-2026-07-13.md). Утверждения ниже про 7 активных skills и Qwable-v2 являются историческим срезом: сейчас package-provided skills увеличивают фактический набор до 17, а runtime-модель без зонда не подтверждена.
 
 ## 1. Что было (диагноз «несвязанная каша» подтверждён)
 

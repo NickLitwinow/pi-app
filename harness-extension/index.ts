@@ -13,6 +13,8 @@
  *
  * Анти-шум: слэш-команды игнорируются; todo/skill-наджи — один раз за ран;
  * verify-надж — максимум 2 раза за ран (35B склонна к лупам от повторов).
+ * По умолчанию все loop-guard'ы advisory-only: харнесс не должен становиться
+ * вторым permission-system. Жёсткая блокировка — только PI_APP_HARNESS_STRICT=1.
  * Выключатель: PI_APP_HARNESS=0. Отладочный лог: PI_APP_HARNESS_LOG=1 →
  * .pi/harness.log в рабочем каталоге.
  */
@@ -20,13 +22,18 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isStrictHarness, isVerifyCommand, needsSequentialThinking } from "./policy.js";
 
 type SkillInfo = { name: string; description?: string };
 
 const TODO_NUDGE =
-	"This looks like a multi-step task. BEFORE acting: create a todo list " +
-	"(use the todo tool if available, otherwise write a short numbered plan, 3–7 items), " +
-	"then work through it, keeping statuses current.";
+	"This may be a multi-step task. Use a short todo list only when it genuinely helps track work; " +
+	"for a straightforward change, proceed directly. Keep any plan proportional to the task.";
+
+const SEQUENTIAL_THINKING_NUDGE =
+	"This is a planning-heavy architecture/refactor task. If the sequential-thinking MCP tool is available, " +
+	"use it once as a structured scratchpad when it would clarify trade-offs or revisions. " +
+	"Do not force it for routine steps, and still provide the user a concise actionable result.";
 
 const VERIFY_NUDGE =
 	"Files were modified in this run and no command has been executed since. " +
@@ -34,21 +41,20 @@ const VERIFY_NUDGE =
 	"(follow the verify skill if installed) and report their REAL output.";
 
 const REPEAT_NUDGE =
-	"STOP: you just repeated the EXACT same tool call. A further repeat will be blocked. " +
-	"Take a DIFFERENT action: use the result you already have, change the arguments, or ask the user.";
+	"You just repeated the exact same tool call. Check whether the earlier result is already sufficient; " +
+	"if a retry is intentional (for changed external state), continue.";
 
 const TODO_LOOP_NUDGE =
-	"STOP: you are cycling todo updates without doing real work. Do NOT call todo again now — " +
-	"advance the current task with read/edit/bash first, then update its status once.";
+	"Several todo updates occurred without another work tool. Prefer advancing the current item before " +
+	"updating status again, unless the plan itself is the requested deliverable.";
 
 const CONTEXT_NUDGE =
-	"Context has grown past the reliable size for this model. FINISH the current todo item, " +
-	"then compact the session (or ask the user to /compact) BEFORE starting anything new. " +
-	"Prefer finishing over exploring; do not open new files unless strictly required.";
+	"Context is large. Consider finishing the current item and compacting before a new workstream. " +
+	"Continue reading or acting when it is necessary to complete the user's request.";
 
 const SUMMARY_NUDGE =
-	"All todos are complete. Give the user a concise summary NOW: what was changed (files), " +
-	"how it was verified (real command output), and anything left undone. Then STOP — no more tool calls.";
+	"All reported todos appear complete. If the requested outcome is genuinely finished, summarize changes, " +
+	"verification, and anything left; otherwise continue with the remaining work.";
 
 const REREAD_NUDGE =
 	"You are re-reading the same file in small slices. Read the needed range in ONE call " +
@@ -93,13 +99,6 @@ function isNonTrivial(prompt: string): boolean {
 	);
 }
 
-/** Команда, которая считается проверкой: тесты/линт/сборка/тайпчек популярных стеков. */
-function isVerifyCommand(cmd: string): boolean {
-	return /((npm|pnpm|yarn|bun)\s+(run\s+)?(test|check|lint|build|typecheck)|vitest|jest\b|pytest|cargo\s+(test|check|clippy|build)|go\s+(test|vet|build)|\btsc\b|eslint|ruff|mypy|make\s+(test|check|lint|build)|gradlew?\s+(test|check|build)|mvn\s+(test|verify)|ctest|swift\s+(test|build))/i.test(
-		cmd,
-	);
-}
-
 function matchSkill(prompt: string, skills: SkillInfo[]): SkillInfo | null {
 	const installed = new Map(skills.map((s) => [s.name, s]));
 	for (const [re, name] of SKILL_TRIGGERS) {
@@ -111,6 +110,7 @@ function matchSkill(prompt: string, skills: SkillInfo[]): SkillInfo | null {
 export default function harness(pi: ExtensionAPI) {
 	if (process.env.PI_APP_HARNESS === "0") return;
 	const debugLog = process.env.PI_APP_HARNESS_LOG === "1";
+	const strict = isStrictHarness(process.env.PI_APP_HARNESS_STRICT);
 
 	/** Одноразовые наджи, потребляются первым же `context` после старта рана. */
 	let pendingNudges: string[] = [];
@@ -155,7 +155,7 @@ export default function harness(pi: ExtensionAPI) {
 		hintedSkills.add(skill.name);
 		pendingNudges.push(
 			`The "${skill.name}" skill matches ${reason}${skill.description ? ` (${skill.description})` : ""}. ` +
-				"Read its SKILL.md now and follow it instead of improvising.",
+				"Read its SKILL.md if applicable; the user's explicit instructions and task scope take priority.",
 		);
 		log(`nudge: skill ${skill.name} [${reason}]`);
 	};
@@ -210,6 +210,10 @@ export default function harness(pi: ExtensionAPI) {
 			pendingNudges.push(TODO_NUDGE);
 			log("nudge: todo-first");
 		}
+		if (needsSequentialThinking(prompt)) {
+			pendingNudges.push(SEQUENTIAL_THINKING_NUDGE);
+			log("nudge: sequential-thinking");
+		}
 		// свежие факты → web-инструменты (H4): модель сама о них не вспоминает
 		if (/(найди в (интернете|сети)|погугли|поищи в|актуальн\w+ верси|последн\w+ верси|latest version|search the web|что нового в)/i.test(prompt)) {
 			pendingNudges.push(
@@ -225,8 +229,8 @@ export default function harness(pi: ExtensionAPI) {
 
 	// Анти-луп (§5.11-1): наблюдаемый отказ локальной 35B — карусель одинаковых
 	// вызовов (read того же файла, todo create→pending→completed) без прогресса.
-	// Эскалация: 2-й идентичный подряд → стоп-реминдер; 4-й → блокировка вызова.
-	// Todo-серия: 3 подряд без содержательной работы → реминдер; 6 → блок todo.
+	// Эскалация: 2-й идентичный подряд → реминдер; 4-й → блокировка вызова
+	// только в strict-режиме. Todo: 3 → реминдер, 6 → strict-блок.
 	pi.on("tool_call", async (ev, ctx) => {
 		const name = String(ev.toolName ?? "").toLowerCase();
 		let sig = name;
@@ -242,10 +246,14 @@ export default function harness(pi: ExtensionAPI) {
 			sameCallStreak = 1;
 		}
 
-		// Предохранитель: блокировки не останавливают генерацию — модель может
+		// Предохранитель strict-режима: блокировки не останавливают генерацию — модель может
 		// пробовать бесконечно (наблюдалось BLOCK todo x20 до таймаута). После
 		// 8 заблокированных вызовов ран прерывается целиком.
 		const blockCall = (reason: string) => {
+			if (!strict) {
+				log(`advisory only: ${reason}`);
+				return undefined;
+			}
 			blockedCalls++;
 			if (blockedCalls >= 8) {
 				log(`loop: ABORT after ${blockedCalls} blocked calls`);
@@ -345,7 +353,7 @@ export default function harness(pi: ExtensionAPI) {
 			pendingNudges.push(MALFORMED_NUDGE);
 			log("loop: malformed x2");
 			loopSignals++;
-		} else if (malformedStreak >= 6) {
+		} else if (malformedStreak >= 6 && strict) {
 			log(`loop: ABORT malformed x${malformedStreak}`);
 			try {
 				ctx.abort();
@@ -471,5 +479,5 @@ export default function harness(pi: ExtensionAPI) {
 		loopSignals = 0;
 	});
 
-	log("loaded");
+	log(`loaded mode=${strict ? "strict" : "advisory"}`);
 }

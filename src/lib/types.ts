@@ -21,6 +21,21 @@ export interface Usage {
   cost?: { input?: number; output?: number; total?: number };
 }
 
+export interface RunFileChange {
+  path: string;
+  status: "modified" | "added" | "deleted" | "renamed" | "binary";
+  additions: number;
+  deletions: number;
+}
+
+export interface RunMeta {
+  id: string;
+  durationMs: number;
+  toolCallIds: string[];
+  checkpoint?: string | null;
+  files?: RunFileChange[];
+}
+
 export interface ChatMessage {
   role: Role | string;
   content: ContentBlock[] | string;
@@ -31,6 +46,8 @@ export interface ChatMessage {
   toolName?: string;
   isError?: boolean;
   timestamp?: number;
+  /** pi-app-only live metadata; persisted pi messages remain untouched. */
+  run?: RunMeta;
   [k: string]: unknown;
 }
 
@@ -122,9 +139,15 @@ export interface ChatState {
   toolExecs: Record<string, ToolExec>;
   /** Live partial assistant message (pi sends the full accumulated message in each update). */
   streaming: ChatMessage | null;
+  /** Ход идёт: строго agent_start … agent_end. Между шагами хода pi шлёт
+   *  turn_end/turn_start — они ход НЕ завершают. */
   isStreaming: boolean;
   /** Когда агент начал текущий ран (для таймера в processing-индикаторе). */
   streamStartedAt: number | null;
+  activeRunId: string | null;
+  activeRunToolIds: string[];
+  /** Ран, прикреплённый к сообщению последним agent_end (для post-run артефактов). */
+  lastRunId: string | null;
   isCompacting: boolean;
   retryActive: boolean;
   retryInfo: string | null;
@@ -145,6 +168,9 @@ export function emptyChatState(): ChatState {
     streaming: null,
     isStreaming: false,
     streamStartedAt: null,
+    activeRunId: null,
+    activeRunToolIds: [],
+    lastRunId: null,
     isCompacting: false,
     retryActive: false,
     retryInfo: null,
@@ -201,15 +227,70 @@ export interface SearchHit {
 export interface AppConfig {
   editor: string;
   processLimit: number;
+  processLimitAuto?: boolean;
   idleKillSecs: number;
+  previewIdleKillSecs?: number;
   theme: string;
   uiScale: number;
   piPath?: string | null;
   sidebarCollapsed?: boolean;
   sidebarWidth?: number;
   sourceRepoPath?: string | null;
+  automaticUpdates?: boolean;
   displayName?: string | null;
   piRetryStallTimeoutMs?: number;
+  /** Язык интерфейса: "ru" | "en"; не задан → авто по локали ОС (§5.11-7). */
+  lang?: string;
+  /** UI-only aliases keyed by provider/model-id; runtime model identity is unchanged. */
+  modelAliases?: Record<string, string>;
+  accentColor?: string;
+  /** Optional icon accent for the Custom appearance preset. */
+  iconColor?: string;
+  /** Visual surface preset. Does not affect the runtime model/provider. */
+  appearancePreset?: "chatgpt" | "claude" | "gemini" | "custom";
+  visualEffects?: boolean;
+  interfaceDensity?: "compact" | "comfortable";
+  transcriptMode?: "summary" | "normal" | "verbose";
+  /** Composer send shortcut; the other Enter variant inserts a newline. */
+  sendKeyBehavior?: "enter" | "mod-enter";
+  /** Resolved GUI palette derived from a pi theme or the built-in editor. */
+  customTheme?: AppThemePalette | null;
+  libraryOnboardingSeen?: boolean;
+  /** Visual identity keyed by the stable provider/model-id pair. */
+  modelAvatars?: Record<string, ModelAvatarConfig>;
+}
+
+export interface ModelAvatarConfig {
+  kind?: "preset" | "path";
+  value?: string;
+  workingKind?: "preset" | "path";
+  workingValue?: string;
+}
+
+export interface AppThemePalette {
+  name: string;
+  background: string;
+  sidebar: string;
+  raised: string;
+  active: string;
+  text: string;
+  muted: string;
+  border: string;
+  accent: string;
+  success: string;
+  warning: string;
+  danger: string;
+}
+
+export interface PiThemeInfo {
+  name: string;
+  path: string;
+  source: "global" | "project" | "package";
+  packageName: string | null;
+  colors: Record<string, string | number>;
+  resolvedColors: Record<string, string>;
+  valid: boolean;
+  error: string | null;
 }
 
 export interface AppUpdateInfo {
@@ -221,6 +302,7 @@ export interface AppUpdateInfo {
   latestKind: "release" | "commit" | "none";
   notes: string;
   htmlUrl: string;
+  assetUrl: string | null;
   updateAvailable: boolean;
   checked: boolean;
   /** Коммитов позади/впереди upstream (локальный git-путь). */
@@ -275,7 +357,11 @@ export interface AnalyticsOverview {
 
 // ---------- marketplace (pi.dev community packages via npm registry) ----------
 
-export type PackageKind = "extension" | "skill";
+export type PackageKind = "extension" | "skill" | "theme" | "prompt";
+
+export type PackageSetting =
+  | string
+  | ({ source: string } & Partial<Record<"extensions" | "skills" | "themes" | "prompts", string[]>>);
 
 export interface PiPackage {
   name: string;
@@ -289,11 +375,28 @@ export interface PiPackage {
   keywords: string[];
   updated: string | null;
   popularity: number;
+  /** Installed version from pi's private npm root; absent for catalog-only rows. */
+  installedVersion?: string | null;
+  updateAvailable?: boolean;
+  pinned?: boolean;
+}
+
+export interface PiUpdateInfo {
+  currentVersion: string | null;
+  latestVersion: string | null;
+  updateAvailable: boolean;
+  checked: boolean;
+  error: string | null;
 }
 
 export interface PackageSearch {
   total: number;
   objects: PiPackage[];
+}
+
+export interface PackageDetails {
+  readme: string | null;
+  changelog: string | null;
 }
 
 // ---------- preview (dev-server launcher) ----------

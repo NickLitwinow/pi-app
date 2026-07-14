@@ -1,8 +1,10 @@
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 
+// CSI (ESC[...m, 2K, ...), OSC (ESC]...BEL/ST — pi-claude-style пишет OSC133-зоны),
+// плюс осиротевшие ESC/BEL: расширения pi шлют не только цветовые коды.
 // eslint-disable-next-line no-control-regex
-const ANSI_RE = /\[[0-9;]*m/g;
+const ANSI_RE = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|\u001b\[[0-9;?]*[ -\/]*[@-~]|[\u001b\u0007]/g;
 
 export function stripAnsi(s: string): string {
   return s.replace(ANSI_RE, "");

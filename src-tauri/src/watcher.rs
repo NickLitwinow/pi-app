@@ -12,20 +12,22 @@ pub fn start_sessions_watcher<R: Runtime>(app: AppHandle<R>) {
         let _ = std::fs::create_dir_all(&root);
 
         let (tx, rx) = mpsc::channel::<()>();
-        let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(ev) = res {
-                // session files are *.jsonl; extension-less paths are (new) project dirs
-                let relevant = ev.paths.iter().any(|p| {
-                    p.extension().map(|e| e == "jsonl").unwrap_or(true)
-                });
-                if relevant {
-                    let _ = tx.send(());
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(ev) = res {
+                    // session files are *.jsonl; extension-less paths are (new) project dirs
+                    let relevant = ev
+                        .paths
+                        .iter()
+                        .any(|p| p.extension().map(|e| e == "jsonl").unwrap_or(true));
+                    if relevant {
+                        let _ = tx.send(());
+                    }
                 }
-            }
-        }) {
-            Ok(w) => w,
-            Err(_) => return,
-        };
+            }) {
+                Ok(w) => w,
+                Err(_) => return,
+            };
         if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
             return;
         }
@@ -56,20 +58,21 @@ pub fn start_config_watcher<R: Runtime>(app: AppHandle<R>) {
     std::thread::spawn(move || {
         let dir = crate::sessions::agent_dir();
         let (tx, rx) = mpsc::channel::<String>();
-        let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(ev) = res {
-                for p in &ev.paths {
-                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                        if matches!(name, "settings.json" | "models.json" | "mcp.json") {
-                            let _ = tx.send(name.to_string());
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(ev) = res {
+                    for p in &ev.paths {
+                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                            if matches!(name, "settings.json" | "models.json" | "mcp.json") {
+                                let _ = tx.send(name.to_string());
+                            }
                         }
                     }
                 }
-            }
-        }) {
-            Ok(w) => w,
-            Err(_) => return,
-        };
+            }) {
+                Ok(w) => w,
+                Err(_) => return,
+            };
         if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err() {
             return;
         }

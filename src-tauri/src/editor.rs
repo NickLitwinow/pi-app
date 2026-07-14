@@ -34,12 +34,24 @@ fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(CHARS[(n >> 18) as usize & 63] as char);
         out.push(CHARS[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { CHARS[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { CHARS[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            CHARS[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            CHARS[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -118,7 +130,10 @@ mod tests {
     fn escapes_shell_args() {
         assert_eq!(shell_escape("simple"), "'simple'");
         assert_eq!(shell_escape("it's"), r"'it'\''s'");
-        assert_eq!(shell_escape("path with spaces/f.txt"), "'path with spaces/f.txt'");
+        assert_eq!(
+            shell_escape("path with spaces/f.txt"),
+            "'path with spaces/f.txt'"
+        );
     }
 
     #[test]

@@ -44,6 +44,8 @@ Run before every PR (this is also what CI runs):
 npx tsc --noEmit                                   # type-check
 npm test                                           # vitest (reducer, diff parser)
 cargo test --manifest-path src-tauri/Cargo.toml    # Rust unit + e2e
+npx tauri build --bundles app                      # release .app for perf smoke
+npm run perf:smoke                                 # macOS cold-start + full WebKit RSS budgets
 ```
 
 The Rust `agent_e2e` test spawns a real `pi` process; it skips gracefully when

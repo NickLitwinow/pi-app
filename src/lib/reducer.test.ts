@@ -111,6 +111,9 @@ describe("applyAgentEvent — streaming lifecycle", () => {
     apply({ type: "agent_end", messages: [] });
     expect(chat.isStreaming).toBe(false);
     expect(chat.streaming).toBeNull();
+    expect(chat.items[1].msg.run?.toolCallIds).toEqual(["call_1"]);
+    expect(chat.items[1].msg.run?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(chat.activeRunId).toBeNull();
   });
 
   it("dedupes the user echo after an optimistic add", () => {
@@ -317,5 +320,102 @@ describe("entriesToChatState", () => {
     expect(chat.items).toHaveLength(2);
     expect(chat.toolExecs.c1.output).toBe("/tmp");
     expect(chat.toolExecs.c1.done).toBe(true);
+  });
+
+  it("reconstructs run summaries («Worked for») so they survive app restarts", () => {
+    // два хода: у первого длительность из метаданных pi-claude-style-tools,
+    // у второго — из разницы timestamp'ов записей
+    const chat = entriesToChatState([
+      { type: "message", timestamp: "2026-07-11T18:49:54.978Z", message: { role: "user", content: [{ type: "text", text: "сделай" }] } },
+      {
+        type: "message",
+        timestamp: "2026-07-11T18:49:56.000Z",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "смотрю" },
+            { type: "toolCall", id: "r1", name: "read", arguments: { path: "a.ts" } },
+            { type: "toolCall", id: "r2", name: "bash", arguments: { command: "ls" } },
+          ],
+        },
+      },
+      { type: "message", timestamp: "2026-07-11T18:49:58.000Z", message: { role: "toolResult", toolCallId: "r1", content: [{ type: "text", text: "ok" }] } },
+      { type: "message", timestamp: "2026-07-11T18:49:59.000Z", message: { role: "toolResult", toolCallId: "r2", content: [{ type: "text", text: "ok" }] } },
+      {
+        type: "message",
+        timestamp: "2026-07-11T18:50:01.783Z",
+        message: { role: "assistant", content: [{ type: "text", text: "готово" }], _piClaudeStyleWorkedDurationMs: 6807 },
+      },
+      { type: "message", timestamp: "2026-07-11T18:55:00.000Z", message: { role: "user", content: [{ type: "text", text: "ещё" }] } },
+      {
+        type: "message",
+        timestamp: "2026-07-11T18:55:09.000Z",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "и это" },
+            { type: "toolCall", id: "r3", name: "edit", arguments: {} },
+          ],
+        },
+      },
+    ]);
+    expect(chat.items).toHaveLength(5);
+    // ран прикреплён к ПОСЛЕДНЕМУ assistant-сообщению хода со всеми инструментами
+    const firstRun = chat.items[2].msg.run;
+    expect(firstRun?.toolCallIds).toEqual(["r1", "r2"]);
+    expect(firstRun?.durationMs).toBe(6807);
+    expect(chat.items[1].msg.run).toBeUndefined();
+    // второй ход: длительность из timestamp'ов (9с)
+    const secondRun = chat.items[4].msg.run;
+    expect(secondRun?.toolCallIds).toEqual(["r3"]);
+    expect(secondRun?.durationMs).toBe(9000);
+  });
+
+  it("does not attach runs to tool-less turns", () => {
+    const chat = entriesToChatState([
+      { type: "message", message: { role: "user", content: [{ type: "text", text: "привет" }] } },
+      { type: "message", message: { role: "assistant", content: [{ type: "text", text: "Привет!" }] } },
+    ]);
+    expect(chat.items[1].msg.run).toBeUndefined();
+  });
+});
+
+describe("agent_end run attachment", () => {
+  it("uses pi-claude-style worked duration when present and records lastRunId", () => {
+    let chat = emptyChatState();
+    chat = applyAgentEvent({ ...chat }, { type: "agent_start" });
+    chat = applyAgentEvent({ ...chat }, {
+      type: "message_end",
+      message: { role: "user", content: [{ type: "text", text: "go" }] },
+    });
+    chat = applyAgentEvent({ ...chat }, { type: "tool_execution_start", toolCallId: "c1", toolName: "bash", args: {} });
+    chat = applyAgentEvent({ ...chat }, {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "done" }], _piClaudeStyleWorkedDurationMs: 4321 },
+    });
+    chat = applyAgentEvent({ ...chat }, { type: "agent_end" });
+    const run = chat.items.at(-1)?.msg.run;
+    expect(run?.durationMs).toBe(4321);
+    expect(chat.lastRunId).toBe(run?.id ?? null);
+  });
+
+  it("does not steal the run onto the previous turn when aborted before a reply", () => {
+    let chat = emptyChatState();
+    // прошлый ход с прикреплённым раном
+    chat = applyAgentEvent({ ...chat }, { type: "agent_start" });
+    chat = applyAgentEvent({ ...chat }, { type: "message_end", message: { role: "user", content: [{ type: "text", text: "первый" }] } });
+    chat = applyAgentEvent({ ...chat }, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ответ" }] } });
+    chat = applyAgentEvent({ ...chat }, { type: "agent_end" });
+    const prevRunId = chat.items.at(-1)?.msg.run?.id;
+    expect(prevRunId).toBeTruthy();
+
+    // новый ход: prompt отправлен, но прерван до первого ответа
+    chat = applyAgentEvent({ ...chat }, { type: "agent_start" });
+    chat = applyAgentEvent({ ...chat }, { type: "message_end", message: { role: "user", content: [{ type: "text", text: "второй" }] } });
+    chat = applyAgentEvent({ ...chat }, { type: "agent_end" });
+
+    // ран прошлого хода не перезаписан пустым, lastRunId не выставлен
+    expect(chat.items[1].msg.run?.id).toBe(prevRunId);
+    expect(chat.lastRunId).toBeNull();
   });
 });

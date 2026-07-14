@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import { getBackend } from "../lib/backend";
 import { notifyOS } from "../lib/notify";
+import { modelAliasKey } from "../lib/models";
+import { parseUnifiedDiff } from "../lib/diff";
 import { addUserMessage, applyAgentEvent, contentText, entriesToChatState } from "../lib/reducer";
 import {
   emptyChatState,
@@ -18,7 +20,7 @@ import {
   type SessionStats,
 } from "../lib/types";
 
-export type View = "chat" | "review" | "settings";
+export type View = "chat" | "review" | "library" | "settings";
 
 export interface SessionFlags {
   pinned: string[];
@@ -55,8 +57,13 @@ export interface WorkspaceChat {
   /** Агент сейчас стримит — трекается всегда, даже когда смотрим другую сессию. */
   liveStreaming: boolean;
   checkpoints: Checkpoint[];
+  /** Снимок непосредственно перед активным ходом; нужен для per-turn diff. */
+  pendingCheckpoint: string | null;
   stderrLog: string[];
   mode: AgentMode;
+  /** Выбор до старта агента: применяется RPC-командой сразу после спавна. */
+  pendingModel: { provider: string; id: string } | null;
+  pendingThinking: string | null;
 }
 
 /** Толерантное сравнение путей сессий. pi в get_state может вернуть `sessionFile`
@@ -92,9 +99,48 @@ export function emptyWorkspaceChat(): WorkspaceChat {
     liveSessionPath: null,
     liveStreaming: false,
     checkpoints: [],
+    pendingCheckpoint: null,
     stderrLog: [],
     mode: "ask",
+    pendingModel: null,
+    pendingThinking: null,
   };
+}
+
+/** Дефолты pi из settings.json + каталог моделей из models.json. Читаются без
+ *  спавна агента, поэтому модель/thinking можно выбрать ещё до первой отправки. */
+export interface PiDefaults {
+  provider: string | null;
+  model: string | null;
+  thinkingLevel: string | null;
+  catalog: ModelInfo[];
+}
+
+export function emptyPiDefaults(): PiDefaults {
+  return { provider: null, model: null, thinkingLevel: null, catalog: [] };
+}
+
+/** Модель, которую покажет UI для workspace: живая → выбранная до старта → дефолт pi. */
+export function effectiveModel(ws: WorkspaceChat, defaults: PiDefaults): ModelInfo | null {
+  if (ws.agentState?.model) return ws.agentState.model;
+  if (ws.pendingModel) {
+    const known = defaults.catalog.find(
+      (m) => m.id === ws.pendingModel!.id && m.provider === ws.pendingModel!.provider,
+    );
+    return known ?? { id: ws.pendingModel.id, provider: ws.pendingModel.provider };
+  }
+  if (defaults.model) {
+    const known = defaults.catalog.find(
+      (m) => m.id === defaults.model && (!defaults.provider || m.provider === defaults.provider),
+    );
+    return known ?? { id: defaults.model, provider: defaults.provider ?? "" };
+  }
+  return null;
+}
+
+/** Уровень thinking для UI: живой → выбранный до старта → дефолт pi. */
+export function effectiveThinking(ws: WorkspaceChat, defaults: PiDefaults): string {
+  return ws.agentState?.thinkingLevel ?? ws.pendingThinking ?? defaults.thinkingLevel ?? "high";
 }
 
 interface Store {
@@ -110,13 +156,19 @@ interface Store {
   sessions: Record<string, SessionMeta[]>;
   /** Текст для вставки в composer (drag&drop путей и т.п.); composer забирает и обнуляет. */
   pendingInsert: string | null;
+  /** Файлы из Finder; composer выбирает vision-блок или path-context. */
+  pendingFiles: string[] | null;
   sessionFlags: SessionFlags;
   /** Панель permission-запроса свёрнута в чип (чат остаётся читаемым). */
   permCollapsed: boolean;
   /** Сплит-скрин: панель live-превью открыта рядом с чатом. */
   previewOpen: boolean;
+  /** База, которую карточка changed files просит открыть в Code Review. */
+  reviewCheckpoint: string | null;
   /** Инкремент при внешнем изменении конфигов pi (config-changed) — зависимость перечитывающих вкладок. */
   configVersion: number;
+  /** Дефолты и каталог моделей pi — доступны до запуска агента. */
+  piDefaults: PiDefaults;
   set: (patch: Partial<Store>) => void;
 }
 
@@ -124,7 +176,7 @@ export const useStore = create<Store>((set) => ({
   ready: false,
   isMock: false,
   piInfo: null,
-  appConfig: { editor: "code", processLimit: 2, idleKillSecs: 900, theme: "system", uiScale: 1 },
+  appConfig: { editor: "code", processLimit: 2, processLimitAuto: true, idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, modelAliases: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: false, modelAvatars: {} },
   projects: [],
   extraWorkspaces: [],
   currentCwd: null,
@@ -132,12 +184,51 @@ export const useStore = create<Store>((set) => ({
   chats: {},
   sessions: {},
   pendingInsert: null,
+  pendingFiles: null,
   sessionFlags: emptySessionFlags(),
   permCollapsed: false,
   previewOpen: false,
+  reviewCheckpoint: null,
   configVersion: 0,
+  piDefaults: emptyPiDefaults(),
   set: (patch) => set(patch),
 }));
+
+/**
+ * Прочитать дефолты pi и каталог моделей из его конфигов (settings.json +
+ * models.json). Это ФАЙЛЫ, а не RPC, поэтому доступно без живого агента — так
+ * модель/thinking выбираются ещё до отправки первого сообщения.
+ */
+export async function loadPiDefaults(): Promise<void> {
+  const be = await getBackend();
+  const [settingsFile, modelsFile] = await Promise.all([
+    be.invoke<{ content?: string }>("read_pi_config", { name: "settings" }).catch(() => null),
+    be.invoke<{ content?: string }>("read_pi_config", { name: "models" }).catch(() => null),
+  ]);
+  const parse = <T,>(raw: string | undefined): T | null => {
+    try {
+      return JSON.parse(raw ?? "") as T;
+    } catch {
+      return null;
+    }
+  };
+  const settings = parse<{ defaultProvider?: string; defaultModel?: string; defaultThinkingLevel?: string }>(settingsFile?.content) ?? {};
+  const models = parse<{ providers?: Record<string, { models?: ModelInfo[] }> }>(modelsFile?.content) ?? {};
+  const catalog: ModelInfo[] = [];
+  for (const [provider, entry] of Object.entries(models.providers ?? {})) {
+    for (const model of entry.models ?? []) {
+      if (model?.id) catalog.push({ ...model, provider });
+    }
+  }
+  useStore.setState({
+    piDefaults: {
+      provider: settings.defaultProvider ?? null,
+      model: settings.defaultModel ?? null,
+      thinkingLevel: settings.defaultThinkingLevel ?? null,
+      catalog,
+    },
+  });
+}
 
 export async function updateAppConfig(patch: Partial<AppConfig>): Promise<void> {
   const next = { ...useStore.getState().appConfig, ...patch };
@@ -204,6 +295,7 @@ function flushAgentEvents() {
   const s = useStore.getState();
   const nextChats = { ...s.chats };
   const finishedRuns: string[] = [];
+  const artifactJobs: { cwd: string; runId: string; checkpoint: string }[] = [];
   let newDialog = false;
   // уведомления ОС: ход завершён / агент ждёт разрешения, когда пользователь
   // не смотрит (окно без фокуса или открыт другой workspace)
@@ -222,6 +314,7 @@ function flushAgentEvents() {
     let chat = ws.chat;
     let applied = false;
     let liveStreaming = ws.liveStreaming;
+    let pendingCheckpoint = ws.pendingCheckpoint;
     for (const ev of events) {
       const t = ev.type as string;
       if (t === "agent_start") liveStreaming = true;
@@ -235,6 +328,12 @@ function flushAgentEvents() {
           applied = true;
         }
         chat = applyAgentEvent(chat, ev);
+        if (t === "agent_end") {
+          // именно ран, прикреплённый ЭТИМ agent_end: reverse-поиск по items мог
+          // зацепить run-мету старого сообщения (например, восстановленную из файла)
+          if (chat.lastRunId && pendingCheckpoint) artifactJobs.push({ cwd, runId: chat.lastRunId, checkpoint: pendingCheckpoint });
+          pendingCheckpoint = null;
+        }
         if (applyToView && (t === "agent_start" || t === "agent_end" || t === "turn_end" || t === "compaction_end")) {
           if (!finishedRuns.includes(cwd)) finishedRuns.push(cwd);
         }
@@ -249,7 +348,7 @@ function flushAgentEvents() {
       if (t === "agent_end") noteOnce(cwd, "end");
     }
     if (applied || liveStreaming !== ws.liveStreaming) {
-      nextChats[cwd] = { ...ws, chat, liveStreaming };
+      nextChats[cwd] = { ...ws, chat, liveStreaming, pendingCheckpoint };
     }
   }
   eventQueue.clear();
@@ -258,10 +357,43 @@ function flushAgentEvents() {
   for (const cwd of finishedRuns) {
     void refreshAgentMeta(cwd);
   }
+  for (const job of artifactJobs) void captureRunFiles(job.cwd, job.runId, job.checkpoint);
   for (const n of osNotes) {
     const name = n.cwd.split("/").pop() || n.cwd;
-    void notifyOS(name, n.kind === "perm" ? "Агент ждёт подтверждения" : "Агент завершил ход");
+    const model = s.chats[n.cwd]?.agentState?.model;
+    const avatar = model ? s.appConfig.modelAvatars?.[modelAliasKey(model.provider, model.id)] : undefined;
+    const notificationIcon = n.kind === "perm" && avatar?.workingKind === "path"
+      ? avatar.workingValue
+      : avatar?.kind === "path"
+        ? avatar.value
+        : undefined;
+    void notifyOS(
+      name,
+      n.kind === "perm" ? "Агент ждёт подтверждения" : "Агент завершил ход",
+      notificationIcon,
+    );
   }
+}
+
+async function captureRunFiles(cwd: string, runId: string, checkpoint: string): Promise<void> {
+  const be = await getBackend();
+  const text = await be.invoke<string>("git_review_diff", { cwd, base: checkpoint }).catch(() => "");
+  const files = parseUnifiedDiff(text).map((file) => ({
+    path: file.newPath === "/dev/null" ? file.oldPath : file.newPath,
+    status: file.status,
+    additions: file.additions,
+    deletions: file.deletions,
+  }));
+  updateChat(cwd, (ws) => ({
+    ...ws,
+    chat: {
+      ...ws.chat,
+      items: ws.chat.items.map((item) => item.msg.run?.id === runId
+        ? { ...item, msg: { ...item.msg, run: { ...item.msg.run, checkpoint, files } } }
+        : item),
+      seq: ws.chat.seq + 1,
+    },
+  }));
 }
 
 // ---------- init ----------
@@ -272,6 +404,10 @@ export async function initApp(): Promise<void> {
   if (initialized) return;
   initialized = true;
   const be = await getBackend();
+  // Backend доступен — приложение уже интерактивно. Списки проектов,
+  // конфигурация и listener'ы догружаются ниже; держать splash до их окончания
+  // добавляло >1 с к холодному старту без пользовательской пользы.
+  useStore.setState({ ready: true, isMock: be.isMock });
 
   await be.listen("agent-event", (payload) => {
     const agentId = String(payload.agentId ?? "");
@@ -359,8 +495,7 @@ export async function initApp(): Promise<void> {
     });
   });
 
-  const [piInfo, appConfig, projects, rawFlags] = await Promise.all([
-    be.invoke<PiInfo>("resolve_pi").catch(() => null),
+  const [appConfig, projects, rawFlags] = await Promise.all([
     be.invoke<AppConfig>("read_app_config").catch(() => null),
     be.invoke<ProjectInfo[]>("list_projects").catch(() => [] as ProjectInfo[]),
     be.invoke<Partial<SessionFlags>>("read_session_flags").catch(() => null),
@@ -368,17 +503,20 @@ export async function initApp(): Promise<void> {
 
   const currentCwd = projects[0]?.cwd ?? null;
   useStore.setState({
-    ready: true,
-    isMock: be.isMock,
-    piInfo,
     appConfig: appConfig ?? useStore.getState().appConfig,
     projects,
     currentCwd,
     sessionFlags: normalizeFlags(rawFlags),
   });
+  // `pi --version` can take seconds when the user's pi environment has many
+  // packages. It is diagnostic metadata, not a prerequisite for an
+  // interactive shell, so never put it on the cold-start critical path.
+  void be.invoke<PiInfo>("resolve_pi").then((piInfo) => useStore.setState({ piInfo })).catch(() => {});
   // убрать legacy-конфиги pi-permission-system (глобальный + текущий проект),
   // иначе расширение сыплет «Legacy policy found…» при каждом старте сессии
   void be.invoke("migrate_permission_configs", { cwd: currentCwd }).catch(() => {});
+  // дефолты/каталог моделей — из файлов pi, без спавна агента
+  void loadPiDefaults();
   if (currentCwd) {
     void refreshSessions(currentCwd);
     void loadPermissionMode(currentCwd);
@@ -430,6 +568,17 @@ export async function ensureAgent(cwd: string, sessionPath?: string | null): Pro
     agentToCwd.set(agentId, cwd);
     // агент открыт в spawnSession — это и есть live-сессия (для новой узнаем из get_state)
     updateChat(cwd, (w) => ({ ...w, agentId, alive: true, liveSessionPath: spawnSession ?? w.sessionPath }));
+    // применяем выбор, сделанный до старта агента (модель/thinking в композере)
+    const pending = getChat(cwd);
+    if (pending.pendingModel) {
+      await rpcRequest(cwd, { type: "set_model", provider: pending.pendingModel.provider, modelId: pending.pendingModel.id }).catch(() => {});
+    }
+    if (pending.pendingThinking) {
+      await rpcRequest(cwd, { type: "set_thinking_level", level: pending.pendingThinking }).catch(() => {});
+    }
+    if (pending.pendingModel || pending.pendingThinking) {
+      updateChat(cwd, (w) => ({ ...w, pendingModel: null, pendingThinking: null }));
+    }
     await refreshAgentMeta(cwd);
     // спавн ленивый (по первому сообщению) — модели/команды тянем после него
     void loadModelsAndCommands(cwd);
@@ -566,7 +715,8 @@ export async function sendPrompt(cwd: string, text: string, images?: { data: str
 
   if (!streaming) {
     updateChat(cwd, (w) => ({ ...w, chat: addUserMessage({ ...w.chat }, trimmed) }));
-    void makeCheckpoint(cwd, "turn");
+    const checkpoint = await makeCheckpoint(cwd, "turn");
+    updateChat(cwd, (w) => ({ ...w, pendingCheckpoint: checkpoint }));
     const cmd: Record<string, unknown> = { type: "prompt", message: trimmed };
     if (images?.length) cmd.images = images.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType }));
     await rpcSend(cwd, cmd);
@@ -587,12 +737,21 @@ export async function abortAgent(cwd: string): Promise<void> {
   await rpcSend(cwd, { type: "abort" }).catch(() => {});
 }
 
+/** Агента ещё нет — выбор запоминаем и применяем сразу после спавна (ensureAgent). */
 export async function setModel(cwd: string, provider: string, modelId: string): Promise<void> {
+  if (!getChat(cwd).alive) {
+    updateChat(cwd, (w) => ({ ...w, pendingModel: { provider, id: modelId } }));
+    return;
+  }
   await rpcRequest(cwd, { type: "set_model", provider, modelId });
   await refreshAgentMeta(cwd);
 }
 
 export async function setThinkingLevel(cwd: string, level: string): Promise<void> {
+  if (!getChat(cwd).alive) {
+    updateChat(cwd, (w) => ({ ...w, pendingThinking: level }));
+    return;
+  }
   await rpcRequest(cwd, { type: "set_thinking_level", level });
   await refreshAgentMeta(cwd);
 }
@@ -622,13 +781,43 @@ export async function newSession(cwd: string): Promise<void> {
   discardQueuedEvents(cwd);
   if (ws.alive && ws.agentId) {
     await rpcRequest(cwd, { type: "new_session" }).catch(() => {});
-    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, checkpoints: [], stats: null }));
+    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, checkpoints: [], pendingCheckpoint: null, stats: null }));
     await refreshAgentMeta(cwd);
   } else {
-    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, checkpoints: [], stats: null }));
+    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, checkpoints: [], pendingCheckpoint: null, stats: null }));
     await ensureAgent(cwd, null);
   }
   void loadModelsAndCommands(cwd);
+}
+
+/**
+ * Закрыть текущую вкладку сессии, не удаляя её JSONL с диска.
+ * Занятого агента намеренно не прерываем: ⌘W не должен терять активную работу.
+ */
+export async function closeCurrentSession(cwd: string): Promise<void> {
+  const ws = getChat(cwd);
+  if (ws.alive && ws.agentId && ws.liveStreaming) {
+    notifyChat(cwd, "warning", "Агент занят — дождитесь завершения, прежде чем закрывать сессию");
+    return;
+  }
+  if (ws.agentId) {
+    const be = await getBackend();
+    await be.invoke("kill_agent", { agentId: ws.agentId }).catch(() => {});
+    agentToCwd.delete(ws.agentId);
+  }
+  discardQueuedEvents(cwd);
+  updateChat(cwd, (w) => ({
+    ...w,
+    chat: emptyChatState(),
+    sessionPath: null,
+    liveSessionPath: null,
+    liveStreaming: false,
+    agentId: null,
+    alive: false,
+    checkpoints: [],
+    pendingCheckpoint: null,
+    stats: null,
+  }));
 }
 
 export function respondToUiRequest(cwd: string, id: string, response: Record<string, unknown>): void {
@@ -954,7 +1143,7 @@ export async function deleteSessionAction(cwd: string, path: string): Promise<vo
       agentToCwd.delete(ws.agentId);
     }
     discardQueuedEvents(cwd);
-    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, liveStreaming: false, agentId: null, alive: false, checkpoints: [], stats: null }));
+    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, liveStreaming: false, agentId: null, alive: false, checkpoints: [], pendingCheckpoint: null, stats: null }));
   }
   await be.invoke("delete_session", { path });
   // подчистить флаги
@@ -1147,18 +1336,20 @@ export async function toggleMessagePin(cwd: string, msg: ChatMessage): Promise<v
 
 // ---------- code review ----------
 
-export async function makeCheckpoint(cwd: string, label: string): Promise<void> {
+export async function makeCheckpoint(cwd: string, label: string): Promise<string | null> {
   try {
     const be = await getBackend();
     const isRepo = await be.invoke<boolean>("git_is_repo", { cwd });
-    if (!isRepo) return;
+    if (!isRepo) return null;
     const hash = await be.invoke<string>("git_checkpoint", { cwd, label });
     updateChat(cwd, (ws) => {
       const cps = ws.checkpoints;
       if (cps.length > 0 && cps[cps.length - 1].hash === hash) return ws;
       return { ...ws, checkpoints: [...cps, { hash, label, ts: Date.now() }].slice(-100) };
     });
+    return hash;
   } catch {
     /* review is best-effort */
+    return null;
   }
 }

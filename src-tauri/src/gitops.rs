@@ -20,7 +20,11 @@ async fn git_ok(cwd: &str, args: &[&str]) -> Result<String, String> {
     if code == 0 {
         Ok(stdout)
     } else {
-        Err(if stderr.trim().is_empty() { format!("git exited with {code}") } else { stderr.trim().to_string() })
+        Err(if stderr.trim().is_empty() {
+            format!("git exited with {code}")
+        } else {
+            stderr.trim().to_string()
+        })
     }
 }
 
@@ -38,23 +42,40 @@ pub async fn git_is_repo(cwd: String) -> Result<bool, String> {
 #[tauri::command]
 pub async fn list_workspace_files(cwd: String) -> Result<Vec<String>, String> {
     const CAP: usize = 4000;
-    if let Ok((out, _, 0)) =
-        run_git(&cwd, &["ls-files", "--cached", "--others", "--exclude-standard"]).await
+    if let Ok((out, _, 0)) = run_git(
+        &cwd,
+        &["ls-files", "--cached", "--others", "--exclude-standard"],
+    )
+    .await
     {
-        let mut files: Vec<String> = out.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect();
+        let mut files: Vec<String> = out
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|s| s.to_string())
+            .collect();
         files.truncate(CAP);
         return Ok(files);
     }
     // не git — ограниченный обход, пропуская тяжёлые каталоги
     let root = std::path::PathBuf::from(&cwd);
     let mut out = Vec::new();
-    let skip = ["node_modules", ".git", "target", "dist", "build", ".venv", "__pycache__"];
+    let skip = [
+        "node_modules",
+        ".git",
+        "target",
+        "dist",
+        "build",
+        ".venv",
+        "__pycache__",
+    ];
     let mut stack = vec![root.clone()];
     while let Some(dir) = stack.pop() {
         if out.len() >= CAP {
             break;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
@@ -106,18 +127,115 @@ pub async fn git_status(cwd: String) -> Result<Vec<StatusEntry>, String> {
     Ok(parse_porcelain(&out))
 }
 
+async fn worktree_snapshot(cwd: &str) -> Result<String, String> {
+    let head = git_ok(cwd, &["rev-parse", "HEAD"])
+        .await
+        .map_err(|_| "репозиторий без коммитов — сделайте первый commit, чтобы включить чекпоинты")?
+        .trim()
+        .to_string();
+    // `git stash create` ignores untracked files, so a file that existed before
+    // the run would be falsely attributed to the agent. A temporary index lets
+    // us snapshot tracked + untracked (respecting .gitignore) without touching
+    // the user's real index or working tree.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let index_path = std::env::temp_dir().join(format!(
+        "pi-app-checkpoint-{}-{nonce}.index",
+        std::process::id()
+    ));
+    let run_index = |args: &[&str]| {
+        let mut command = Command::new("git");
+        command
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_INDEX_FILE", &index_path);
+        command
+    };
+    let read = run_index(&["read-tree", &head])
+        .output()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !read.status.success() {
+        let _ = std::fs::remove_file(&index_path);
+        return Err(String::from_utf8_lossy(&read.stderr).trim().to_string());
+    }
+    // First update only paths already present in HEAD (including deletions).
+    let add = run_index(&["add", "-u"])
+        .output()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !add.status.success() {
+        let _ = std::fs::remove_file(&index_path);
+        return Err(String::from_utf8_lossy(&add.stderr).trim().to_string());
+    }
+    // Then add existing tracked/staged files and small untracked files. Large
+    // untracked artefacts are intentionally skipped so a checkpoint cannot
+    // copy multi-GB build outputs into the Git object database.
+    let cached = git_ok(cwd, &["ls-files", "--cached"]).await?;
+    let untracked = git_ok(cwd, &["ls-files", "--others", "--exclude-standard"]).await?;
+    let root = std::path::Path::new(cwd);
+    let mut paths: Vec<String> = cached
+        .lines()
+        .filter(|path| root.join(path).is_file())
+        .map(str::to_string)
+        .collect();
+    paths.extend(untracked.lines().filter_map(|path| {
+        let metadata = std::fs::metadata(root.join(path)).ok()?;
+        (metadata.is_file() && metadata.len() <= 2_000_000).then(|| path.to_string())
+    }));
+    for chunk in paths.chunks(200) {
+        let mut command = run_index(&["add", "--"]);
+        command.args(chunk);
+        let output = command.output().await.map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            let _ = std::fs::remove_file(&index_path);
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+    }
+    let tree_out = run_index(&["write-tree"])
+        .output()
+        .await
+        .map_err(|error| error.to_string())?;
+    let _ = std::fs::remove_file(&index_path);
+    if !tree_out.status.success() {
+        return Err(String::from_utf8_lossy(&tree_out.stderr).trim().to_string());
+    }
+    let tree = String::from_utf8_lossy(&tree_out.stdout).trim().to_string();
+    let commit = Command::new("git")
+        .args([
+            "commit-tree",
+            &tree,
+            "-p",
+            &head,
+            "-m",
+            "pi-app pre-run checkpoint",
+        ])
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "Pi App")
+        .env("GIT_AUTHOR_EMAIL", "pi-app@local")
+        .env("GIT_COMMITTER_NAME", "Pi App")
+        .env("GIT_COMMITTER_EMAIL", "pi-app@local")
+        .output()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !commit.status.success() {
+        return Err(String::from_utf8_lossy(&commit.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&commit.stdout).trim().to_string())
+}
+
 /// Snapshot the current working tree without touching the index or HEAD.
 /// Returns the checkpoint commit hash, pinned under refs/pi-app/checkpoints/.
 #[tauri::command]
 pub async fn git_checkpoint(cwd: String, label: String) -> Result<String, String> {
-    let (out, _, code) = run_git(&cwd, &["stash", "create"]).await?;
-    let hash = if code == 0 && !out.trim().is_empty() {
-        out.trim().to_string()
-    } else {
-        // clean tree (or stash create failed): fall back to HEAD
-        git_ok(&cwd, &["rev-parse", "HEAD"]).await.map_err(|_| "репозиторий без коммитов — сделайте первый commit, чтобы включить чекпоинты")?.trim().to_string()
-    };
-    let safe_label: String = label.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(40).collect();
+    let hash = worktree_snapshot(&cwd).await?;
+    let safe_label: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(40)
+        .collect();
     let refname = format!(
         "refs/pi-app/checkpoints/{}-{}",
         std::time::SystemTime::now()
@@ -130,35 +248,15 @@ pub async fn git_checkpoint(cwd: String, label: String) -> Result<String, String
     Ok(hash)
 }
 
-/// Unified diff of the working tree vs a base ref (defaults to HEAD),
-/// including untracked files via --no-index against /dev/null.
+/// Unified diff of the complete working tree vs a base ref (defaults to HEAD).
+/// Both sides are trees, so pre-existing untracked files are handled correctly.
 #[tauri::command]
 pub async fn git_review_diff(cwd: String, base: Option<String>) -> Result<String, String> {
     let base_ref = base.unwrap_or_else(|| "HEAD".to_string());
-    let (mut diff, _, code) = run_git(&cwd, &["diff", &base_ref]).await?;
+    let current = worktree_snapshot(&cwd).await?;
+    let (diff, _, code) = run_git(&cwd, &["diff", &base_ref, &current]).await?;
     if code > 1 {
         return Err(format!("git diff failed (exit {code})"));
-    }
-    // untracked files
-    let status = git_ok(&cwd, &["status", "--porcelain=v1", "--untracked-files=all"]).await?;
-    for entry in parse_porcelain(&status) {
-        if entry.status != "??" {
-            continue;
-        }
-        let full = std::path::Path::new(&cwd).join(&entry.path);
-        if let Ok(meta) = std::fs::metadata(&full) {
-            if meta.is_dir() {
-                continue;
-            }
-            if meta.len() > 2_000_000 {
-                diff.push_str(&format!("\ndiff --git a/{p} b/{p}\n--- /dev/null\n+++ b/{p}\n@@ skipped: file larger than 2MB @@\n", p = entry.path));
-                continue;
-            }
-        }
-        let (u_out, _, u_code) = run_git(&cwd, &["diff", "--no-index", "--", "/dev/null", &entry.path]).await?;
-        if u_code <= 1 {
-            diff.push_str(&u_out);
-        }
     }
     Ok(diff)
 }
@@ -191,10 +289,16 @@ pub async fn git_summary(cwd: String) -> Result<GitSummary, String> {
     if s.branch.is_empty() {
         s.branch = "detached".into();
     }
-    s.has_remote = matches!(run_git(&cwd, &["remote"]).await, Ok((out, _, 0)) if !out.trim().is_empty());
+    s.has_remote =
+        matches!(run_git(&cwd, &["remote"]).await, Ok((out, _, 0)) if !out.trim().is_empty());
 
     // ahead/behind относительно upstream (если он настроен)
-    if let Ok((out, _, 0)) = run_git(&cwd, &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"]).await {
+    if let Ok((out, _, 0)) = run_git(
+        &cwd,
+        &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+    )
+    .await
+    {
         let mut it = out.split_whitespace();
         s.behind = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
         s.ahead = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
@@ -205,7 +309,11 @@ pub async fn git_summary(cwd: String) -> Result<GitSummary, String> {
         if code <= 1 {
             for part in out.split(',') {
                 let part = part.trim();
-                let num: u64 = part.split(' ').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                let num: u64 = part
+                    .split(' ')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
                 if part.contains("insertion") {
                     s.insertions += num;
                 } else if part.contains("deletion") {
@@ -282,7 +390,9 @@ fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -307,20 +417,31 @@ async fn has_cli(name: &str) -> bool {
 pub async fn git_open_pr(cwd: String) -> Result<(), String> {
     let remote = git_ok(&cwd, &["remote", "get-url", "origin"])
         .await
-        .map_err(|_| "у репозитория нет remote «origin» — добавьте его (git remote add origin …)".to_string())?;
+        .map_err(|_| {
+            "у репозитория нет remote «origin» — добавьте его (git remote add origin …)".to_string()
+        })?;
     let (host, web_base) = remote_web_base(remote.trim())
         .ok_or_else(|| format!("не удалось разобрать URL remote: {}", remote.trim()))?;
 
     // нативные CLI дают лучший UX (заполняют заголовок/тело) — если установлены
     if host.contains("github") && has_cli("gh").await {
-        return spawn_detached(&format!("cd {} && gh pr create --web", crate::editor::shell_escape_pub(&cwd)));
+        return spawn_detached(&format!(
+            "cd {} && gh pr create --web",
+            crate::editor::shell_escape_pub(&cwd)
+        ));
     }
     if host.contains("gitlab") && has_cli("glab").await {
-        return spawn_detached(&format!("cd {} && glab mr create --web", crate::editor::shell_escape_pub(&cwd)));
+        return spawn_detached(&format!(
+            "cd {} && glab mr create --web",
+            crate::editor::shell_escape_pub(&cwd)
+        ));
     }
 
     // универсальный путь: открыть страницу создания PR/MR в браузере
-    let branch = git_ok(&cwd, &["branch", "--show-current"]).await?.trim().to_string();
+    let branch = git_ok(&cwd, &["branch", "--show-current"])
+        .await?
+        .trim()
+        .to_string();
     if branch.is_empty() {
         return Err("вы в состоянии detached HEAD — переключитесь на ветку".into());
     }
@@ -343,6 +464,44 @@ fn spawn_detached(cmd: &str) -> Result<(), String> {
 #[tauri::command]
 pub async fn git_checkout_file(cwd: String, gitref: String, path: String) -> Result<(), String> {
     git_ok(&cwd, &["checkout", &gitref, "--", &path]).await?;
+    Ok(())
+}
+
+/// Restore every file changed during one agent run to its pre-run checkpoint.
+/// Files absent from the checkpoint (created by the run) are removed. Paths are
+/// restricted to the workspace to keep the bulk action safe.
+#[tauri::command]
+pub async fn git_restore_run_files(
+    cwd: String,
+    gitref: String,
+    files: Vec<String>,
+) -> Result<(), String> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let root = std::path::Path::new(&cwd);
+    for path in files {
+        let candidate = std::path::Path::new(&path);
+        if candidate.is_absolute()
+            || candidate
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            || path.contains(['\n', '\r', '\0'])
+        {
+            return Err(format!("небезопасный путь: {path}"));
+        }
+        let object = format!("{gitref}:{path}");
+        let (_, _, exists_code) = run_git(&cwd, &["cat-file", "-e", &object]).await?;
+        if exists_code == 0 {
+            git_ok(&cwd, &["checkout", &gitref, "--", &path]).await?;
+        } else {
+            let full = root.join(candidate);
+            if full.is_file() || full.is_symlink() {
+                std::fs::remove_file(&full)
+                    .map_err(|error| format!("{}: {error}", full.display()))?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -382,7 +541,16 @@ pub async fn git_branches(cwd: String) -> Result<Vec<BranchInfo>, String> {
     let fmt = "%(refname:short)\u{1f}%(HEAD)\u{1f}%(upstream:short)\u{1f}%(upstream:track)\u{1f}%(subject)\u{1f}%(committerdate:unix)";
     let mut out = Vec::new();
 
-    let local = git_ok(&cwd, &["for-each-ref", "refs/heads", "--sort=-committerdate", &format!("--format={fmt}")]).await?;
+    let local = git_ok(
+        &cwd,
+        &[
+            "for-each-ref",
+            "refs/heads",
+            "--sort=-committerdate",
+            &format!("--format={fmt}"),
+        ],
+    )
+    .await?;
     for line in local.lines() {
         let f: Vec<&str> = line.split(SEP).collect();
         if f.len() < 6 {
@@ -393,7 +561,11 @@ pub async fn git_branches(cwd: String) -> Result<Vec<BranchInfo>, String> {
             name: f[0].to_string(),
             current: f[1] == "*",
             remote: false,
-            upstream: if f[2].is_empty() { None } else { Some(f[2].to_string()) },
+            upstream: if f[2].is_empty() {
+                None
+            } else {
+                Some(f[2].to_string())
+            },
             ahead,
             behind,
             last_subject: f[4].to_string(),
@@ -402,7 +574,16 @@ pub async fn git_branches(cwd: String) -> Result<Vec<BranchInfo>, String> {
     }
 
     let locals: std::collections::HashSet<String> = out.iter().map(|b| b.name.clone()).collect();
-    let remote = git_ok(&cwd, &["for-each-ref", "refs/remotes", "--sort=-committerdate", &format!("--format={fmt}")]).await?;
+    let remote = git_ok(
+        &cwd,
+        &[
+            "for-each-ref",
+            "refs/remotes",
+            "--sort=-committerdate",
+            &format!("--format={fmt}"),
+        ],
+    )
+    .await?;
     for line in remote.lines() {
         let f: Vec<&str> = line.split(SEP).collect();
         if f.len() < 6 || f[0].ends_with("/HEAD") {
@@ -431,7 +612,10 @@ pub async fn git_branches(cwd: String) -> Result<Vec<BranchInfo>, String> {
 #[tauri::command]
 pub async fn git_checkout_branch(cwd: String, name: String, remote: bool) -> Result<(), String> {
     if remote {
-        let local = name.split_once('/').map(|(_, b)| b.to_string()).unwrap_or_else(|| name.clone());
+        let local = name
+            .split_once('/')
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_else(|| name.clone());
         git_ok(&cwd, &["checkout", "-B", &local, "--track", &name]).await?;
     } else {
         git_ok(&cwd, &["checkout", &name]).await?;
@@ -440,7 +624,11 @@ pub async fn git_checkout_branch(cwd: String, name: String, remote: bool) -> Res
 }
 
 #[tauri::command]
-pub async fn git_create_branch(cwd: String, name: String, from: Option<String>) -> Result<(), String> {
+pub async fn git_create_branch(
+    cwd: String,
+    name: String,
+    from: Option<String>,
+) -> Result<(), String> {
     let mut args = vec!["checkout", "-b", name.as_str()];
     if let Some(ref f) = from {
         args.push(f.as_str());
@@ -497,7 +685,9 @@ pub async fn git_discard(cwd: String, paths: Vec<String>) -> Result<(), String> 
     for p in &paths {
         if untracked.contains(p) {
             let full = std::path::Path::new(&cwd).join(p);
-            std::fs::remove_file(&full).or_else(|_| std::fs::remove_dir_all(&full)).map_err(|e| format!("{p}: {e}"))?;
+            std::fs::remove_file(&full)
+                .or_else(|_| std::fs::remove_dir_all(&full))
+                .map_err(|e| format!("{p}: {e}"))?;
         } else {
             tracked.push(p.as_str());
         }
@@ -521,7 +711,10 @@ pub async fn git_commit(cwd: String, message: String, amend: bool) -> Result<Str
         args.push("--amend");
     }
     git_ok(&cwd, &args).await?;
-    Ok(git_ok(&cwd, &["rev-parse", "HEAD"]).await?.trim().to_string())
+    Ok(git_ok(&cwd, &["rev-parse", "HEAD"])
+        .await?
+        .trim()
+        .to_string())
 }
 
 /// Push the current branch; sets upstream automatically when missing.
@@ -532,11 +725,16 @@ pub async fn git_push(cwd: String) -> Result<String, String> {
         return Ok(if err.trim().is_empty() { out } else { err });
     }
     if err.contains("no upstream") || err.contains("--set-upstream") {
-        let branch = git_ok(&cwd, &["branch", "--show-current"]).await?.trim().to_string();
+        let branch = git_ok(&cwd, &["branch", "--show-current"])
+            .await?
+            .trim()
+            .to_string();
         if branch.is_empty() {
             return Err(err.trim().to_string());
         }
-        return git_ok(&cwd, &["push", "-u", "origin", &branch]).await.map(|o| o.trim().to_string());
+        return git_ok(&cwd, &["push", "-u", "origin", &branch])
+            .await
+            .map(|o| o.trim().to_string());
     }
     Err(err.trim().to_string())
 }
@@ -545,9 +743,17 @@ pub async fn git_push(cwd: String) -> Result<String, String> {
 pub async fn git_pull(cwd: String) -> Result<String, String> {
     let (out, err, code) = run_git(&cwd, &["pull", "--ff-only"]).await?;
     if code == 0 {
-        Ok(if out.trim().is_empty() { err.trim().to_string() } else { out.trim().to_string() })
+        Ok(if out.trim().is_empty() {
+            err.trim().to_string()
+        } else {
+            out.trim().to_string()
+        })
     } else {
-        Err(if err.trim().is_empty() { format!("git pull failed ({code})") } else { err.trim().to_string() })
+        Err(if err.trim().is_empty() {
+            format!("git pull failed ({code})")
+        } else {
+            err.trim().to_string()
+        })
     }
 }
 
@@ -573,7 +779,12 @@ pub async fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<CommitInfo>,
     let n = limit.unwrap_or(50).clamp(1, 500).to_string();
     let (out, _, code) = run_git(
         &cwd,
-        &["log", "--format=%H\u{1f}%h\u{1f}%an\u{1f}%at\u{1f}%s\u{1f}%D", "-n", &n],
+        &[
+            "log",
+            "--format=%H\u{1f}%h\u{1f}%an\u{1f}%at\u{1f}%s\u{1f}%D",
+            "-n",
+            &n,
+        ],
     )
     .await?;
     if code != 0 {
@@ -601,7 +812,15 @@ pub async fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<CommitInfo>,
 /// Diff of a single commit (for the history pane).
 #[tauri::command]
 pub async fn git_show_commit(cwd: String, hash: String) -> Result<String, String> {
-    git_ok(&cwd, &["show", &hash, "--format=commit %H%nAuthor: %an%nDate: %ad%n%n    %s%n"]).await
+    git_ok(
+        &cwd,
+        &[
+            "show",
+            &hash,
+            "--format=commit %H%nAuthor: %an%nDate: %ad%n%n    %s%n",
+        ],
+    )
+    .await
 }
 
 /// Diff for one file: staged (index vs HEAD) or unstaged (worktree vs index);
@@ -665,21 +884,58 @@ mod tests {
         fs::write(tmp.path().join("a.txt"), "line1\nCHANGED\n").unwrap();
         fs::write(tmp.path().join("new.txt"), "brand new\n").unwrap();
 
-        let diff = git_review_diff(cwd.clone(), Some(cp0.clone())).await.unwrap();
-        assert!(diff.contains("CHANGED"), "diff should contain tracked change: {diff}");
-        assert!(diff.contains("brand new"), "diff should contain untracked file: {diff}");
+        let diff = git_review_diff(cwd.clone(), Some(cp0.clone()))
+            .await
+            .unwrap();
+        assert!(
+            diff.contains("CHANGED"),
+            "diff should contain tracked change: {diff}"
+        );
+        assert!(
+            diff.contains("brand new"),
+            "diff should contain untracked file: {diff}"
+        );
 
         // checkpoint with dirty tree, then more changes diff against it
         let cp1 = git_checkpoint(cwd.clone(), "turn1".into()).await.unwrap();
         assert_ne!(cp1, cp0);
         fs::write(tmp.path().join("a.txt"), "line1\nCHANGED-AGAIN\n").unwrap();
-        let diff2 = git_review_diff(cwd.clone(), Some(cp1.clone())).await.unwrap();
+        let diff2 = git_review_diff(cwd.clone(), Some(cp1.clone()))
+            .await
+            .unwrap();
         assert!(diff2.contains("CHANGED-AGAIN"));
+        assert!(
+            !diff2.contains("brand new"),
+            "pre-existing untracked file must be part of the checkpoint: {diff2}"
+        );
 
         // revert the file back to cp1 state
-        git_checkout_file(cwd.clone(), cp1, "a.txt".into()).await.unwrap();
+        git_checkout_file(cwd.clone(), cp1, "a.txt".into())
+            .await
+            .unwrap();
         let content = fs::read_to_string(tmp.path().join("a.txt")).unwrap();
         assert!(content.contains("CHANGED") && !content.contains("CHANGED-AGAIN"));
+    }
+
+    #[tokio::test]
+    async fn restore_run_files_restores_tracked_and_removes_created() {
+        let tmp = init_repo().await;
+        let cwd = tmp.path().to_str().unwrap().to_string();
+        let checkpoint = git_checkpoint(cwd.clone(), "before-run".into())
+            .await
+            .unwrap();
+        fs::write(tmp.path().join("a.txt"), "changed by agent\n").unwrap();
+        fs::write(tmp.path().join("created.txt"), "new\n").unwrap();
+
+        git_restore_run_files(cwd, checkpoint, vec!["a.txt".into(), "created.txt".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "line1\nline2\n"
+        );
+        assert!(!tmp.path().join("created.txt").exists());
     }
 
     #[tokio::test]
@@ -693,45 +949,69 @@ mod tests {
         assert!(branches[0].current);
 
         // создать ветку, изменить файл, застейджить, закоммитить
-        git_create_branch(cwd.clone(), "feature-x".into(), None).await.unwrap();
+        git_create_branch(cwd.clone(), "feature-x".into(), None)
+            .await
+            .unwrap();
         fs::write(tmp.path().join("a.txt"), "line1\nfeature\n").unwrap();
         fs::write(tmp.path().join("new.txt"), "u\n").unwrap();
 
         // staged diff пуст до add, файл виден как unstaged
-        let d0 = git_file_diff(cwd.clone(), "a.txt".into(), false).await.unwrap();
+        let d0 = git_file_diff(cwd.clone(), "a.txt".into(), false)
+            .await
+            .unwrap();
         assert!(d0.contains("feature"));
-        let untracked = git_file_diff(cwd.clone(), "new.txt".into(), false).await.unwrap();
+        let untracked = git_file_diff(cwd.clone(), "new.txt".into(), false)
+            .await
+            .unwrap();
         assert!(untracked.contains("+u"));
 
         git_stage(cwd.clone(), vec!["a.txt".into()]).await.unwrap();
-        let staged = git_file_diff(cwd.clone(), "a.txt".into(), true).await.unwrap();
+        let staged = git_file_diff(cwd.clone(), "a.txt".into(), true)
+            .await
+            .unwrap();
         assert!(staged.contains("feature"));
 
         // unstage → снова в worktree
-        git_unstage(cwd.clone(), vec!["a.txt".into()]).await.unwrap();
-        assert!(git_file_diff(cwd.clone(), "a.txt".into(), true).await.unwrap().trim().is_empty());
+        git_unstage(cwd.clone(), vec!["a.txt".into()])
+            .await
+            .unwrap();
+        assert!(git_file_diff(cwd.clone(), "a.txt".into(), true)
+            .await
+            .unwrap()
+            .trim()
+            .is_empty());
 
         git_stage(cwd.clone(), vec![]).await.unwrap(); // add -A
-        let hash = git_commit(cwd.clone(), "feat: x".into(), false).await.unwrap();
+        let hash = git_commit(cwd.clone(), "feat: x".into(), false)
+            .await
+            .unwrap();
         assert_eq!(hash.len(), 40);
 
         let log = git_log(cwd.clone(), Some(10)).await.unwrap();
         assert_eq!(log.len(), 2);
         assert_eq!(log[0].subject, "feat: x");
-        let show = git_show_commit(cwd.clone(), log[0].hash.clone()).await.unwrap();
+        let show = git_show_commit(cwd.clone(), log[0].hash.clone())
+            .await
+            .unwrap();
         assert!(show.contains("feature"));
 
         // discard: изменить + выбросить
         fs::write(tmp.path().join("a.txt"), "garbage\n").unwrap();
         fs::write(tmp.path().join("junk.txt"), "j\n").unwrap();
-        git_discard(cwd.clone(), vec!["a.txt".into(), "junk.txt".into()]).await.unwrap();
-        assert!(fs::read_to_string(tmp.path().join("a.txt")).unwrap().contains("feature"));
+        git_discard(cwd.clone(), vec!["a.txt".into(), "junk.txt".into()])
+            .await
+            .unwrap();
+        assert!(fs::read_to_string(tmp.path().join("a.txt"))
+            .unwrap()
+            .contains("feature"));
         assert!(!tmp.path().join("junk.txt").exists());
 
         // переключение и удаление ветки
         let main = branches[0].name.clone();
         git_checkout_branch(cwd.clone(), main, false).await.unwrap();
-        git_delete_branch(cwd.clone(), "feature-x".into(), true).await.unwrap();
+        git_delete_branch(cwd.clone(), "feature-x".into(), true)
+            .await
+            .unwrap();
         assert_eq!(git_branches(cwd.clone()).await.unwrap().len(), 1);
     }
 

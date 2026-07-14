@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Virtuoso } from "react-virtuoso";
 import { getBackend } from "../lib/backend";
 import { confirmDialog, messageDialog } from "../lib/dialog";
 import { firstChangedLine, parseUnifiedDiff, type DiffFile } from "../lib/diff";
@@ -25,6 +26,14 @@ interface ReviewComment {
   line: number | null;
   text: string;
 }
+
+type DiffRow =
+  | { kind: "hunk"; key: string; header: string }
+  | {
+      kind: "line";
+      key: string;
+      line: DiffFile["hunks"][number]["lines"][number];
+    };
 
 function fmtAgo(tsSec: number): string {
   const d = Date.now() - tsSec * 1000;
@@ -228,16 +237,80 @@ function DiffFileBlock({
   actions?: React.ReactNode;
 }) {
   const editor = useStore((s) => s.appConfig.editor);
-  const [commentDraft, setCommentDraft] = useState<number | null>(null);
+  const [commentDraft, setCommentDraft] = useState<{ key: string; line: number | null } | null>(null);
   const [draftText, setDraftText] = useState("");
-  // G1: большие диффы сворачиваем по умолчанию — тысячи DOM-строк тормозят
   const totalLines = file.hunks.reduce((n, h) => n + h.lines.length, 0);
   const [expanded, setExpanded] = useState(totalLines <= 400);
+  const rows = useMemo<DiffRow[]>(
+    () =>
+      file.hunks.flatMap((hunk, hunkIndex) => [
+        { kind: "hunk" as const, key: `h-${hunkIndex}`, header: hunk.header },
+        ...hunk.lines.map((line, lineIndex) => ({
+          kind: "line" as const,
+          key: `l-${hunkIndex}-${lineIndex}`,
+          line,
+        })),
+      ]),
+    [file.hunks],
+  );
 
   const openInEditor = async () => {
     const be = await getBackend();
     const path = `${cwd.replace(/\/$/, "")}/${file.newPath}`;
     await be.invoke("open_in_editor", { editor, path, line: firstChangedLine(file) }).catch(() => {});
+  };
+
+  const renderRow = (row: DiffRow) => {
+    if (row.kind === "hunk") return <div className="hunk-header">{row.header}</div>;
+
+    const lineNo = row.line.newNo ?? row.line.oldNo;
+    const draftOpen = commentDraft?.key === row.key;
+    return (
+      <div>
+        <div className={`dline ${row.line.kind === "add" ? "add" : row.line.kind === "del" ? "del" : ""}`}>
+          <span className="no">{row.line.oldNo ?? ""}</span>
+          <span className="no">{row.line.newNo ?? ""}</span>
+          <span className="dtext">
+            {row.line.kind === "add" ? "+" : row.line.kind === "del" ? "−" : " "} {row.line.text}
+          </span>
+          <button
+            className="add-comment"
+            title="Комментировать строку"
+            onClick={() => {
+              setCommentDraft({ key: row.key, line: lineNo });
+              setDraftText("");
+            }}
+          >
+            <CommentIcon size={12} />
+          </button>
+        </div>
+        {draftOpen && (
+          <div className="comment-box">
+            <textarea
+              autoFocus
+              style={{ width: "100%", minHeight: 50 }}
+              placeholder="Что исправить в этой строке?"
+              value={draftText}
+              onChange={(e) => setDraftText(e.target.value)}
+            />
+            <div className="row" style={{ justifyContent: "flex-end", marginTop: 4 }}>
+              <button onClick={() => setCommentDraft(null)}>Отмена</button>
+              <button
+                className="primary"
+                onClick={() => {
+                  if (draftText.trim()) {
+                    onComment({ file: file.newPath, line: commentDraft?.line ?? null, text: draftText.trim() });
+                  }
+                  setCommentDraft(null);
+                }}
+              >
+                Добавить
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -263,61 +336,17 @@ function DiffFileBlock({
         >
           Большой дифф: {totalLines} строк, {file.hunks.length} ханков — показать
         </button>
+      ) : totalLines > 400 ? (
+        <Virtuoso
+          className="virtual-diff"
+          style={{ height: `min(70vh, ${Math.max(240, rows.length * 24)}px)` }}
+          data={rows}
+          computeItemKey={(_index, row) => row.key}
+          itemContent={(_index, row) => renderRow(row)}
+          increaseViewportBy={300}
+        />
       ) : (
-        file.hunks.map((h, hi) => (
-          <div key={hi}>
-            <div className="hunk-header">{h.header}</div>
-            {h.lines.map((l, li) => {
-              const lineNo = l.newNo ?? l.oldNo;
-              return (
-                <div key={li}>
-                  <div className={`dline ${l.kind === "add" ? "add" : l.kind === "del" ? "del" : ""}`}>
-                    <span className="no">{l.oldNo ?? ""}</span>
-                    <span className="no">{l.newNo ?? ""}</span>
-                    <span className="dtext">
-                      {l.kind === "add" ? "+" : l.kind === "del" ? "−" : " "} {l.text}
-                    </span>
-                    <button
-                      className="add-comment"
-                      title="Комментировать строку"
-                      onClick={() => {
-                        setCommentDraft(lineNo);
-                        setDraftText("");
-                      }}
-                    >
-                      <CommentIcon size={12} />
-                    </button>
-                  </div>
-                  {commentDraft != null && commentDraft === lineNo && (
-                    <div className="comment-box">
-                      <textarea
-                        autoFocus
-                        style={{ width: "100%", minHeight: 50 }}
-                        placeholder="Что исправить в этой строке?"
-                        value={draftText}
-                        onChange={(e) => setDraftText(e.target.value)}
-                      />
-                      <div className="row" style={{ justifyContent: "flex-end", marginTop: 4 }}>
-                        <button onClick={() => setCommentDraft(null)}>Отмена</button>
-                        <button
-                          className="primary"
-                          onClick={() => {
-                            if (draftText.trim()) {
-                              onComment({ file: file.newPath, line: commentDraft, text: draftText.trim() });
-                            }
-                            setCommentDraft(null);
-                          }}
-                        >
-                          Добавить
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        ))
+        rows.map((row) => <div key={row.key}>{renderRow(row)}</div>)
       )}
     </div>
   );
@@ -624,10 +653,10 @@ function HistoryTab({ cwd, onComment }: { cwd: string; onComment: (c: ReviewComm
 
 // ---------- вкладка «Чекпоинты» (diff против чекпоинта pi-app) ----------
 
-function CheckpointsTab({ cwd, onComment, onChanged }: { cwd: string; onComment: (c: ReviewComment) => void; onChanged: () => void }) {
+function CheckpointsTab({ cwd, onComment, onChanged, initialBase }: { cwd: string; onComment: (c: ReviewComment) => void; onChanged: () => void; initialBase?: string | null }) {
   const chats = useStore((s) => s.chats);
   const checkpoints = chats[cwd]?.checkpoints ?? [];
-  const [base, setBase] = useState<string>("HEAD");
+  const [base, setBase] = useState<string>(initialBase ?? "HEAD");
   const [diffText, setDiffText] = useState("");
   const [loading, setLoading] = useState(false);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
@@ -736,7 +765,8 @@ type ReviewTab = "changes" | "history" | "checkpoints";
 
 export default function ReviewView() {
   const cwd = useStore((s) => s.currentCwd);
-  const [tab, setTab] = useState<ReviewTab>("changes");
+  const reviewCheckpoint = useStore((s) => s.reviewCheckpoint);
+  const [tab, setTab] = useState<ReviewTab>(reviewCheckpoint ? "checkpoints" : "changes");
   const [summary, setSummary] = useState<GitSummary | null>(null);
   const [isRepo, setIsRepo] = useState<boolean | null>(null);
   const [comments, setComments] = useState<ReviewComment[]>([]);
@@ -755,6 +785,10 @@ export default function ReviewView() {
   useEffect(() => {
     void refreshSummary();
   }, [refreshSummary, refreshKey]);
+
+  useEffect(() => {
+    if (reviewCheckpoint) setTab("checkpoints");
+  }, [reviewCheckpoint]);
 
   if (!cwd) return <div className="empty">Выберите проект</div>;
 
@@ -822,7 +856,7 @@ export default function ReviewView() {
         )}
       </div>
 
-      <div className="tabs" style={{ padding: "8px 14px 0", marginBottom: 0, borderBottom: "1px solid var(--border)" }}>
+      <div className="tabs review-tabs">
         {(
           [
             { id: "changes", label: `Изменения${summary && summary.changedFiles > 0 ? ` · ${summary.changedFiles}` : ""}` },
@@ -830,7 +864,14 @@ export default function ReviewView() {
             { id: "checkpoints", label: "Чекпоинты агента" },
           ] as { id: ReviewTab; label: string }[]
         ).map((t) => (
-          <button key={t.id} className={tab === t.id ? "active" : ""} onClick={() => setTab(t.id)}>
+          <button
+            key={t.id}
+            className={tab === t.id ? "active" : ""}
+            onClick={() => {
+              setTab(t.id);
+              if (t.id !== "checkpoints") useStore.getState().set({ reviewCheckpoint: null });
+            }}
+          >
             {t.label}
           </button>
         ))}
@@ -844,7 +885,7 @@ export default function ReviewView() {
 
       {tab === "changes" && <ChangesTab key={refreshKey} cwd={cwd} onComment={addComment} onChanged={onGitChanged} />}
       {tab === "history" && <HistoryTab key={refreshKey} cwd={cwd} onComment={addComment} />}
-      {tab === "checkpoints" && <CheckpointsTab key={refreshKey} cwd={cwd} onComment={addComment} onChanged={onGitChanged} />}
+      {tab === "checkpoints" && <CheckpointsTab key={`${refreshKey}:${reviewCheckpoint ?? "HEAD"}`} cwd={cwd} onComment={addComment} onChanged={onGitChanged} initialBase={reviewCheckpoint} />}
     </div>
   );
 }
