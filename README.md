@@ -73,7 +73,7 @@ The app is unsigned — on first launch, right-click `Pi.app` → **Open**. Inst
 ### Develop
 
 ```bash
-npm install
+npm ci               # `npm install` rewrites the tracked package-lock.json
 npm run dev          # UI only, mock backend, no pi needed — http://localhost:1420
 npm run tauri dev    # full app with hot-reload (requires pi installed)
 ```
@@ -83,6 +83,26 @@ npm run tauri dev    # full app with hot-reload (requires pi installed)
 ```bash
 npm run tauri build  # .app + .dmg under src-tauri/target/release/bundle/
 ```
+
+### In-app update fails with "local changes would be overwritten"
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+        package-lock.json
+```
+
+Versions up to `6a1dae4` ran `npm install` during the update, which rewrote the
+tracked `package-lock.json` and left the checkout dirty — so the *next* update
+aborted at `git pull --ff-only`. Newer versions use `npm ci` and reset build
+artifacts automatically, but you need one manual step to get there:
+
+```bash
+cd /path/to/pi-app          # your sources checkout (Update Center shows the path)
+git checkout -- package-lock.json src-tauri/Cargo.lock
+```
+
+Then run the update again. Your own uncommitted work is never touched by this —
+the updater now refuses to start when it finds any, and lists the files instead.
 
 ## ⌨️ Keyboard Shortcuts
 

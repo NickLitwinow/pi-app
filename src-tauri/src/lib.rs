@@ -10,6 +10,7 @@ pub mod pi_cli;
 pub mod preview;
 pub mod sessions;
 pub mod supervisor;
+pub mod text;
 pub mod themes;
 pub mod watcher;
 

@@ -520,7 +520,7 @@ pub async fn spawn_agent_impl<R: Runtime>(
                                             agent_id: id.clone(),
                                             line: format!(
                                                 "[unparseable] {}",
-                                                &line[..line.len().min(500)]
+                                                crate::text::head_bytes(&line, 500)
                                             ),
                                         },
                                     );
@@ -541,7 +541,7 @@ pub async fn spawn_agent_impl<R: Runtime>(
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let mut l = line;
-                l.truncate(4000);
+                crate::text::truncate_bytes(&mut l, 4000);
                 let _ = app.emit(
                     "agent-stderr",
                     AgentStderrPayload {

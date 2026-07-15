@@ -248,7 +248,7 @@ pub async fn preview_start(
         tauri::async_runtime::spawn(async move {
             let mut lines = BufReader::new(reader).lines();
             while let Ok(Some(mut line)) = lines.next_line().await {
-                line.truncate(4000);
+                crate::text::truncate_bytes(&mut line, 4000);
                 let _ = app.emit(
                     "preview-output",
                     PreviewOutput {

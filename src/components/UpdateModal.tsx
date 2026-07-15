@@ -51,6 +51,17 @@ export default function UpdateModal({ onClose }: { onClose: () => void }) {
   const repoPath = appInfo?.sourceRepo ?? configuredRepo ?? null;
   const packageUpdates = packageInfo.filter((item) => item.updateAvailable);
 
+  // Пересборка начинается с `git pull --ff-only`: на незакоммиченных правках или
+  // разошедшихся ветках она обречена. Раньше это выяснялось только из лога с
+  // кодом 1 — теперь говорим до нажатия. Готовый DMG этим не блокируется: он
+  // ставится мимо исходников.
+  const sourceBlock = appInfo?.diverged
+    ? "Локальная ветка разошлась с upstream — быстрый перемотка-pull невозможен. Слейте или сбросьте ветку вручную."
+    : appInfo && appInfo.dirtyFiles.length > 0
+      ? `Незакоммиченные правки в исходниках (${appInfo.dirtyFiles.slice(0, 3).join(", ")}${appInfo.dirtyFiles.length > 3 ? ` и ещё ${appInfo.dirtyFiles.length - 3}` : ""}). Закоммитьте или уберите их (git stash) — обновление их не тронет.`
+      : null;
+  const sourceUpdateBlocked = sourceBlock != null && !appInfo?.assetUrl;
+
   const pickRepo = async () => {
     const be = await getBackend();
     if (be.isMock) {
@@ -149,11 +160,13 @@ export default function UpdateModal({ onClose }: { onClose: () => void }) {
                   <span className="mono">{appInfo.latest ?? "—"}{appInfo.latestKind !== "none" ? ` · ${appInfo.latestKind === "release" ? "релиз" : "коммит"}` : ""}</span>
                 </div>
                 {appInfo.notes && <div className="am-notes">{appInfo.notes}</div>}
+                {appInfo.updateAvailable && sourceBlock && <div className="am-notes update-warn">⚠ {sourceBlock}</div>}
                 <div className="update-inline-actions">
                   {appInfo.htmlUrl && <button className="hint" onClick={() => void openExternalUrl(appInfo.htmlUrl)}><ExternalIcon size={12} /> GitHub</button>}
                   <button
                     className="primary"
-                    disabled={appRunning || (!appInfo.assetUrl && !appInfo.sourceRepoValid)}
+                    disabled={appRunning || sourceUpdateBlocked || (!appInfo.assetUrl && !appInfo.sourceRepoValid)}
+                    title={sourceUpdateBlocked ? sourceBlock ?? undefined : undefined}
                     onClick={() => void updateApp()}
                   >
                     {appRunning ? <><span className="spinner" /> Установка…</> : <><CheckIcon size={13} /> {appInfo.assetUrl ? "Установить в фоне" : "Обновить из исходников"}</>}

@@ -308,6 +308,12 @@ export interface AppUpdateInfo {
   /** Коммитов позади/впереди upstream (локальный git-путь). */
   behind: number;
   ahead: number;
+  /** Незакоммиченные правки пользователя — пересборка из исходников невозможна. */
+  dirtyFiles: string[];
+  /** Артефакты сборки, которые обновление откатит само (с бэкапом). */
+  autoResettableFiles: string[];
+  /** Ветки разошлись — `git pull --ff-only` не пройдёт. */
+  diverged: boolean;
   error: string | null;
 }
 

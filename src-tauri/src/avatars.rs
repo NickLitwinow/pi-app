@@ -27,7 +27,11 @@ pub fn read_avatar_data(path: String) -> Result<String, String> {
         "webp" => "image/webp",
         "svg" => "image/svg+xml",
         "json" => "application/json",
-        _ => return Err("поддерживаются PNG, JPEG, GIF, WebP, анимированный SVG и Lottie (JSON)".into()),
+        _ => {
+            return Err(
+                "поддерживаются PNG, JPEG, GIF, WebP, анимированный SVG и Lottie (JSON)".into(),
+            )
+        }
     };
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))

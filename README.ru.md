@@ -73,7 +73,7 @@ git clone https://github.com/NickLitwinow/pi-app.git && cd pi-app && npm run boo
 ### Разработка
 
 ```bash
-npm install
+npm ci               # `npm install` перезаписывает затреканный package-lock.json
 npm run dev          # только UI, mock-бэкенд, pi не нужен — http://localhost:1420
 npm run tauri dev    # полное приложение с hot-reload (требуется установленный pi)
 ```
@@ -83,6 +83,28 @@ npm run tauri dev    # полное приложение с hot-reload (треб
 ```bash
 npm run tauri build  # .app + .dmg в src-tauri/target/release/bundle/
 ```
+
+### Обновление падает с «local changes would be overwritten»
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+        package-lock.json
+```
+
+Версии по `6a1dae4` включительно выполняли при обновлении `npm install` — он
+перезаписывал затреканный `package-lock.json` и оставлял рабочую копию грязной,
+поэтому *следующее* обновление обрывалось на `git pull --ff-only`. Новые версии
+используют `npm ci` и откатывают артефакты сборки сами, но чтобы до них
+добраться, нужен один ручной шаг:
+
+```bash
+cd /путь/к/pi-app           # каталог исходников (показан в Центре обновлений)
+git checkout -- package-lock.json src-tauri/Cargo.lock
+```
+
+После этого запустите обновление снова. Вашу незакоммиченную работу это не
+затрагивает: обновление теперь вообще не стартует, если находит её, а вместо
+запуска показывает список файлов.
 
 ## ⌨️ Горячие клавиши
 
