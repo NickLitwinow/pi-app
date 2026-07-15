@@ -724,7 +724,8 @@ class MockBackend implements Backend {
           notes: "def5678 feat: self-update, dialog fixes\nc0ffee0 fix: statusline layout",
           htmlUrl: "https://github.com/NickLitwinow/pi-app", updateAvailable: true,
           assetUrl: "https://github.com/NickLitwinow/pi-app/releases/download/v0.2.0/Pi-universal.dmg",
-          checked: true, behind: 2, ahead: 0, error: null,
+          checked: true, behind: 2, ahead: 0,
+          dirtyFiles: [], autoResettableFiles: [], diverged: false, error: null,
         } as T;
       }
       case "check_pi_update": {
@@ -740,7 +741,7 @@ class MockBackend implements Backend {
       case "app_update_run": {
         const runId = `upd-${Date.now()}`;
         void (async () => {
-          for (const l of ["▶ Обновление исходников (git pull)", "$ git pull --ff-only", "Already up to date.", "▶ Сборка приложения (tauri build)", "Compiling pi-app…", "✓ Готово. Нажмите «Перезапустить»."]) {
+          for (const l of ["▶ Обновление исходников (git pull)", "$ git pull --ff-only", "Already up to date.", "▶ Установка зависимостей (npm ci)", "$ npm ci --no-audit --no-fund", "▶ Сборка приложения (tauri build)", "Compiling pi-app…", "✓ Готово. Нажмите «Перезапустить»."]) {
             await sleep(500);
             this.emit("app-update-output", { runId, line: l, done: false });
           }

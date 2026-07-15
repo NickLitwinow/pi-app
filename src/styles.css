@@ -366,6 +366,9 @@ html[data-effects="on"] .sidebar {
   background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
   font-size: 12px; color: var(--text-dim); white-space: pre-wrap; max-height: 120px; overflow-y: auto; margin: 6px 0;
 }
+.app-modal .am-notes.update-warn {
+  border-color: var(--warn); color: var(--text); white-space: normal;
+}
 .app-modal .am-link { display: inline-flex; align-items: center; gap: 5px; margin: 4px 0; }
 .app-modal .am-repo { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
 .app-modal .am-actions { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }

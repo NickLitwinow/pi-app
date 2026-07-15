@@ -243,7 +243,7 @@ pub async fn pi_cli_run_impl<R: Runtime>(
             tauri::async_runtime::spawn(async move {
                 let mut lines = BufReader::new(r).lines();
                 while let Ok(Some(mut line)) = lines.next_line().await {
-                    line.truncate(4000);
+                    crate::text::truncate_bytes(&mut line, 4000);
                     let _ = app.emit(
                         "pi-cli-output",
                         PiCliOutput {

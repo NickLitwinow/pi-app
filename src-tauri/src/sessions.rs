@@ -347,10 +347,38 @@ fn read_header_line(path: &Path) -> Option<Value> {
     serde_json::from_str(line.trim()).ok()
 }
 
+/// Путь под `root` после разыменования симлинков и `..`.
+///
+/// Пути в команды приходят из webview, а он рендерит недоверенный вывод модели
+/// и инструментов. `assert_session_file` проверяет СОДЕРЖИМОЕ (это сессия pi),
+/// но не МЕСТО — скоуп по корню сессий закрывает вторую половину: любой файл,
+/// начинающийся с `{"type":"session"}`, где бы он ни лежал, больше не мишень.
+fn within_root(path: &str, root: &Path) -> Result<PathBuf, String> {
+    // canonicalize разыменовывает симлинки и `..` — иначе скоуп обходится
+    // через `<root>/link-наружу` или `<root>/../../secret.jsonl`.
+    let resolved = Path::new(path)
+        .canonicalize()
+        .map_err(|e| format!("{path}: {e}"))?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("каталог сессий pi недоступен: {e}"))?;
+    if !resolved.starts_with(&root) {
+        return Err("путь вне каталога сессий pi".into());
+    }
+    Ok(resolved)
+}
+
+fn scoped_session_path(path: &str) -> Result<PathBuf, String> {
+    within_root(path, &sessions_root())
+}
+
 /// Permanently delete a session file (with validation that it IS a session).
 #[tauri::command]
 pub fn delete_session(path: String) -> Result<(), String> {
-    let p = Path::new(&path);
+    delete_session_at(&scoped_session_path(&path)?)
+}
+
+fn delete_session_at(p: &Path) -> Result<(), String> {
     assert_session_file(p)?;
     fs::remove_file(p).map_err(|e| e.to_string())
 }
@@ -384,7 +412,10 @@ fn gen_session_id() -> String {
 /// до указанного entry id, «форк с этого места»). Возвращает мету новой сессии.
 #[tauri::command]
 pub fn fork_session(path: String, up_to_entry_id: Option<String>) -> Result<SessionMeta, String> {
-    let src = Path::new(&path);
+    fork_session_at(&scoped_session_path(&path)?, up_to_entry_id)
+}
+
+fn fork_session_at(src: &Path, up_to_entry_id: Option<String>) -> Result<SessionMeta, String> {
     assert_session_file(src)?;
     let content = fs::read_to_string(src).map_err(|e| e.to_string())?;
     let new_id = gen_session_id();
@@ -454,8 +485,11 @@ pub fn fork_session(path: String, up_to_entry_id: Option<String>) -> Result<Sess
 /// the same format pi itself writes (name changes are append-only events).
 #[tauri::command]
 pub fn rename_session(path: String, name: String) -> Result<(), String> {
+    rename_session_at(&scoped_session_path(&path)?, &name)
+}
+
+fn rename_session_at(p: &Path, name: &str) -> Result<(), String> {
     use std::io::Write;
-    let p = Path::new(&path);
     assert_session_file(p)?;
 
     // parentId must reference the last entry in the file
@@ -559,7 +593,7 @@ pub fn read_session_thread(path: String) -> Result<Vec<Value>, String> {
     if !path.ends_with(".jsonl") {
         return Err("not a session file".into());
     }
-    read_session_thread_entries(Path::new(&path))
+    read_session_thread_entries(&scoped_session_path(&path)?)
 }
 
 // ---------- search ----------
@@ -1077,7 +1111,7 @@ mod session_ops_tests {
         .unwrap();
 
         // полный форк
-        let meta = fork_session(file.to_string_lossy().into_owned(), None).unwrap();
+        let meta = fork_session_at(&file, None).unwrap();
         assert_ne!(meta.id, "orig01");
         assert_eq!(meta.message_count, 3);
         assert_eq!(meta.name.as_deref(), Some("Форк: Orig"));
@@ -1088,7 +1122,7 @@ mod session_ops_tests {
         );
 
         // частичный форк: всё строго до e3 (второго сообщения пользователя)
-        let meta2 = fork_session(file.to_string_lossy().into_owned(), Some("e3".into())).unwrap();
+        let meta2 = fork_session_at(&file, Some("e3".into())).unwrap();
         assert_eq!(meta2.message_count, 2);
         let content = fs::read_to_string(Path::new(&meta2.path)).unwrap();
         assert!(!content.contains("second"));
@@ -1137,12 +1171,12 @@ mod session_ops_tests {
         let file = proj.join("s.jsonl");
         fs::write(&file, "{\"type\":\"session\",\"version\":3,\"id\":\"abc\",\"timestamp\":\"2026-07-01T00:00:00.000Z\",\"cwd\":\"/tmp/x\"}\n{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-07-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n").unwrap();
 
-        rename_session(file.to_string_lossy().into_owned(), "Новое имя".into()).unwrap();
+        rename_session_at(&file, "Новое имя").unwrap();
         let meta = parse_session_meta(&file).unwrap();
         assert_eq!(meta.name.as_deref(), Some("Новое имя"));
 
         // повторное переименование цепляет parentId за последнюю запись
-        rename_session(file.to_string_lossy().into_owned(), "Второе".into()).unwrap();
+        rename_session_at(&file, "Второе").unwrap();
         let content = fs::read_to_string(&file).unwrap();
         let last: Value = serde_json::from_str(content.lines().last().unwrap()).unwrap();
         assert_eq!(last["name"], "Второе");
@@ -1151,8 +1185,44 @@ mod session_ops_tests {
         // удаление отказывает не-сессиям и удаляет сессию
         let bogus = proj.join("bogus.jsonl");
         fs::write(&bogus, "{\"type\":\"other\"}\n").unwrap();
-        assert!(delete_session(bogus.to_string_lossy().into_owned()).is_err());
-        delete_session(file.to_string_lossy().into_owned()).unwrap();
+        assert!(delete_session_at(&bogus).is_err());
+        delete_session_at(&file).unwrap();
         assert!(!file.exists());
+    }
+
+    /// Скоуп файловых команд: webview не должен дотянуться до файлов вне
+    /// каталога сессий pi — ни абсолютным путём, ни `..`, ни симлинком.
+    #[test]
+    fn session_paths_are_scoped_to_the_sessions_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let proj = root.join("--p--");
+        fs::create_dir_all(&proj).unwrap();
+        let inside = proj.join("s.jsonl");
+        fs::write(&inside, "{\"type\":\"session\",\"id\":\"a\"}\n").unwrap();
+
+        // легитимный путь внутри корня проходит
+        let ok = within_root(&inside.to_string_lossy(), &root).unwrap();
+        assert!(ok.ends_with("s.jsonl"));
+
+        // файл снаружи — отказ, даже если это валидная сессия pi
+        let outside = tmp.path().join("elsewhere.jsonl");
+        fs::write(&outside, "{\"type\":\"session\",\"id\":\"b\"}\n").unwrap();
+        assert!(within_root(&outside.to_string_lossy(), &root).is_err());
+
+        // обход через `..` — отказ
+        let traversal = proj.join("../../elsewhere.jsonl");
+        assert!(within_root(&traversal.to_string_lossy(), &root).is_err());
+
+        // симлинк изнутри корня наружу — отказ (canonicalize разыменовывает)
+        #[cfg(unix)]
+        {
+            let link = proj.join("link.jsonl");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(within_root(&link.to_string_lossy(), &root).is_err());
+        }
+
+        // несуществующий путь не паникует, а честно отказывает
+        assert!(within_root(&root.join("nope.jsonl").to_string_lossy(), &root).is_err());
     }
 }

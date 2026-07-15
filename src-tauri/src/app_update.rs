@@ -98,7 +98,47 @@ pub struct AppUpdateInfo {
     /// Коммитов позади/впереди upstream (локальный git-путь; 0 в fallback).
     pub behind: u64,
     pub ahead: u64,
+    /// Незакоммиченные правки пользователя: `git pull --ff-only` их не переживёт,
+    /// а трогать их мы не имеем права — сборку из исходников надо блокировать.
+    pub dirty_files: Vec<String>,
+    /// Испорченные пайплайном артефакты сборки — откатим сами (с бэкапом).
+    pub auto_resettable_files: Vec<String>,
+    /// Ветки разошлись (ahead>0 && behind>0) — ff-only невозможен в принципе.
+    pub diverged: bool,
     pub error: Option<String>,
+}
+
+/// Разбор semver-подобной версии в сравнимые числа. Нечисловые хвосты
+/// (`1.2.3-beta`) отбрасываются: pre-release-каналов у нас нет.
+fn version_parts(v: &str) -> Vec<u64> {
+    v.trim()
+        .trim_start_matches('v')
+        .split(['.', '-', '+'])
+        .map_while(|p| p.parse::<u64>().ok())
+        .collect()
+}
+
+/// Строго ли `latest` новее `current`.
+///
+/// Раньше сравнение было `tag != current_version`, из-за чего ЛЮБОЙ отличный
+/// тег считался обновлением — включая более старый. В связке с фоновой
+/// автоустановкой это молча откатывало приложение назад.
+fn is_newer(latest: &str, current: &str) -> bool {
+    let (a, b) = (version_parts(latest), version_parts(current));
+    if a.is_empty() || b.is_empty() {
+        // версию не разобрать — не рискуем предлагать установку
+        return false;
+    }
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return x > y;
+        }
+    }
+    false
 }
 
 fn release_dmg(v: &Value) -> Option<String> {
@@ -152,20 +192,30 @@ async fn github_get(url: &str) -> Result<(u16, String), String> {
     Ok((status, json.to_string()))
 }
 
-/// Запустить git в `repo`, вернуть trimmed stdout при коде 0.
-async fn git_capture(repo: &Path, args: &[&str]) -> Option<String> {
+/// Запустить git в `repo`, вернуть stdout как есть при коде 0.
+async fn git_capture_raw(repo: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .args(args)
         .current_dir(repo)
         .stdin(Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .ok()?;
     if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         None
     }
+}
+
+/// То же, но trimmed — удобно для одиночных значений (sha, имя ветки).
+/// ВНИМАНИЕ: для `status --porcelain` не годится — trim съедает ведущий пробел
+/// статуса первой строки (`" M path"`), и разбор уезжает на символ.
+async fn git_capture(repo: &Path, args: &[&str]) -> Option<String> {
+    git_capture_raw(repo, args)
+        .await
+        .map(|out| out.trim().to_string())
 }
 
 /// Upstream-ref, который отслеживает репозиторий: @{upstream} текущей ветки,
@@ -196,6 +246,56 @@ struct LocalStatus {
     ahead: u64,
     up_sha: String,
     notes: String,
+    dirty: Vec<String>,
+    auto_resettable: Vec<String>,
+}
+
+/// Файлы, которые портит сам пайплайн обновления: `npm install` переписывал
+/// package-lock.json, `tauri build` — Cargo.lock. Оба затрекано в git, поэтому
+/// СЛЕДУЮЩИЙ `git pull --ff-only` падал с «Your local changes to the following
+/// files would be overwritten by merge» — первое обновление у пользователя
+/// проходило, все последующие нет. Шаг npm переведён на `npm ci` (lockfile не
+/// трогает), а уже испорченные копии чиним откатом с бэкапом.
+const BUILD_ARTIFACTS: &[&str] = &["package-lock.json", "src-tauri/Cargo.lock"];
+
+#[derive(Default, PartialEq, Debug)]
+struct DirtyState {
+    /// Артефакты сборки — можно откатить (с бэкапом) и продолжить.
+    auto_resettable: Vec<String>,
+    /// Всё остальное — работа пользователя, трогать нельзя.
+    blocking: Vec<String>,
+}
+
+/// Разбор `git status --porcelain`. Untracked (`??`) не учитываем: они ломают
+/// ff-only только при коллизии с входящим коммитом — тогда пусть говорит сам
+/// git, а не мы запрещаем обновление из-за постороннего файла в каталоге.
+fn classify_porcelain(porcelain: &str) -> DirtyState {
+    let mut state = DirtyState::default();
+    for line in porcelain.lines() {
+        if line.len() < 4 || line.starts_with("??") || line.starts_with("!!") {
+            continue;
+        }
+        // "XY path" либо "XY orig -> path" (переименование).
+        let path = line[3..].split(" -> ").last().unwrap_or_default().trim();
+        let path = path.trim_matches('"');
+        if path.is_empty() {
+            continue;
+        }
+        if BUILD_ARTIFACTS.contains(&path) {
+            state.auto_resettable.push(path.to_string());
+        } else {
+            state.blocking.push(path.to_string());
+        }
+    }
+    state
+}
+
+/// Состояние рабочей копии исходников (для честного статуса в UI).
+async fn dirty_state(repo: &Path) -> DirtyState {
+    match git_capture_raw(repo, &["status", "--porcelain"]).await {
+        Some(out) => classify_porcelain(&out),
+        None => DirtyState::default(),
+    }
 }
 
 /// Локальный git-взгляд на то, отстаёт ли репозиторий исходников от remote —
@@ -208,12 +308,16 @@ async fn local_update_status(repo: &Path) -> Option<LocalStatus> {
         .split_once('/')
         .map(|(r, _)| r.to_string())
         .unwrap_or_else(|| "origin".into());
-    // best-effort fetch (с таймаутом) — освежить remote-tracking ref
+    // best-effort fetch (с таймаутом) — освежить remote-tracking ref.
+    // kill_on_drop обязателен: без него дроп future по таймауту оставлял
+    // git-процесс жить (check_app_update зовётся на каждом старте — на медленном
+    // или битом remote такие fetch'и копились).
     let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         let _ = Command::new("git")
             .args(["fetch", "--quiet", &remote])
             .current_dir(repo)
             .stdin(Stdio::null())
+            .kill_on_drop(true)
             .output()
             .await;
     })
@@ -248,11 +352,14 @@ async fn local_update_status(repo: &Path) -> Option<LocalStatus> {
     )
     .await
     .unwrap_or_default();
+    let dirty = dirty_state(repo).await;
     Some(LocalStatus {
         behind,
         ahead,
         up_sha,
         notes,
+        dirty: dirty.blocking,
+        auto_resettable: dirty.auto_resettable,
     })
 }
 
@@ -310,6 +417,9 @@ pub async fn check_app_update(source_repo: Option<String>) -> AppUpdateInfo {
                 info.latest = Some(st.up_sha);
                 info.latest_kind = "commit".into();
                 info.update_available = st.behind > 0;
+                info.diverged = st.behind > 0 && st.ahead > 0;
+                info.dirty_files = st.dirty;
+                info.auto_resettable_files = st.auto_resettable;
                 info.notes = if st.behind > 0 {
                     st.notes
                 } else if st.ahead > 0 {
@@ -363,7 +473,7 @@ pub async fn check_app_update(source_repo: Option<String>) -> AppUpdateInfo {
                     .unwrap_or("")
                     .to_string();
                 info.asset_url = release_dmg(&v);
-                info.update_available = !tag.is_empty() && tag != info.current_version;
+                info.update_available = is_newer(&tag, &info.current_version);
                 return info;
             }
         }
@@ -449,7 +559,34 @@ fn current_app_bundle() -> PathBuf {
     PathBuf::from("/Applications/Pi.app")
 }
 
-/// Локальное обновление: git pull → npm install → tauri build → замена бандла.
+/// Подготовка рабочей копии к `git pull --ff-only`.
+///
+/// Артефакты сборки, испорченные прошлым запуском обновления, откатываем —
+/// сохранив копию рядом (`*.pi-app.bak`, та же механика, что у config.rs).
+/// На правках пользователя останавливаемся, не тронув ни файла: молча
+/// затирать чужую работу ради обновления недопустимо.
+async fn reset_build_artifacts(repo: &Path) -> Result<Vec<String>, Vec<String>> {
+    let state = dirty_state(repo).await;
+    if !state.blocking.is_empty() {
+        return Err(state.blocking);
+    }
+    let mut reset = Vec::new();
+    for path in state.auto_resettable {
+        let full = repo.join(&path);
+        let mut backup = full.clone().into_os_string();
+        backup.push(".pi-app.bak");
+        let _ = std::fs::copy(&full, PathBuf::from(backup));
+        if git_capture(repo, &["checkout", "--", &path])
+            .await
+            .is_some()
+        {
+            reset.push(path);
+        }
+    }
+    Ok(reset)
+}
+
+/// Локальное обновление: git pull → npm ci → tauri build → замена бандла.
 /// Каждый шаг стримит вывод событием `app-update-output`. Возвращает run id.
 #[tauri::command]
 pub async fn app_update_run(app: AppHandle, source_repo: String) -> Result<String, String> {
@@ -559,6 +696,47 @@ pub async fn app_update_run_impl<R: Runtime>(
                 },
             );
         };
+        let emit_done = |code: i32| {
+            let _ = app2.emit(
+                "app-update-output",
+                UpdateOutput {
+                    run_id: run_id2.clone(),
+                    line: None,
+                    done: true,
+                    code: Some(code),
+                },
+            );
+        };
+
+        // Рабочая копия должна пережить `git pull --ff-only`, иначе шаг 1 упадёт
+        // с «local changes would be overwritten by merge» и обновление умрёт
+        // здесь — ровно тот отказ, который ловили пользователи.
+        match reset_build_artifacts(&repo).await {
+            Err(blocking) => {
+                emit_line(
+                    "✗ В каталоге исходников есть незакоммиченные правки — обновление остановлено, чтобы их не потерять:".into(),
+                );
+                for file in blocking.iter().take(20) {
+                    emit_line(format!("   · {file}"));
+                }
+                if blocking.len() > 20 {
+                    emit_line(format!("   … и ещё {}", blocking.len() - 20));
+                }
+                emit_line(
+                    "Закоммитьте их или уберите (git stash), затем повторите обновление.".into(),
+                );
+                emit_done(1);
+                return;
+            }
+            Ok(reset) if !reset.is_empty() => {
+                emit_line(format!(
+                    "▶ Откат артефактов сборки перед обновлением: {} (копии сохранены рядом как *.pi-app.bak)",
+                    reset.join(", ")
+                ));
+            }
+            Ok(_) => {}
+        }
+
         // шаги пайплайна; каждая команда через login-shell (нужен PATH к node/npm/cargo)
         let steps: Vec<(String, String)> = vec![
             (
@@ -566,8 +744,11 @@ pub async fn app_update_run_impl<R: Runtime>(
                 "git pull --ff-only".into(),
             ),
             (
-                "Установка зависимостей (npm install)".into(),
-                "npm install --no-audit --no-fund".into(),
+                // Именно `npm ci`, а не `npm install`: install переписывал
+                // затреканный package-lock.json (все зависимости на ^-диапазонах)
+                // и тем ломал следующий запуск обновления.
+                "Установка зависимостей (npm ci)".into(),
+                "npm ci --no-audit --no-fund".into(),
             ),
             (
                 "Сборка приложения (tauri build) — это займёт несколько минут".into(),
@@ -583,15 +764,7 @@ pub async fn app_update_run_impl<R: Runtime>(
                 emit_line(format!(
                     "✗ шаг завершился с кодом {code} — обновление прервано"
                 ));
-                let _ = app2.emit(
-                    "app-update-output",
-                    UpdateOutput {
-                        run_id: run_id2.clone(),
-                        line: None,
-                        done: true,
-                        code: Some(code),
-                    },
-                );
+                emit_done(code);
                 return;
             }
         }
@@ -600,15 +773,7 @@ pub async fn app_update_run_impl<R: Runtime>(
         let built = format!("{repo_str}/src-tauri/target/release/bundle/macos/Pi.app");
         if !Path::new(&built).exists() {
             emit_line("✗ собранный Pi.app не найден — проверьте вывод сборки".into());
-            let _ = app2.emit(
-                "app-update-output",
-                UpdateOutput {
-                    run_id: run_id2.clone(),
-                    line: None,
-                    done: true,
-                    code: Some(1),
-                },
-            );
+            emit_done(1);
             return;
         }
         emit_line(format!("▶ Установка новой версии в {}", bundle.display()));
@@ -625,15 +790,7 @@ pub async fn app_update_run_impl<R: Runtime>(
                 "✓ Готово. Нажмите «Перезапустить», чтобы запустить обновлённую версию.".into(),
             );
         }
-        let _ = app2.emit(
-            "app-update-output",
-            UpdateOutput {
-                run_id: run_id2.clone(),
-                line: None,
-                done: true,
-                code: Some(code),
-            },
-        );
+        emit_done(code);
     });
 
     Ok(run_id)
@@ -696,7 +853,7 @@ async fn stream_shell<R: Runtime>(app: &AppHandle<R>, run_id: &str, cwd: &str, c
         tauri::async_runtime::spawn(async move {
             let mut lines = BufReader::new(reader).lines();
             while let Ok(Some(mut line)) = lines.next_line().await {
-                line.truncate(4000);
+                crate::text::truncate_bytes(&mut line, 4000);
                 let _ = app.emit(
                     "app-update-output",
                     UpdateOutput {
@@ -791,6 +948,145 @@ mod tests {
         let st = local_update_status(&work).await.expect("status");
         assert_eq!(st.behind, 0, "ahead-версия не должна считаться отстающей");
         assert_eq!(st.ahead, 1);
+    }
+
+    /// Фоновая автоустановка молча откатывала версию назад: обновлением
+    /// считался любой тег, отличный от текущего.
+    #[test]
+    fn offers_only_strictly_newer_releases() {
+        assert!(is_newer("0.2.0", "0.1.0"));
+        assert!(is_newer("v1.0.0", "0.9.9"));
+        assert!(is_newer("0.1.10", "0.1.9")); // числами, не строками
+        assert!(is_newer("1.2.1", "1.2")); // недостающие части = 0
+
+        assert!(!is_newer("0.1.0", "0.1.0"), "та же версия — не обновление");
+        assert!(!is_newer("0.1.0", "0.2.0"), "старее — НЕ предлагать откат");
+        assert!(!is_newer("0.9.9", "1.0.0"));
+        // "1.2" и "1.2.0" — одна и та же версия в обе стороны
+        assert!(!is_newer("1.2", "1.2.0"));
+        assert!(!is_newer("1.2.0", "1.2"));
+
+        // мусор не должен провоцировать установку
+        assert!(!is_newer("", "0.1.0"));
+        assert!(!is_newer("nightly", "0.1.0"));
+        assert!(!is_newer("0.2.0", "unknown"));
+    }
+
+    #[test]
+    fn classifies_build_artifacts_apart_from_user_work() {
+        let state = classify_porcelain(
+            " M package-lock.json\n M src-tauri/Cargo.lock\n M src/App.tsx\n?? scratch.txt\nA  src/new.rs\n",
+        );
+        assert_eq!(
+            state.auto_resettable,
+            vec!["package-lock.json", "src-tauri/Cargo.lock"]
+        );
+        // untracked не блокирует; правки пользователя — блокируют
+        assert_eq!(state.blocking, vec!["src/App.tsx", "src/new.rs"]);
+    }
+
+    #[test]
+    fn classifies_renames_and_empty_output() {
+        let state = classify_porcelain("R  old/name.rs -> src/renamed.rs\n");
+        assert_eq!(state.blocking, vec!["src/renamed.rs"]);
+        assert_eq!(classify_porcelain(""), DirtyState::default());
+    }
+
+    /// Ведущий пробел статуса значим: на trimmed-выводе разбор съедал первую
+    /// букву пути («ackage-lock.json») и артефакт уезжал в blocking.
+    #[test]
+    fn keeps_paths_intact_for_unstaged_first_line() {
+        let state = classify_porcelain(" M package-lock.json\n");
+        assert_eq!(state.auto_resettable, vec!["package-lock.json"]);
+        assert!(state.blocking.is_empty());
+    }
+
+    #[test]
+    fn keeps_paths_with_spaces() {
+        let state = classify_porcelain(" M src/some file.tsx\n");
+        assert_eq!(state.blocking, vec!["src/some file.tsx"]);
+    }
+
+    /// Регрессия на присланный отказ: `git pull --ff-only` падал с «Your local
+    /// changes to package-lock.json would be overwritten by merge», потому что
+    /// прошлый прогон обновления сам переписал lockfile через `npm install`.
+    #[tokio::test]
+    async fn resets_lockfile_dirtied_by_previous_update_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        StdCommand::new("git")
+            .args(["init", "--bare", "-q", origin.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let work = tmp.path().join("work");
+        StdCommand::new("git")
+            .args([
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        git(&work, &["config", "user.email", "t@t.dev"]);
+        git(&work, &["config", "user.name", "t"]);
+        std::fs::write(work.join("package-lock.json"), "{\"v\":1}\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "c1"]);
+        git(&work, &["push", "-q", "-u", "origin", "HEAD"]);
+
+        // прошлый `npm install` переписал затреканный lockfile
+        std::fs::write(work.join("package-lock.json"), "{\"v\":2}\n").unwrap();
+        assert!(!dirty_state(&work).await.auto_resettable.is_empty());
+
+        let reset = reset_build_artifacts(&work).await.expect("не блокирует");
+        assert_eq!(reset, vec!["package-lock.json"]);
+        // рабочая копия снова чистая → git pull --ff-only пройдёт
+        assert_eq!(dirty_state(&work).await, DirtyState::default());
+        assert_eq!(
+            std::fs::read_to_string(work.join("package-lock.json")).unwrap(),
+            "{\"v\":1}\n"
+        );
+        // и правка не потеряна безвозвратно
+        assert_eq!(
+            std::fs::read_to_string(work.join("package-lock.json.pi-app.bak")).unwrap(),
+            "{\"v\":2}\n"
+        );
+    }
+
+    /// Правки пользователя обновление не трогает — оно останавливается.
+    #[tokio::test]
+    async fn refuses_to_touch_user_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        StdCommand::new("git")
+            .args(["init", "-q", work.to_str().unwrap()])
+            .output()
+            .unwrap();
+        git(&work, &["config", "user.email", "t@t.dev"]);
+        git(&work, &["config", "user.name", "t"]);
+        std::fs::write(work.join("src/App.tsx"), "v1\n").unwrap();
+        std::fs::write(work.join("package-lock.json"), "{\"v\":1}\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "c1"]);
+
+        std::fs::write(work.join("src/App.tsx"), "работа пользователя\n").unwrap();
+        std::fs::write(work.join("package-lock.json"), "{\"v\":2}\n").unwrap();
+
+        let blocked = reset_build_artifacts(&work)
+            .await
+            .expect_err("должен блокировать");
+        assert_eq!(blocked, vec!["src/App.tsx"]);
+        // ничего не откачено — ни правка, ни даже артефакт рядом с ней
+        assert_eq!(
+            std::fs::read_to_string(work.join("src/App.tsx")).unwrap(),
+            "работа пользователя\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join("package-lock.json")).unwrap(),
+            "{\"v\":2}\n"
+        );
     }
 
     /// Обратный случай: origin ушёл вперёд → обновление доступно (behind > 0).
