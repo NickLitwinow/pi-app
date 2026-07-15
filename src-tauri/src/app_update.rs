@@ -108,6 +108,39 @@ pub struct AppUpdateInfo {
     pub error: Option<String>,
 }
 
+/// Разбор semver-подобной версии в сравнимые числа. Нечисловые хвосты
+/// (`1.2.3-beta`) отбрасываются: pre-release-каналов у нас нет.
+fn version_parts(v: &str) -> Vec<u64> {
+    v.trim()
+        .trim_start_matches('v')
+        .split(['.', '-', '+'])
+        .map_while(|p| p.parse::<u64>().ok())
+        .collect()
+}
+
+/// Строго ли `latest` новее `current`.
+///
+/// Раньше сравнение было `tag != current_version`, из-за чего ЛЮБОЙ отличный
+/// тег считался обновлением — включая более старый. В связке с фоновой
+/// автоустановкой это молча откатывало приложение назад.
+fn is_newer(latest: &str, current: &str) -> bool {
+    let (a, b) = (version_parts(latest), version_parts(current));
+    if a.is_empty() || b.is_empty() {
+        // версию не разобрать — не рискуем предлагать установку
+        return false;
+    }
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
 fn release_dmg(v: &Value) -> Option<String> {
     let assets = v.get("assets")?.as_array()?;
     let arch = if cfg!(target_arch = "aarch64") {
@@ -440,7 +473,7 @@ pub async fn check_app_update(source_repo: Option<String>) -> AppUpdateInfo {
                     .unwrap_or("")
                     .to_string();
                 info.asset_url = release_dmg(&v);
-                info.update_available = !tag.is_empty() && tag != info.current_version;
+                info.update_available = is_newer(&tag, &info.current_version);
                 return info;
             }
         }
@@ -915,6 +948,28 @@ mod tests {
         let st = local_update_status(&work).await.expect("status");
         assert_eq!(st.behind, 0, "ahead-версия не должна считаться отстающей");
         assert_eq!(st.ahead, 1);
+    }
+
+    /// Фоновая автоустановка молча откатывала версию назад: обновлением
+    /// считался любой тег, отличный от текущего.
+    #[test]
+    fn offers_only_strictly_newer_releases() {
+        assert!(is_newer("0.2.0", "0.1.0"));
+        assert!(is_newer("v1.0.0", "0.9.9"));
+        assert!(is_newer("0.1.10", "0.1.9")); // числами, не строками
+        assert!(is_newer("1.2.1", "1.2")); // недостающие части = 0
+
+        assert!(!is_newer("0.1.0", "0.1.0"), "та же версия — не обновление");
+        assert!(!is_newer("0.1.0", "0.2.0"), "старее — НЕ предлагать откат");
+        assert!(!is_newer("0.9.9", "1.0.0"));
+        // "1.2" и "1.2.0" — одна и та же версия в обе стороны
+        assert!(!is_newer("1.2", "1.2.0"));
+        assert!(!is_newer("1.2.0", "1.2"));
+
+        // мусор не должен провоцировать установку
+        assert!(!is_newer("", "0.1.0"));
+        assert!(!is_newer("nightly", "0.1.0"));
+        assert!(!is_newer("0.2.0", "unknown"));
     }
 
     #[test]
