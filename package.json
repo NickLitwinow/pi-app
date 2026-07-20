@@ -11,6 +11,10 @@
     "test": "vitest run",
     "test:visual": "playwright test",
     "test:visual:update": "playwright test --update-snapshots",
+    "patch:pi-subagents": "node scripts/patch-pi-subagents-worktree.mjs",
+    "check:pi-subagents": "node scripts/patch-pi-subagents-worktree.mjs --check",
+    "verify:harness:final": "node bench/verify-final.mjs",
+    "verify:harness:readiness": "node bench/verify-readiness.mjs",
     "tauri": "tauri",
     "bootstrap": "npm ci && npm run tauri build && node scripts/install-app.mjs"
   },

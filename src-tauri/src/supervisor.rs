@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -10,6 +11,62 @@ use tokio::sync::Mutex;
 
 use crate::config::load_app_config;
 use crate::jsonl::LineFramer;
+
+#[cfg(target_os = "macos")]
+fn sandbox_quote(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn canonical_or_original(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Allow reads everywhere, but keep all writes from the agent and its child
+/// tools inside the workspace, durable Pi session storage, and OS scratch.
+/// This is deliberately an OS boundary rather than a prompt convention.
+#[cfg(target_os = "macos")]
+fn workspace_sandbox_profile(cwd: &Path, session_path: Option<&str>) -> String {
+    let agent_dir = crate::sessions::agent_dir();
+    let mut writable = vec![
+        canonical_or_original(cwd),
+        canonical_or_original(&agent_dir.join("sessions")),
+        canonical_or_original(&agent_dir.join("logs")),
+        // Pi uses proper-lockfile even for read-only settings/auth/model-store
+        // access. Keep those narrow runtime locks writable without exposing the
+        // package, skill, or extension trees under the agent directory.
+        agent_dir.join("settings.json.lock"),
+        agent_dir.join("auth.json"),
+        agent_dir.join("auth.json.lock"),
+        agent_dir.join("models-store.json"),
+        agent_dir.join("models-store.json.lock"),
+        agent_dir.join("mcp-cache.json"),
+        agent_dir.join("mcp-npx-cache.json"),
+        agent_dir.join("mcp-onboarding.json"),
+        agent_dir.join("mcp-oauth"),
+        canonical_or_original(&std::env::temp_dir()),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+    ];
+    if let Some(config_dir) = dirs::config_dir() {
+        writable.push(config_dir.join("ponytail"));
+    }
+    if let Some(parent) = session_path.and_then(|path| Path::new(path).parent()) {
+        writable.push(canonical_or_original(parent));
+    }
+    writable.sort();
+    writable.dedup();
+    let rules = writable
+        .iter()
+        .map(|path| format!("(subpath \"{}\")", sandbox_quote(path)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* {rules} (literal \"/dev/null\") (literal \"/dev/tty\"))"
+    )
+}
 
 // ---------- pi binary resolution ----------
 
@@ -419,13 +476,45 @@ pub async fn spawn_agent_impl<R: Runtime>(
     // ошибки провайдера»). Задаём порог из конфига (по умолчанию 0 = выкл); 0
     // снимает только stall-abort, прочие ретраи расширения остаются. GUI из
     // Finder не наследует env шелла, поэтому задаём явно.
-    let stall_timeout = crate::config::load_app_config().pi_retry_stall_timeout_ms;
+    let stall_timeout = app_config.pi_retry_stall_timeout_ms;
 
+    #[cfg(target_os = "macos")]
+    let sandbox_profile = (app_config.agent_sandbox_mode == "workspace-write"
+        && Path::new("/usr/bin/sandbox-exec").exists())
+    .then(|| workspace_sandbox_profile(Path::new(&opts.cwd), opts.session_path.as_deref()));
+    #[cfg(target_os = "macos")]
+    let mut cmd = if let Some(profile) = sandbox_profile.as_ref() {
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command.args(["-p", profile, &pi]);
+        command
+    } else {
+        Command::new(&pi)
+    };
+    #[cfg(not(target_os = "macos"))]
     let mut cmd = Command::new(&pi);
     cmd.args(&args)
         .current_dir(&opts.cwd)
         .env("PATH", child_path())
         .env("PI_RETRY_STALL_TIMEOUT_MS", stall_timeout.to_string())
+        .env(
+            "PI_APP_SANDBOX_MODE",
+            if app_config.agent_sandbox_mode == "workspace-write" {
+                #[cfg(target_os = "macos")]
+                {
+                    if sandbox_profile.is_some() {
+                        "workspace-write"
+                    } else {
+                        "unavailable"
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    "unavailable"
+                }
+            } else {
+                "unrestricted"
+            },
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -806,6 +895,24 @@ mod tests {
         assert_eq!(groups.get(&300), None, "нечисловой rss пропущен");
         assert_eq!(pids.get(&101), Some(&2048));
         assert_eq!(pids.get(&100), Some(&1024));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn workspace_sandbox_allows_workspace_and_escapes_paths() {
+        use super::workspace_sandbox_profile;
+        use std::path::Path;
+
+        let profile = workspace_sandbox_profile(
+            Path::new("/tmp/project with \"quote\""),
+            Some("/tmp/sessions/example.jsonl"),
+        );
+        assert!(profile.contains("(deny file-write*)"));
+        assert!(profile.contains("project with \\\"quote\\\""));
+        assert!(profile.contains("(subpath \"/tmp/sessions\")"));
+        assert!(profile.contains("settings.json.lock"));
+        assert!(profile.contains("ponytail"));
+        assert!(profile.contains("(literal \"/dev/null\")"));
     }
 
     #[cfg(unix)]

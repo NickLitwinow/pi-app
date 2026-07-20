@@ -794,6 +794,69 @@ html[data-effects="on"] .topbar {
 .gitbar .gb-pr:hover { background: color-mix(in srgb, var(--brand-button) 90%, white); }
 .gitbar .gb-pr-caret { border-radius: 0 8px 8px 0; padding: 5px 8px; border-left: 1px solid var(--bg); }
 
+/* persisted workflow / background tasks control center */
+.workflow-dock {
+  margin: 0 0 8px; border: 1px solid var(--border); border-radius: 11px;
+  background: var(--bg-raised); overflow: hidden; box-shadow: var(--hairline-top);
+}
+.workflow-summary {
+  width: 100%; min-height: 34px; display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; color: var(--text-dim); text-align: left; font-size: 11.5px;
+}
+.workflow-summary:hover { background: var(--bg-hover); color: var(--text); }
+.workflow-summary strong { color: var(--text); font-weight: 620; flex: 1; }
+.workflow-pulse, .step-state { width: 8px; height: 8px; border-radius: 999px; flex: 0 0 auto; background: var(--text-dim); }
+.workflow-pulse.running, .step-state.running { background: var(--brand); box-shadow: 0 0 0 3px var(--brand-soft); animation: icon-pulse 1.35s ease infinite; }
+.workflow-pulse.failed, .step-state.failed { background: var(--danger); }
+.step-state.passed, .step-state.completed { background: var(--ok); }
+.step-state.waiting, .step-state.queued { background: #d99c2b; }
+.step-state.skipped, .step-state.cancelled { background: var(--text-dim); opacity: .55; }
+.workflow-error { color: var(--danger); }
+.workflow-panel { border-top: 1px solid var(--border); max-height: min(440px, 52vh); overflow: hidden; display: flex; flex-direction: column; }
+.workflow-tabs { padding: 5px 6px; display: flex; gap: 3px; border-bottom: 1px solid var(--border); overflow-x: auto; }
+.workflow-tabs button { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 6px; color: var(--text-dim); font-size: 11px; white-space: nowrap; }
+.workflow-tabs button:hover, .workflow-tabs button.active { color: var(--text); background: var(--bg-hover); }
+.workflow-tabs small { min-width: 15px; padding: 0 4px; border-radius: 8px; background: var(--brand-soft); color: var(--brand); text-align: center; }
+.workflow-list { padding: 7px; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
+.workflow-empty { color: var(--text-dim); font-size: 11.5px; padding: 10px; text-align: center; }
+.workflow-objective { display: grid; gap: 4px; padding: 8px 9px; border-left: 2px solid var(--brand); border-radius: 6px; background: var(--brand-soft); }
+.workflow-objective strong { color: var(--text); font-size: 11px; font-weight: 600; line-height: 1.4; }
+.workflow-objective small { color: var(--text-dim); font: 9.5px/1.35 var(--font-mono); }
+.workflow-step, .task-card, .branch-card, .context-record { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+.plan-backlog-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 2px 0; }
+.plan-backlog-head small { color: var(--muted); }
+.plan-task-body { display: flex; flex-direction: column; gap: 3px; }
+.plan-task .step-state.in_progress { background: var(--brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 18%, transparent); }
+.context-live { padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+.context-live div { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.context-live progress { width: 100%; height: 6px; margin: 8px 0; accent-color: var(--brand); }
+.context-live small { color: var(--muted); }
+.workflow-step { display: grid; grid-template-columns: 10px minmax(0,1fr) auto; align-items: start; gap: 8px; padding: 8px; }
+.workflow-step > div { min-width: 0; }
+.workflow-step strong, .task-head strong, .branch-card strong { color: var(--text); font-size: 11.5px; font-weight: 610; }
+.workflow-step p, .branch-card p { margin: 2px 0; color: var(--text-dim); font-size: 10.5px; line-height: 1.35; }
+.workflow-step small, .branch-card small { color: var(--text-dim); font-family: var(--font-mono); font-size: 9.5px; }
+.workflow-step b { color: var(--text-dim); font-size: 9.5px; font-weight: 500; text-transform: uppercase; }
+.workflow-primary { align-self: flex-start; padding: 6px 10px; border-radius: 7px; background: var(--brand); color: white; font-size: 11px; }
+.workflow-primary:disabled { opacity: .55; }
+.workflow-timeline, .context-record { padding: 7px 9px; font-size: 10.5px; }
+.workflow-timeline summary, .context-record summary { color: var(--text); cursor: pointer; font-weight: 570; }
+.workflow-timeline > div { display: grid; grid-template-columns: 70px minmax(0,1fr); gap: 6px; margin-top: 5px; color: var(--text-dim); }
+.workflow-timeline time { font-family: var(--font-mono); }
+.context-record p { margin: 7px 0; color: var(--text-dim); white-space: pre-wrap; }
+.context-record pre, .task-transcript { max-height: 190px; overflow: auto; margin: 7px 0 0; padding: 7px; border-radius: 6px; background: var(--bg); color: var(--text-dim); font: 10px/1.4 var(--font-mono); white-space: pre-wrap; }
+.task-card { padding: 8px; }
+.task-head { display: grid; grid-template-columns: 10px minmax(0,1fr) auto; align-items: center; gap: 7px; }
+.task-head small { color: var(--text-dim); font-size: 9.5px; }
+.task-meta { display: flex; flex-wrap: wrap; gap: 4px 9px; margin: 5px 0 0 17px; color: var(--text-dim); font: 9.5px/1.35 var(--font-mono); }
+.task-actions { display: flex; flex-wrap: wrap; gap: 3px; margin: 7px 0 0 17px; }
+.task-actions button, .branch-card button, .task-steer button { padding: 3px 7px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-dim); font-size: 10px; }
+.task-actions button:hover, .branch-card button:hover { color: var(--text); background: var(--bg-hover); }
+.task-actions button:disabled { opacity: .42; cursor: not-allowed; background: transparent; }
+.task-steer { display: flex; gap: 5px; margin: 6px 0 0 17px; }
+.task-steer input { min-width: 0; flex: 1; padding: 4px 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg-input); font-size: 10.5px; }
+.branch-card { padding: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
 /* composer */
 
 /* композер выровнен по колонке сообщений: та же максимальная ширина + центрирование

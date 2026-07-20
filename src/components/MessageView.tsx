@@ -432,6 +432,8 @@ function UserMessageActions({
   const [copied, setCopied] = useState(false);
   const [working, setWorking] = useState(false);
   const text = contentText(msg.content);
+  const allItems = useStore((s) => s.chats[cwd]?.chat.items ?? []);
+  const backgroundTasks = useStore((s) => s.chats[cwd]?.chat.backgroundTasks ?? []);
 
   const run = (fn: () => Promise<void>) => {
     setWorking(true);
@@ -462,9 +464,44 @@ function UserMessageActions({
         {copied ? <CheckIcon size={12} /> : <CopyIcon size={12} />}
       </button>
       <button
-        title="Откатить сюда: сессия вернётся к этому сообщению (rewind)"
-        disabled={busy || working}
-        onClick={() => run(() => rewindToMessage(cwd, userIndex, text))}
+        title="Изменить и повторить отсюда — в этой же сессии"
+        disabled={working}
+        onClick={() => run(async () => {
+          const userTurns = allItems.filter((item) => item.msg.role === "user" && !item.viaExtension);
+          const laterUserTurns = userTurns.slice(userIndex + 1);
+          const laterTurns = laterUserTurns.length;
+          const currentItemIndex = allItems.findIndex((item) => item.msg === msg);
+          const abandonedItems = currentItemIndex >= 0 ? allItems.slice(currentItemIndex + 1) : [];
+          const assistantTurns = abandonedItems.filter((item) => item.msg.role === "assistant").length;
+          const toolCalls = abandonedItems.reduce((count, item) => count + (
+            Array.isArray(item.msg.content)
+              ? item.msg.content.filter((block) => block.type === "toolCall").length
+              : 0
+          ), 0);
+          const promptDiff = laterUserTurns
+            .slice(0, 4)
+            .map((item) => `− ${contentText(item.msg.content).replace(/\s+/g, " ").slice(0, 120)}`)
+            .join("\n");
+          const imageCount = Array.isArray(msg.content) ? msg.content.filter((block) => block.type === "image").length : 0;
+          const activeTasks = backgroundTasks.filter((task) => task.status === "queued" || task.status === "running").length;
+          const preview = [
+            `Session diff: −${laterTurns} запросов, −${assistantTurns} ответов, −${toolCalls} tool calls.`,
+            promptDiff || "Последующих пользовательских запросов нет.",
+            `Текст и вложения (${imageCount}) вернутся в composer.`,
+            activeTasks > 0 ? `Фоновые задачи будут транзакционно остановлены: ${activeTasks}.` : "Активных фоновых задач нет.",
+            busy ? "Текущий ход модели будет остановлен перед rewind." : "Текущий ход модели уже завершён.",
+            "Изменения файлов в workspace сохранятся; изменится только активная ветка этой сессии.",
+            "",
+            `Запрос: ${text.slice(0, 500)}`,
+          ].join("\n");
+          const confirmed = await confirmDialog(preview, {
+            title: "Rewind preview",
+            kind: "warning",
+            okLabel: "Отменить и изменить",
+            cancelLabel: "Оставить как есть",
+          });
+          if (confirmed) await rewindToMessage(cwd, userIndex, msg);
+        })}
       >
         <RewindIcon size={12} />
       </button>

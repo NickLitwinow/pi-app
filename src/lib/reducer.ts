@@ -1,5 +1,18 @@
 import { workedDurationMs } from "./turn-timing";
-import { emptyChatState, type ChatMessage, type ChatState, type ExtUiRequest, type RunMeta, type ToolExec } from "./types";
+import {
+  emptyChatState,
+  type BackgroundTaskView,
+  type BranchRecord,
+  type ChatMessage,
+  type ChatState,
+  type CompactionRecord,
+  type ExtUiRequest,
+  type PlannedTaskView,
+  type RunMeta,
+  type StructuredCheckpoint,
+  type ToolExec,
+  type WorkflowViewState,
+} from "./types";
 
 let keyCounter = 0;
 let runCounter = 0;
@@ -105,9 +118,22 @@ function resultText(v: unknown): string {
   return asString(v);
 }
 
+function capturePlannedTasks(chat: ChatState, msg: ChatMessage) {
+  if (msg.toolName !== "todo") return;
+  const details = msg.details as { tasks?: unknown } | undefined;
+  if (!Array.isArray(details?.tasks)) return;
+  chat.plannedTasks = details.tasks.filter((task): task is PlannedTaskView => {
+    if (!task || typeof task !== "object") return false;
+    const item = task as Partial<PlannedTaskView>;
+    return typeof item.id === "number" && typeof item.subject === "string"
+      && ["pending", "in_progress", "completed", "deleted"].includes(String(item.status));
+  });
+}
+
 function finalizeMessage(chat: ChatState, msg: ChatMessage) {
   const role = msg.role;
   if (role === "toolResult") {
+    capturePlannedTasks(chat, msg);
     const callId = (msg.toolCallId as string) ?? "";
     if (callId) {
       upsertExec(chat, callId, {
@@ -132,7 +158,8 @@ function finalizeMessage(chat: ChatState, msg: ChatMessage) {
       const it = chat.items[i];
       if (it.optimistic && it.msg.role === "user" && contentText(it.msg.content) === text) {
         const items = [...chat.items];
-        items[i] = { ...it, optimistic: false };
+        // The persisted/runtime echo is authoritative and includes image blocks.
+        items[i] = { key: it.key, msg, optimistic: false };
         chat.items = items;
         return;
       }
@@ -304,6 +331,16 @@ export function applyAgentEvent(chat: ChatState, ev: Record<string, unknown>): C
     }
     case "compaction_end": {
       chat.isCompacting = false;
+      const result = (ev.result ?? {}) as Record<string, unknown>;
+      const summary = asString(result.summary ?? ev.summary);
+      if (summary) {
+        chat.compactions = [...chat.compactions, {
+          at: Date.now(),
+          reason: asString(ev.reason),
+          summary,
+          tokensBefore: typeof result.tokensBefore === "number" ? result.tokensBefore : undefined,
+        }].slice(-30);
+      }
       pushToast(chat, "success", "Контекст сжат");
       break;
     }
@@ -339,11 +376,27 @@ export function applyAgentEvent(chat: ChatState, ev: Record<string, unknown>): C
         chat.statusEntries = entries;
       } else if (method === "setWidget") {
         const key = asString(ev.widgetKey ?? ev.key ?? "widget");
-        const text = asString(ev.widgetText ?? ev.text ?? ev.lines ?? ev.content ?? ev.widget ?? "");
-        const widgets = { ...chat.widgets };
-        if (text) widgets[key] = text;
-        else delete widgets[key];
-        chat.widgets = widgets;
+        const wireLines = (ev as Record<string, unknown>).widgetLines;
+        const text = Array.isArray(wireLines)
+          ? wireLines.map(asString).join("\n")
+          : asString(ev.widgetText ?? ev.text ?? ev.lines ?? ev.content ?? ev.widget ?? "");
+        if (key === "pi-app-workflow-state") {
+          try { chat.workflow = text ? JSON.parse(text) as WorkflowViewState : null; } catch { /* keep last valid state */ }
+        } else if (key === "pi-app-background-state") {
+          try { chat.backgroundTasks = text ? JSON.parse(text) as BackgroundTaskView[] : []; } catch { /* keep last valid state */ }
+        } else if (key === "pi-app-checkpoint-state") {
+          try {
+            const checkpoint = JSON.parse(text) as StructuredCheckpoint;
+            if (!chat.structuredCheckpoints.some((item) => item.at === checkpoint.at)) {
+              chat.structuredCheckpoints = [...chat.structuredCheckpoints, checkpoint].slice(-30);
+            }
+          } catch { /* keep last valid state */ }
+        } else {
+          const widgets = { ...chat.widgets };
+          if (text) widgets[key] = text;
+          else delete widgets[key];
+          chat.widgets = widgets;
+        }
       } else if (method === "set_editor_text" || method === "setEditorText") {
         chat.editorPrefill = asString(ev.text ?? "");
       }
@@ -405,6 +458,35 @@ export function entriesToChatState(entries: Record<string, unknown>[]): ChatStat
   };
 
   for (const e of entries) {
+    if (e.type === "compaction") {
+      const record: CompactionRecord = {
+        at: entryTimestampMs(e) ?? Date.now(),
+        summary: asString(e.summary),
+        tokensBefore: typeof e.tokensBefore === "number" ? e.tokensBefore : undefined,
+        firstKeptEntryId: asString(e.firstKeptEntryId) || undefined,
+      };
+      if (record.summary) chat.compactions.push(record);
+      continue;
+    }
+    if (e.type === "custom") {
+      const customType = asString(e.customType);
+      const data = e.data as Record<string, unknown> | undefined;
+      if (customType === "pi-app-workflow-state" && data?.version === 3) chat.workflow = data as unknown as WorkflowViewState;
+      else if (["subagents:record", "pi-app-background-record", "pi-app-evaluator-record"].includes(customType) && data?.id) {
+        const task = data as unknown as BackgroundTaskView;
+        const index = chat.backgroundTasks.findIndex((item) => item.id === task.id);
+        if (index >= 0) chat.backgroundTasks[index] = task;
+        else chat.backgroundTasks.push(task);
+      } else if (customType === "pi-app-rewind-record" || customType === "pi-app-branch-record") {
+        if (data) chat.branches.push(data as unknown as BranchRecord);
+      } else if (customType === "pi-app-checkpoint") {
+        if (data) chat.structuredCheckpoints.push(data as unknown as StructuredCheckpoint);
+      } else if (customType === "pi-app-compaction-record" && data) {
+        const record = data as unknown as CompactionRecord;
+        if (!chat.compactions.some((item) => item.at === record.at)) chat.compactions.push(record);
+      }
+      continue;
+    }
     if (e.type !== "message") continue;
     const msg = e.message as ChatMessage | undefined;
     if (!msg) continue;
@@ -432,12 +514,16 @@ export function entriesToChatState(entries: Record<string, unknown>[]): ChatStat
 }
 
 /** Add an optimistic user message (used on send). */
-export function addUserMessage(chat: ChatState, text: string): ChatState {
+export function addUserMessage(chat: ChatState, text: string, images: Array<{ data: string; mimeType: string }> = []): ChatState {
+  const content = [
+    { type: "text", text },
+    ...images.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType })),
+  ];
   chat.items = [
     ...chat.items,
     {
       key: nextKey(),
-      msg: { role: "user", content: [{ type: "text", text }], timestamp: Date.now() },
+      msg: { role: "user", content, timestamp: Date.now() },
       optimistic: true,
     },
   ];

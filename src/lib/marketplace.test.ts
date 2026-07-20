@@ -11,7 +11,8 @@ describe("packageNameFromSpec", () => {
     ["npm:pi-web-access@2.1.0", "pi-web-access"],
     ["npm:@gotgenes/pi-permission-system", "@gotgenes/pi-permission-system"],
     ["npm:@gotgenes/pi-permission-system@0.5.0", "@gotgenes/pi-permission-system"],
-    ["git:https://example.com/package.git", null],
+    ["git:https://example.com/package.git", "package"],
+    ["git:github.com/DietrichGebert/ponytail", "ponytail"],
   ])("normalizes %s", (source, expected) => {
     expect(packageNameFromSpec(source)).toBe(expected);
   });
@@ -52,5 +53,16 @@ describe("package resource filters", () => {
       skills: ["skills/review/SKILL.md"],
       themes: [],
     });
+  });
+
+  it("can disable skill discovery for a Git package while retaining its extension", () => {
+    const [next] = setPackageResourceEnabled(
+      ["git:github.com/DietrichGebert/ponytail"],
+      "ponytail",
+      "skill",
+      false,
+    );
+    expect(next).toEqual({ source: "git:github.com/DietrichGebert/ponytail", skills: [] });
+    expect(isPackageResourceEnabled(next, "extension")).toBe(true);
   });
 });

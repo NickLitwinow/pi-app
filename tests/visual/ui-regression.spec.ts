@@ -127,7 +127,8 @@ test("Library harness profiles — context cost and scope", async ({ page }) => 
   await page.getByRole("button", { name: "Library" }).click();
   await page.getByRole("button", { name: /^Профили/ }).click();
   await expect(page.getByText("Recommended", { exact: true })).toBeVisible();
-  await expect(page.getByText("≈4.8K токенов", { exact: true })).toBeVisible();
+  await expect(page.getByText("≈4.2K токенов + lazy Ponytail skills", { exact: true })).toBeVisible();
+  await expect(page.getByText("ponytail", { exact: true })).toBeVisible();
   await page.getByText("Local reasoning boost", { exact: true }).scrollIntoViewIfNeeded();
   await page.getByRole("button", { name: "Включить boost" }).click();
   await expect(page.getByRole("button", { name: "Выключить boost" })).toBeVisible();
@@ -190,6 +191,60 @@ test("Post-run summary — stable stream, collapsed actions and changed files", 
   await expect(page.getByRole("button", { name: "Чекпоинты агента" })).toHaveClass(/active/);
   await expect(page.getByTitle("База сравнения")).toHaveValue("abc1234");
   await expectNoHorizontalOverflow(page);
+});
+
+test("Workflow control center — plan, tasks, timeline and gates", async ({ page }) => {
+  await boot(page);
+  const composer = page.locator(".composer textarea");
+  await composer.fill("[mock-workflow] show structured workflow");
+  await composer.press("Enter");
+  const dock = page.getByRole("region", { name: "Workflow control center" });
+  await expect(dock).toBeVisible();
+  await dock.locator(".workflow-summary").click();
+  await expect(dock.getByText("Build", { exact: true })).toBeVisible();
+  await expect(dock.getByText("npm test", { exact: false })).toBeVisible();
+  await expect(dock.getByText("executor · attempt 1/5", { exact: false })).toBeVisible();
+  await dock.getByRole("button", { name: /Plan/ }).click();
+  await expect(dock.getByText("Execution backlog", { exact: true })).toBeVisible();
+  await expect(dock.getByText("implementing workflow controls", { exact: false })).toBeVisible();
+  await expect(page).toHaveScreenshot("workflow-plan-control-center.png", { fullPage: true });
+  await dock.getByRole("button", { name: /Context/ }).click();
+  await expect(dock.getByText("Live context", { exact: true })).toBeVisible();
+  await expect(dock.getByText("Checkpoint", { exact: false }).first()).toBeVisible();
+  await expect(dock.getByText("Compaction", { exact: false }).first()).toBeVisible();
+  await expect(page).toHaveScreenshot("workflow-context-control-center.png", { fullPage: true });
+  await dock.getByRole("button", { name: /Tasks/ }).click();
+  await expect(dock.getByText("Review rewind transaction", { exact: true })).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+  await expect(page).toHaveScreenshot("workflow-control-center.png", { fullPage: true });
+  await page.getByRole("button", { name: "Заблокировать" }).click();
+});
+
+test("Same-session rewind restores text and image, then resends without creating a session", async ({ page }) => {
+  await boot(page);
+  const rowsBefore = await page.locator(".sess-row").count();
+  await page.locator(".sess-row", { hasText: "Rewind transaction" }).click();
+  const target = page.getByText("Второй запрос с изображением", { exact: true });
+  await expect(target).toBeVisible();
+  await target.hover();
+  page.once("dialog", (dialog) => {
+    expect(dialog.message()).toContain("Session diff:");
+    expect(dialog.message()).toContain("вложения (1)");
+    void dialog.accept();
+  });
+  await page.getByTitle("Изменить и повторить отсюда — в этой же сессии").last().click();
+
+  const composer = page.locator(".composer textarea");
+  await expect(composer).toHaveValue("Второй запрос с изображением");
+  await expect(page.getByTitle("Открыть attachment-1.png")).toBeVisible();
+  await expect(page.getByText("Второй ответ будет оставлен в abandoned branch.", { exact: true })).toHaveCount(0);
+  expect(await page.locator(".sess-row").count()).toBe(rowsBefore);
+
+  await composer.fill("Изменённый второй запрос");
+  await composer.press("Enter");
+  await expect(page.getByText("Изменённый второй запрос", { exact: true })).toBeVisible();
+  expect(await page.locator(".sess-row").count()).toBe(rowsBefore);
+  await page.getByRole("button", { name: "Заблокировать" }).click();
 });
 
 test("Live turn shows the process, then folds it into Worked for (Codex flow)", async ({ page }) => {
@@ -267,7 +322,7 @@ test("Model avatar — separate idle and LLM-working states", async ({ page }) =
   const processing = page.locator(".processing");
   await expect(processing.locator(".agent-avatar.working")).toBeVisible();
   await expect(processing.locator(".pdots")).toHaveCount(0);
-  await expect(processing.locator(".p-label")).toContainText("Claude Opus 4.7");
+  await expect(processing.locator(".p-label")).toContainText("ThinkingCap 27B");
   await expect(processing.locator(".p-label")).toContainText(/(размышляет|анализирует запрос|изучает контекст|осматривается|планирует шаги|проверяет детали|исследует варианты|сопоставляет данные|формулирует ответ)/);
   await expect(processing.locator(".p-label")).not.toContainText("pi работает");
 });
@@ -318,7 +373,7 @@ test("Model avatar popover escapes clipping containers (settings + model dropdow
   // 2) Выпадашка моделей: у .dropdown анимация оставляет transform, из-за чего
   //    он становился containing block для position:fixed — поповер уезжал за экран
   await page.getByRole("button", { name: "Чат" }).click();
-  await page.locator(".c-row").getByRole("button", { name: /Claude Opus|модель/ }).click();
+  await page.locator(".c-row").getByRole("button", { name: /ThinkingCap 27B|модель/ }).click();
   const aliasButtons = page.getByTitle("Задать отображаемое название");
   await expect(aliasButtons.first()).toBeVisible();
   await aliasButtons.last().click(); // последняя модель — худший случай по вертикали
@@ -332,7 +387,7 @@ test("Model picker is usable before the agent starts (multi-provider catalog)", 
   await expect(page.locator(".statusline")).toContainText("агент запустится с первым сообщением");
 
   // модель и thinking берутся из конфигов pi, а не из живого агента
-  const modelChip = page.locator(".c-row").getByRole("button", { name: /Claude Opus/ });
+  const modelChip = page.locator(".c-row").getByRole("button", { name: /ThinkingCap 27B/ });
   await expect(modelChip).toBeVisible();
   const thinking = page.locator(".c-row").getByRole("button", { name: /thinking:/ });
   await expect(thinking).toBeEnabled();

@@ -59,6 +59,7 @@ class MockBackend implements Backend {
   private renamed = new Map<string, string>();
   private forked: SessionMeta[] = [];
   private currentSession = "/mock/a/live.jsonl";
+  private rewindTargetBySession = new Map<string, string>();
   private permMode: string | null = null;
   private settings = JSON.stringify(
     {
@@ -73,11 +74,10 @@ class MockBackend implements Backend {
         "npm:@juicesharp/rpiv-todo",
         "npm:@juicesharp/rpiv-ask-user-question",
         "npm:pi-lens",
-        "npm:pi-hermes-memory",
-        "npm:pi-rewind",
         "npm:@gotgenes/pi-permission-system",
         "npm:pi-claude-style-tools",
         "npm:@plannotator/pi-extension",
+        "git:github.com/DietrichGebert/ponytail",
       ],
       skills: ["~/.claude/skills"],
     },
@@ -165,6 +165,91 @@ class MockBackend implements Backend {
     const respond = (id: unknown, command: string, data: Record<string, unknown> = {}) =>
       this.emitAgent(agentId, { type: "response", id, command, success: true, data });
     void respond;
+    if (prompt.includes("[mock-workflow]")) {
+      const now = Date.now();
+      const workflow = {
+        version: 3,
+        runId: "wf-mock",
+        createdAt: now - 20_000,
+        updatedAt: now,
+        objective: "Build and verify the session workflow control center",
+        profile: "feature",
+        status: "active",
+        approved: true,
+        editsPending: true,
+        changedFiles: ["src/session.ts", "src/WorkflowDock.tsx"],
+        intent: { primary: "build", profile: "feature", risk: "medium", needsResearch: false, allowsMutation: true, allowsDeletion: false, requiresPlan: true, requiresSandbox: true, requiresEvaluator: true, requiresHumanApproval: false, signals: ["mutation", "coupled"] },
+        steps: [
+          { id: "plan", label: "Plan", kind: "plan", deps: [], status: "passed", acceptance: "Scope and observable done state are explicit.", required: true, owner: "orchestrator", maxAttempts: 2, attempts: 1 },
+          { id: "build", label: "Build", kind: "build", deps: ["plan"], status: "running", acceptance: "Implementation satisfies the approved plan.", required: true, owner: "executor", maxAttempts: 5, attempts: 1 },
+          { id: "verify:test", label: "Tests", kind: "gate", deps: ["build"], status: "pending", acceptance: "All tests pass.", command: "npm test", required: true, owner: "gate-runner", maxAttempts: 5, attempts: 0 },
+          { id: "evaluate", label: "Independent evaluation", kind: "evaluate", deps: ["verify:test"], status: "pending", acceptance: "Read-only evaluator accepts the outcome.", required: true, owner: "evaluator", maxAttempts: 5, attempts: 0 },
+          { id: "review", label: "Engineer review", kind: "review", deps: ["evaluate"], status: "pending", acceptance: "Evidence is ready for handoff.", required: true, owner: "human", maxAttempts: 1, attempts: 0 },
+        ],
+        events: [
+          { id: "e1", type: "created", at: now - 20_000, message: "feature workflow created" },
+          { id: "e2", stepId: "plan", type: "passed", at: now - 10_000, message: "Plan approved" },
+          { id: "e3", stepId: "build", type: "started", at: now, message: "Implementation changed project files" },
+        ],
+      };
+      const tasks = [{
+        id: "agent-mock",
+        type: "reviewer",
+        description: "Review rewind transaction",
+        status: "running",
+        startedAt: now - 5_000,
+        durationMs: 5_000,
+        tokens: 4_218,
+        priority: "normal",
+        branch: "pi-agent/rewind-review",
+        baseSha: "abc1234",
+      }];
+      this.emitAgent(agentId, { type: "extension_ui_request", method: "setWidget", widgetKey: "pi-app-workflow-state", widgetLines: [JSON.stringify(workflow)] });
+      this.emitAgent(agentId, { type: "extension_ui_request", method: "setWidget", widgetKey: "pi-app-background-state", widgetLines: [JSON.stringify(tasks)] });
+      this.emitAgent(agentId, {
+        type: "message_end",
+        message: {
+          role: "toolResult",
+          toolCallId: "todo-mock",
+          toolName: "todo",
+          content: [{ type: "text", text: "Execution backlog updated" }],
+          details: {
+            tasks: [
+              { id: 1, subject: "Inspect session contracts", status: "completed" },
+              { id: 2, subject: "Implement workflow controls", activeForm: "implementing workflow controls", status: "in_progress", blockedBy: [1], owner: "main" },
+              { id: 3, subject: "Verify rewind and merge", status: "pending", blockedBy: [2] },
+            ],
+          },
+        },
+      });
+      this.emitAgent(agentId, {
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "pi-app-checkpoint-state",
+        widgetLines: [JSON.stringify({
+          version: 1,
+          at: now - 2_000,
+          runId: "wf-mock",
+          objective: workflow.objective,
+          profile: "feature",
+          decisions: ["Same-session rewind remains append-only"],
+          gateEvidence: [{ id: "verify:test", status: "pending", command: "npm test" }],
+          risks: ["Evaluator has not run yet"],
+          steps: workflow.steps.map(({ id, status }) => ({ id, status })),
+          nextReadySteps: ["build"],
+          nextAction: "Finish build, then run deterministic gates.",
+          context: { percent: 75.4, tokens: 197_656, contextWindow: 262_144 },
+        })],
+      });
+      this.emitAgent(agentId, {
+        type: "compaction_end",
+        reason: "manual",
+        result: {
+          tokensBefore: 229_440,
+          summary: "## Goal\nPreserve the session workflow.\n\n## Progress\nPlan approved.\n\n## Key Decisions\nRewind stays in-session.\n\n## Next Steps\nRun gates and evaluator.",
+        },
+      });
+    }
     this.emitAgent(agentId, { type: "agent_start" });
     this.emitAgent(agentId, { type: "turn_start" });
     this.emitAgent(agentId, { type: "message_start" });
@@ -310,7 +395,7 @@ class MockBackend implements Backend {
       case "resolve_pi":
         return { path: "/opt/homebrew/bin/pi", version: "0.80.3 (mock)", agentDir: "~/.pi/agent" } satisfies PiInfo as T;
       case "read_app_config":
-        return { editor: "code", processLimit: 2, processLimitAuto: true, idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, displayName: "Nikita", piRetryStallTimeoutMs: 0, modelAliases: { "ollama/qwen-local": "Claude Opus 4.7" }, modelAvatars: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: true } satisfies AppConfig as T;
+        return { editor: "code", processLimit: 2, processLimitAuto: true, agentSandboxMode: "workspace-write", idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, displayName: "Nikita", piRetryStallTimeoutMs: 0, modelAliases: { "ollama/qwen-local": "ThinkingCap 27B" }, modelAvatars: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: true } satisfies AppConfig as T;
       case "write_app_config":
         return undefined as T;
       case "read_avatar_data": {
@@ -348,6 +433,11 @@ class MockBackend implements Backend {
             path: "/mock/a/s3.jsonl", id: "s3", cwd: "/Users/dev/pi-app", name: "Старый рефакторинг",
             createdAt: new Date(Date.now() - 200000e3).toISOString(), modifiedMs: Date.now() - 172800e3,
             messageCount: 41, userSnippet: "Рефакторинг supervisor", costTotal: 1.2, tokensIn: 500000, tokensOut: 40000,
+          },
+          {
+            path: "/mock/a/rewind.jsonl", id: "rewind", cwd: "/Users/dev/pi-app", name: "Rewind transaction",
+            createdAt: new Date(Date.now() - 90e3).toISOString(), modifiedMs: Date.now() - 30e3,
+            messageCount: 4, userSnippet: "Второй запрос с изображением", costTotal: 0, tokensIn: 4000, tokensOut: 300,
           },
           // две одноимённые сессии (одинаковый стартовый промпт Create PR) —
           // воспроизводят баг переключения между сессиями с одинаковым названием
@@ -392,6 +482,20 @@ class MockBackend implements Backend {
       case "read_session_thread": {
         const p = String(args.path);
         const now = Date.now();
+        if (p.endsWith("/rewind.jsonl")) {
+          const first = [
+            { type: "message", id: "rewind-u1", parentId: "root", timestamp: now - 60_000, message: { role: "user", content: [{ type: "text", text: "Первый запрос остаётся в активной ветке" }] } },
+            { type: "message", id: "rewind-a1", parentId: "rewind-u1", timestamp: now - 55_000, message: { role: "assistant", content: [{ type: "text", text: "Первый ответ остаётся." }], model: "qwen-local", provider: "ollama" } },
+          ];
+          if (this.rewindTargetBySession.get(p) === "rewind-u2") return first as T;
+          return [...first,
+            { type: "message", id: "rewind-u2", parentId: "rewind-a1", timestamp: now - 30_000, message: { role: "user", content: [
+              { type: "text", text: "Второй запрос с изображением" },
+              { type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nUwAAAAASUVORK5CYII=", mimeType: "image/png" },
+            ] } },
+            { type: "message", id: "rewind-a2", parentId: "rewind-u2", timestamp: now - 25_000, message: { role: "assistant", content: [{ type: "text", text: "Второй ответ будет оставлен в abandoned branch." }], model: "qwen-local", provider: "ollama" } },
+          ] as T;
+        }
         // как реальный pi 0.80.x: assistant несёт provider/model, у финального
         // сообщения — метаданные pi-claude-style-tools и ANSI-строка тайминга
         // ОДИН ход = user → серия assistant-сообщений (мысли/инструменты) →
@@ -609,7 +713,13 @@ class MockBackend implements Backend {
         const line = JSON.parse(String(args.line));
         const agentId = String(args.agentId);
         if (line.type === "prompt") {
-          void this.runScript(agentId, String(line.message ?? ""));
+          const prompt = String(line.message ?? "");
+          if (prompt.startsWith("/pi-rewind ")) {
+            this.rewindTargetBySession.set(this.currentSession, prompt.slice("/pi-rewind ".length).trim());
+            this.emitAgent(agentId, { type: "response", id: line.id, command: "prompt", success: true, data: { sameSession: true } });
+          } else {
+            void this.runScript(agentId, prompt);
+          }
         } else if (line.type === "steer") {
           this.steerQueue.push(String(line.message ?? ""));
           this.emitAgent(agentId, { type: "queue_update", steering: [...this.steerQueue], followUp: [] });
@@ -626,31 +736,34 @@ class MockBackend implements Backend {
           const data: Record<string, unknown> =
             line.type === "get_state"
               ? {
-                  model: { id: "qwen-local", provider: "ollama", contextWindow: 128000, input: ["text"] },
+                  model: { id: "qwen-local", provider: "ollama", contextWindow: 262144, input: ["text", "image"] },
                   thinkingLevel: "high", isStreaming: false, sessionId: "mock", sessionFile: this.currentSession, messageCount: 2,
                 }
               : line.type === "get_available_models"
                 ? { models: [
-                    { id: "qwen-local", provider: "ollama", reasoning: true, contextWindow: 128000 },
+                    { id: "qwen-local", provider: "ollama", reasoning: true, contextWindow: 262144, input: ["text", "image"] },
                     { id: "claude-sonnet-4", provider: "anthropic", reasoning: true, contextWindow: 200000 },
                   ] }
                 : line.type === "get_session_stats"
                   ? {
                       tokens: { input: 12000, output: 800, cacheRead: 9000, cacheWrite: 400 },
                       cost: 0.05, userMessages: 3, assistantMessages: 3, toolCalls: 2, totalMessages: 8,
-                      contextUsage: { tokens: 43000, contextWindow: 128000, percent: 34 },
+                      contextUsage: { tokens: 89_129, contextWindow: 262_144, percent: 34 },
                     }
                   : line.type === "set_auto_compaction"
                     ? {}
                   : line.type === "get_fork_messages"
-                    ? { messages: [
+                    ? { messages: this.currentSession.endsWith("/rewind.jsonl") ? [
+                        { entryId: "rewind-u1", text: "Первый запрос остаётся в активной ветке" },
+                        { entryId: "rewind-u2", text: "Второй запрос с изображением" },
+                      ] : [
                         { entryId: "fe1", text: "Восстановленная сессия: что мы делали?" },
                         { entryId: "fe2", text: "Покажи демо стриминга" },
                       ] }
                   : line.type === "fork"
                     ? { text: "Покажи демо стриминга", cancelled: false }
                   : line.type === "get_commands"
-                    ? { commands: [{ name: "plan", description: "Plan mode" }, { name: "review", description: "Review diff" }] }
+                    ? { commands: [{ name: "plan", description: "Plan mode" }, { name: "review", description: "Review diff" }, { name: "pi-rewind", description: "Same-session rewind" }] }
                     : line.type === "get_messages"
                       ? {
                           messages: [

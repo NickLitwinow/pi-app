@@ -515,9 +515,9 @@ const RECOMMENDED_EXTENSIONS: Recommended[] = [
     desc: "Plan mode: агент сначала составляет план с аннотациями, затем правит код (/plannotator).",
   },
   {
-    pkg: "npm:pi-rewind",
-    name: "pi-rewind",
-    desc: "Снапшоты файлов на каждый ход: «Откатить сюда» у сообщений возвращает не только диалог, но и код.",
+    pkg: "npm:@tintinweb/pi-subagents",
+    name: "pi-subagents",
+    desc: "Очередь фоновых агентов, worktree-изоляция, steering и session-scoped расписания.",
   },
 ];
 
@@ -527,16 +527,15 @@ const CORE_PACKAGES = [
   "pi-mcp-adapter",
   "rpiv-todo",
   "rpiv-ask-user-question",
-  "pi-hermes-memory",
-  "pi-rewind",
   "pi-permission-system",
   "pi-claude-style-tools",
   "pi-retry",
   "pi-statusline",
-  "pi-vcc",
   "plannotator",
   "harness",
   "pi-web-access", // возвращён в ядро (H4): без него модель не может в web-факты
+  "pi-subagents",
+  "DietrichGebert/ponytail", // официальный git-пакет; full policy инъектируется перед каждым model turn
 ];
 
 /** Грубая оценка токенов текста (≈4 символа/токен для английских описаний). */
@@ -1227,6 +1226,21 @@ function AppTab() {
       </div>
       <div className="hint" style={{ marginTop: -4, marginBottom: 10 }}>
         Если models.json указывает localhost/ollama/oMLX, приложение использует один агент, чтобы процессы не конкурировали за GPU. Снимите флажок для ручного лимита.
+      </div>
+      <div className="form-row">
+        <label>Sandbox агента <small>Применяется к новым процессам</small></label>
+        <SegmentedControl
+          label="Граница записи агента"
+          value={appConfig.agentSandboxMode ?? "workspace-write"}
+          options={[
+            { value: "workspace-write", label: "Workspace write" },
+            { value: "unrestricted", label: "Unrestricted" },
+          ]}
+          onChange={(agentSandboxMode) => void updateAppConfig({ agentSandboxMode })}
+        />
+      </div>
+      <div className="hint" style={{ marginTop: -4, marginBottom: 10 }}>
+        Workspace write разрешает чтение системы, но запись — только в текущий проект, хранилище сессий и временные worktree. Это защищает исходники skills и соседние репозитории от ошибочного tool call. На macOS ограничение наследуют все дочерние процессы агента.
       </div>
       <div className="form-row">
         <label>Idle agent timeout <small>Секунды до остановки</small></label>

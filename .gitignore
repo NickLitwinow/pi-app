@@ -4,8 +4,11 @@ src-tauri/target/
 src-tauri/gen/
 .DS_Store
 *.local
-# локальное состояние pi этого проекта (permission-режим и т.п.)
-.pi/
+# Локальное состояние pi остаётся приватным; декларативные project gates можно
+# безопасно ревьюить и воспроизводить на других машинах.
+.pi/*
+!.pi/verifiers.json
+!.pi/workflow.json
 bench/results/
 test-results/
 playwright-report/

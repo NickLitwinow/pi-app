@@ -11,6 +11,7 @@ import {
   type ChatState,
   type Checkpoint,
   type ChatMessage,
+  type ComposerAttachment,
   type ModelInfo,
   type PiInfo,
   type PinnedMessage,
@@ -176,7 +177,7 @@ export const useStore = create<Store>((set) => ({
   ready: false,
   isMock: false,
   piInfo: null,
-  appConfig: { editor: "code", processLimit: 2, processLimitAuto: true, idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, modelAliases: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: false, modelAvatars: {} },
+  appConfig: { editor: "code", processLimit: 2, processLimitAuto: true, agentSandboxMode: "workspace-write", idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, modelAliases: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: false, modelAvatars: {} },
   projects: [],
   extraWorkspaces: [],
   currentCwd: null,
@@ -714,14 +715,14 @@ export async function sendPrompt(cwd: string, text: string, images?: { data: str
   const streaming = ws.chat.isStreaming;
 
   if (!streaming) {
-    updateChat(cwd, (w) => ({ ...w, chat: addUserMessage({ ...w.chat }, trimmed) }));
+    updateChat(cwd, (w) => ({ ...w, chat: addUserMessage({ ...w.chat }, trimmed, images) }));
     const checkpoint = await makeCheckpoint(cwd, "turn");
     updateChat(cwd, (w) => ({ ...w, pendingCheckpoint: checkpoint }));
     const cmd: Record<string, unknown> = { type: "prompt", message: trimmed };
     if (images?.length) cmd.images = images.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType }));
     await rpcSend(cwd, cmd);
   } else {
-    updateChat(cwd, (w) => ({ ...w, chat: addUserMessage({ ...w.chat }, trimmed) }));
+    updateChat(cwd, (w) => ({ ...w, chat: addUserMessage({ ...w.chat }, trimmed, images) }));
     await rpcSend(cwd, { type: "steer", message: trimmed });
   }
 }
@@ -1250,39 +1251,86 @@ function pickForkEntry(
   return msgs[userIndex];
 }
 
-/** «Rewind to here»: откат активной сессии к пользовательскому сообщению
- *  (pi fork создаёт ветку; pi-rewind, если установлен, предложит вернуть файлы).
- *  Текст сообщения попадает в composer для правки и повторной отправки. */
-export async function rewindToMessage(cwd: string, userIndex: number, text: string): Promise<void> {
-  const ws = getChat(cwd);
-  if (ws.liveStreaming) throw new Error("Агент занят — дождитесь завершения перед откатом");
+/** «Rewind to here»: move the active leaf before a user message in the SAME
+ * session file. The abandoned path stays in Pi's append-only history, but it is
+ * no longer the active conversation. The selected prompt goes to the composer
+ * for editing and re-submission. Rewind never creates another session. */
+function messageAttachments(msg: ChatMessage): ComposerAttachment[] {
+  if (!Array.isArray(msg.content)) return [];
+  let index = 0;
+  return msg.content.flatMap((block) => {
+    if (block.type !== "image" || typeof block.data !== "string" || typeof block.mimeType !== "string") return [];
+    index++;
+    return [{ data: block.data, mimeType: block.mimeType, name: `attachment-${index}.${block.mimeType.split("/")[1] ?? "image"}` }];
+  });
+}
+
+async function waitForAgentIdle(cwd: string, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (getChat(cwd).liveStreaming && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (getChat(cwd).liveStreaming) throw new Error("Не удалось остановить текущий ход перед rewind");
+}
+
+export async function rewindToMessage(cwd: string, userIndex: number, msg: ChatMessage): Promise<void> {
+  let ws = getChat(cwd);
   if (isBrowsingAway(ws)) throw new Error("Сначала вернитесь к активной сессии");
+  if (ws.liveStreaming) {
+    await abortAgent(cwd);
+    await waitForAgentIdle(cwd);
+    ws = getChat(cwd);
+  }
   await ensureAgent(cwd, ws.sessionPath);
   const data = await rpcRequest(cwd, { type: "get_fork_messages" }, 45000);
   const msgs = (data.messages ?? []) as { entryId: string; text: string }[];
+  const text = contentText(msg.content);
   const target = pickForkEntry(msgs, userIndex, text);
   if (!target) throw new Error("Сообщение для отката не найдено");
 
-  // In-session rewind (§5.12-4, как в Claude Code): если наш harness
-  // предоставляет /pi-rewind — откатываемся navigateTree'ом ВНУТРИ той же
-  // сессии (leaf сдвигается, новый файл НЕ создаётся). Иначе — легаси-путь
-  // через RPC fork (создаёт ветку-сессию). pi-rewind в обоих случаях может
-  // предложить восстановление файлов диалогом.
-  const hasInSession = ws.commands.some((c) => c.name === "pi-rewind");
-  if (hasInSession) {
-    await rpcRequest(cwd, { type: "prompt", message: `/pi-rewind ${target.entryId}` }, 180000);
-  } else {
-    const res = (await rpcRequest(cwd, { type: "fork", entryId: target.entryId }, 180000)) as {
-      cancelled?: boolean;
-    };
-    if (res.cancelled) return;
+  // Session switching starts command discovery asynchronously. A fast rewind click
+  // must refresh that catalog before declaring the extension unavailable.
+  if (!getChat(cwd).commands.some((c) => c.name === "pi-rewind")) {
+    await loadModelsAndCommands(cwd);
   }
+  ws = getChat(cwd);
+  const hasInSession = ws.commands.some((c) => c.name === "pi-rewind");
+  if (!hasInSession) throw new Error("Внутрисессионный rewind недоступен: перезапустите агент с pi-app-harness");
+  await rpcRequest(cwd, { type: "prompt", message: `/pi-rewind ${target.entryId}` }, 180000);
   discardQueuedEvents(cwd);
   // полная история активной ветки — из файла живого агента (тот же при in-session)
   const live = getChat(cwd).liveSessionPath ?? ws.sessionPath;
   const chat = live ? await loadSessionFromFile(live) : emptyChatState();
   chat.editorPrefill = target.text;
+  chat.editorAttachments = messageAttachments(msg);
   updateChat(cwd, (w) => ({ ...w, chat }));
+  await refreshAgentMeta(cwd);
+}
+
+export async function controlWorkflow(cwd: string, action: "approve-plan" | "retry-gates"): Promise<void> {
+  await ensureAgent(cwd, getChat(cwd).sessionPath);
+  await rpcRequest(cwd, { type: "prompt", message: `/pi-workflow ${action}` }, 180_000);
+}
+
+export async function controlBackgroundTask(
+  cwd: string,
+  action: "cancel" | "steer" | "transcript" | "diff" | "retry" | "merge",
+  id: string,
+  message = "",
+): Promise<void> {
+  await ensureAgent(cwd, getChat(cwd).sessionPath);
+  await rpcRequest(cwd, { type: "prompt", message: `/pi-task ${action} ${id}${message ? ` ${message}` : ""}` }, 180_000);
+}
+
+export async function returnToSessionBranch(cwd: string, leafId: string): Promise<void> {
+  const ws = getChat(cwd);
+  if (ws.liveStreaming) throw new Error("Агент занят — дождитесь завершения перед сменой ветки");
+  await ensureAgent(cwd, ws.sessionPath);
+  await rpcRequest(cwd, { type: "prompt", message: `/pi-branch-return ${leafId}` }, 180_000);
+  discardQueuedEvents(cwd);
+  const live = getChat(cwd).liveSessionPath ?? ws.sessionPath;
+  const chat = live ? await loadSessionFromFile(live) : emptyChatState();
+  updateChat(cwd, (current) => ({ ...current, chat }));
   await refreshAgentMeta(cwd);
 }
 

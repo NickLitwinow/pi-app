@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "commands": [
+    {
+      "id": "test",
+      "label": "Unit and integration tests",
+      "command": "npm test",
+      "acceptance": "All Vitest suites pass without masked failures.",
+      "required": true,
+      "timeoutMs": 300000
+    },
+    {
+      "id": "build",
+      "label": "Typecheck and production build",
+      "command": "npm run build",
+      "acceptance": "TypeScript emits no errors and Vite completes the production build.",
+      "required": true,
+      "timeoutMs": 300000
+    },
+    {
+      "id": "visual",
+      "label": "Browser UI regression suite",
+      "command": "npm run test:visual",
+      "acceptance": "Playwright exercises the production UI workflows without behavioral or screenshot regressions.",
+      "required": true,
+      "timeoutMs": 300000
+    },
+    {
+      "id": "rust",
+      "label": "Tauri backend tests",
+      "command": "cargo test --manifest-path src-tauri/Cargo.toml",
+      "acceptance": "Rust unit and real-agent integration tests pass.",
+      "required": true,
+      "timeoutMs": 600000
+    },
+    {
+      "id": "rustfmt",
+      "label": "Rust formatting",
+      "command": "cargo fmt --manifest-path src-tauri/Cargo.toml --check",
+      "acceptance": "Rust sources match the project formatter.",
+      "required": true,
+      "timeoutMs": 120000
+    }
+  ],
+  "evaluator": {
+    "enabled": true,
+    "agent": "independent-evaluator"
+  }
+}

@@ -1,5 +1,10 @@
 # Аудит harness, community extensions, skills и AGENTS.md
 
+> Исторический срез до redesign. Текущая реализация, модель, набор пакетов и
+> решение по официальному Ponytail описаны в
+> [HARNESS-REDESIGN-2026-07-18.md](HARNESS-REDESIGN-2026-07-18.md); рекомендации
+> ниже про `pi-ponytail` 0.1.2 и strict harness больше не являются текущими.
+
 **Дата:** 2026-07-13  
 **Скоуп:** фактически активный `~/.pi/agent/settings.json`, локально установленные npm-пакеты, их `pi`-манифесты и lifecycle/tool hooks, активные `SKILL.md`, глобальный `~/.pi/agent/AGENTS.md`, `pi-app-harness`. Секреты и содержимое model endpoint не читались; модель и сервер не запускались и не изменялись.
 
@@ -136,4 +141,6 @@ Npm search по `pi-package` содержит 1000+ результатов и н
 5. Исправить permission root diagnostics и покрыть cwd/external тестами.
 6. Сократить активные skills с 17 примерно до 10 через resource filtering.
 7. Только затем оценить side-chat (`pi-btw`) и modern `pi-subagents`; не ставить новые all-in-one harness packs.
+# Historical audit note
 
+Этот снимок отражает состояние на 2026-07-13. Текущая реализация и принятые решения описаны в [HARNESS-REDESIGN-2026-07-18.md](./HARNESS-REDESIGN-2026-07-18.md); в частности, отдельный strict-режим harness удалён.

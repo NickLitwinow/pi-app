@@ -1,5 +1,7 @@
 # Аудит окружения pi под Qwen 3.6-35B-A3B (oQ4) — до уровня «Opus-замены»
 
+> Исторический срез. Текущий профиль `ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision`, окно 262,144 и новый workflow описаны в [HARNESS-REDESIGN-2026-07-18.md](HARNESS-REDESIGN-2026-07-18.md).
+
 **Дата:** 2026-07-02 · Модель: Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled, MLX oQ4, 128k ctx, MTP.
 Замеры сделаны на живых сессиях pi 0.80.3 через RPC.
 

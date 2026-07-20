@@ -1,483 +1,1221 @@
 /**
- * pi-app-harness — воркфлоу-харнесс pi-app (ROADMAP §5.1, issue #16).
+ * pi-app workflow harness v3.
  *
- * Три поведения, все — ЭФЕМЕРНЫЕ system-reminder'ы, добавляемые в контекст
- * конкретного LLM-вызова через событие `context` (в сессию/чат не пишутся,
- * токены не накапливаются в истории):
+ * The model receives a compact capability contract. The harness owns durable workflow
+ * state, deterministic project gates, evaluator hand-off, background task controls,
+ * structured context checkpoints, and same-session rewind transactions.
  *
- *  1. todo-first — нетривиальный промпт → напоминание составить todo-план до действий;
- *  2. verify-before-done — после edit/write, пока не выполнена ни одна команда,
- *     каждый вызов получает напоминание прогнать проверки (см. skill verify);
- *  3. skill-router (уровень 2) — промпт матчится по триггерам на установленный
- *     скилл → «прочитай его SKILL.md и следуй ему».
- *
- * Анти-шум: слэш-команды игнорируются; todo/skill-наджи — один раз за ран;
- * verify-надж — максимум 2 раза за ран (35B склонна к лупам от повторов).
- * По умолчанию все loop-guard'ы advisory-only: харнесс не должен становиться
- * вторым permission-system. Жёсткая блокировка — только PI_APP_HARNESS_STRICT=1.
- * Выключатель: PI_APP_HARNESS=0. Отладочный лог: PI_APP_HARNESS_LOG=1 →
- * .pi/harness.log в рабочем каталоге.
+ * Environment:
+ *   PI_APP_HARNESS=0                       disable everything
+ *   PI_APP_HARNESS_PROFILE=baseline        retain session/task commands only
+ *   PI_APP_HARNESS_MAX_LOOPS=4             bounded repair continuations (0..4)
+ *   PI_APP_HARNESS_EVALUATOR_TIMEOUT_MS=1800000 local high-reasoning evaluator timeout
+ *   PI_APP_HARNESS_WAIT_FOR_BACKGROUND=1 keep headless print-mode alive for workers
+ *   PI_APP_HARNESS_ABLATIONS=a,b           classifier,repair-loop,semantic-gates,ponytail
+ *   PI_APP_HARNESS_LOG=1                   append .pi/harness.log
  */
 
-import { appendFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { isStrictHarness, isVerifyCommand, needsSequentialThinking } from "./policy.js";
+import { buildIndependentEvaluatorPrompt, buildIndependentFalsifierPrompt, executionFailed, independentEvaluationAccepted, independentEvaluationRepairPrompt, parseBackgroundAgentId } from "./policy.js";
+import {
+	attachVerifierSteps,
+	createWorkflowState,
+	loadVerifierManifest,
+	normalizeWorkflowState,
+	readySteps,
+	updateWorkflowStep,
+	type WorkflowState,
+	type WorkflowStep,
+} from "./workflow.js";
+import { fingerprintWorkspace, isWorkspacePath, rebaseWorktreePrompt } from "./workspace.js";
+import { decorateTaskQueue, type TaskPriority } from "./tasks.js";
 
-type SkillInfo = { name: string; description?: string };
+type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+type BackgroundTask = {
+	id: string;
+	type: string;
+	description: string;
+	status: TaskStatus;
+	result?: string;
+	error?: string;
+	startedAt?: number;
+	completedAt?: number;
+	durationMs?: number;
+	tokens?: number;
+	branch?: string;
+	baseSha?: string;
+	worktreePath?: string;
+	outputFile?: string;
+	prompt?: string;
+	transcript?: string;
+	diff?: string;
+	mergedCommit?: string;
+	evaluatorProtocolVersion?: number;
+	evaluatorQuorum?: boolean;
+	priority?: TaskPriority;
+	queuePosition?: number;
+	etaMs?: number;
+	blockedReason?: string;
+};
 
-const TODO_NUDGE =
-	"This may be a multi-step task. Use a short todo list only when it genuinely helps track work; " +
-	"for a straightforward change, proceed directly. Keep any plan proportional to the task.";
+type LiveSubagentRecord = {
+	id: string;
+	type?: string;
+	description?: string;
+	status?: string;
+	result?: string;
+	error?: string;
+	startedAt?: number;
+	completedAt?: number;
+	toolUses?: number;
+	outputFile?: string;
+	pendingSteers?: string[];
+	session?: { steer(message: string): Promise<void> };
+	worktree?: { path: string; branch: string; baseSha: string; workPath: string };
+	worktreeResult?: { hasChanges: boolean; branch?: string };
+	lifetimeUsage?: { input?: number; output?: number; cacheWrite?: number };
+};
 
-const SEQUENTIAL_THINKING_NUDGE =
-	"This is a planning-heavy architecture/refactor task. If the sequential-thinking MCP tool is available, " +
-	"use it once as a structured scratchpad when it would clarify trade-offs or revisions. " +
-	"Do not force it for routine steps, and still provide the user a concise actionable result.";
+type SubagentRegistry = {
+	getRecord(id: string): LiveSubagentRecord | undefined;
+	waitForAll(): Promise<void>;
+};
 
-const VERIFY_NUDGE =
-	"Files were modified in this run and no command has been executed since. " +
-	"Before declaring the task complete: run the project's checks/tests " +
-	"(follow the verify skill if installed) and report their REAL output.";
+type RpcReply<T> = { success: true; data?: T } | { success: false; error: string };
+type ContinuationWaiter = {
+	started: boolean;
+	finish(completed: boolean): void;
+};
 
-const REPEAT_NUDGE =
-	"You just repeated the exact same tool call. Check whether the earlier result is already sufficient; " +
-	"if a retry is intentional (for changed external state), continue.";
+const MAX_AUTO_LOOPS = Math.min(4, Math.max(0, Number(process.env.PI_APP_HARNESS_MAX_LOOPS ?? 4) || 0));
+const CHECKPOINT_PERCENT = 75;
+const ABLATIONS = new Set((process.env.PI_APP_HARNESS_ABLATIONS ?? "").split(",").map((value) => value.trim()).filter(Boolean));
+const WRITE_TOOLS = new Set(["edit", "write", "apply_patch", "multi_edit"]);
 
-const TODO_LOOP_NUDGE =
-	"Several todo updates occurred without another work tool. Prefer advancing the current item before " +
-	"updating status again, unless the plan itself is the requested deliverable.";
+const WORKFLOW_GUIDANCE = `
+Workflow contract:
+- Treat the supplied workflow as a dependency graph. Complete only ready steps and satisfy each acceptance gate with evidence.
+- For coupled work, establish a short plan and observable done state before editing. Keep the implementation incremental.
+- Turn every normative behavior into a clause matrix before implementation. Probe valid and adversarial invalid boundaries; keep input type/grammar, coerced value range, discriminators, idempotency, and side effects as separate obligations. Discriminators are strict typed literals unless the authoritative contract explicitly permits coercion; never use Number/String/loose equality to broaden them. Unless a contract narrows the term, blank strings include empty and whitespace-only values.
+- Preserve pre-existing public modules and capabilities. Repair drifted siblings by delegating to the canonical implementation; do not delete them unless removal is explicitly requested and all callers/contracts are migrated.
+- The harness runs declared lint/typecheck/test/build gates itself after edits. Read failures, repair the cause, and never mask an exit code.
+- Green tests prove only what they assert. An independent evaluator reviews successful builds; completion requires deterministic gates and clause-by-clause evaluator acceptance.
+- Background workers are bounded, isolated workstreams. Preserve their transcript and reconcile their output before merge.
+- At high context usage, leave a structured checkpoint: objective, decisions, changed files, gate evidence, risks, and next ready step.`;
 
-const CONTEXT_NUDGE =
-	"Context is large. Consider finishing the current item and compacting before a new workstream. " +
-	"Continue reading or acting when it is necessary to complete the user's request.";
+const PONYTAIL_POLICY = `
+Ponytail is mandatory for this run: preserve explicit user scope and acceptance criteria, prefer reuse and the smallest coherent change, inspect before editing, verify observed outcomes, and never trade away safety or correctness merely to reduce code. Ponytail skills and commands are available for deeper audit/review.`;
 
-const SUMMARY_NUDGE =
-	"All reported todos appear complete. If the requested outcome is genuinely finished, summarize changes, " +
-	"verification, and anything left; otherwise continue with the remaining work.";
+const LOOP_NOTE = "The same operation is repeating without new evidence. Reuse prior evidence or change strategy; do not retry an unchanged call.";
+const MALFORMED_NOTE = "Tool calls were missing required arguments. Emit one valid tool call using the exact schema and all required fields.";
 
-const REREAD_NUDGE =
-	"You are re-reading the same file in small slices. Read the needed range in ONE call " +
-	"(or the whole file if it is small) and MOVE ON to acting on it.";
-
-/** Порог контекст-гарда (~токены, оценка chars/4). Окно модели 262К, поэтому
- *  голый размер — не повод паниковать: ниже порога надж не приходит вовсе, а в
- *  «серой зоне» (½ порога…порог) — только при признаках деградации (луп-события
- *  в этом ране). Настраивается: PI_APP_HARNESS_CTX_TOKENS. */
-const CONTEXT_NUDGE_TOKENS = Number(process.env.PI_APP_HARNESS_CTX_TOKENS ?? "") || 100_000;
-
-const MALFORMED_NUDGE =
-	"Your tool calls are arriving with EMPTY arguments — the call format is broken. " +
-	"Emit the tool call again with ALL required fields as proper JSON " +
-	'(write: {"path": …, "content": …}; edit: {"path", "oldText", "newText"}; read: {"path"}; bash: {"command"}). ' +
-	"Do NOT wrap tool calls in markdown.";
-
-/** Инструменты, у которых пустые arguments всегда означают сломанный вызов. */
-const ARGS_REQUIRED = new Set(["read", "write", "edit", "bash"]);
-
-/** Инструменты, считающиеся «содержательной работой» (сбрасывают todo-серию). */
-const WORK_TOOLS = new Set(["read", "edit", "write", "bash", "grep", "find", "ls"]);
-
-/** Триггеры → имя скилла. Подсказываем только если скилл реально установлен.
- *  ВАЖНО: `\b` в JS-регэкспах не работает с кириллицей (не входит в \w) —
- *  для русских основ используем голые вхождения, для коротких английских
- *  токенов — явные границы. */
-const SKILL_TRIGGERS: Array<[RegExp, string]> = [
-	[/(ревью|провер(ь|ка)\s+(код|дифф)|посмотри\s+(pr|дифф|diff)|code\s+review|\breview\b)/i, "code-review"],
-	[/(баг|ошибк|краш|падает|не\s+работает|слома|исправ|почин|\b(bug|crash|fix|broken)\b)/i, "debug"],
-	[/(тест|покрыти|\b(tests?|coverage)\b)/i, "testing"],
-	[/(коммит|запушь|релиз|\b(commit|push|pull\s+request|merge\s+request|pr|mr|release|ship)\b)/i, "ship"],
-	[/(работает\s+ли|проверь,?\s+что|убедись|прогони\s+провер|\bverify\b)/i, "verify"],
-];
-
-function isNonTrivial(prompt: string): boolean {
-	if (prompt.length >= 280) return true;
-	const listMarkers = (prompt.match(/(^|\n)\s*(\d+[.)]|[-*•])\s+/g) ?? []).length;
-	if (listMarkers >= 2) return true;
-	return /(реализуй|рефактор|переработа|мигрир|переделай|исправь\s+вс[её]|добавь\s+.{10,}\s+и\s+|\b(implement|refactor|migrate|redesign)\b)/i.test(
-		prompt,
-	);
+function outputText(value: unknown, limit = 8_000): string {
+	try {
+		const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+		return text.length > limit ? `${text.slice(0, limit)}\n…truncated` : text;
+	} catch {
+		return "";
+	}
 }
 
-function matchSkill(prompt: string, skills: SkillInfo[]): SkillInfo | null {
-	const installed = new Map(skills.map((s) => [s.name, s]));
-	for (const [re, name] of SKILL_TRIGGERS) {
-		if (re.test(prompt) && installed.has(name)) return installed.get(name)!;
+function changedPath(args: unknown): string | undefined {
+	if (!args || typeof args !== "object") return undefined;
+	const value = args as Record<string, unknown>;
+	const path = value.path ?? value.file_path ?? value.filePath;
+	return typeof path === "string" && path.trim() ? path : undefined;
+}
+
+function toolPaths(args: unknown, depth = 0): string[] {
+	if (!args || typeof args !== "object" || depth > 4) return [];
+	const paths: string[] = [];
+	for (const [key, value] of Object.entries(args as Record<string, unknown>)) {
+		if (/^(?:path|file_?path|file)$/i.test(key) && typeof value === "string" && value.trim()) paths.push(value);
+		else if (Array.isArray(value)) for (const item of value) paths.push(...toolPaths(item, depth + 1));
+		else if (value && typeof value === "object") paths.push(...toolPaths(value, depth + 1));
 	}
-	return null;
+	return paths;
+}
+
+function patchPaths(args: unknown): string[] {
+	if (!args || typeof args !== "object") return [];
+	const value = args as Record<string, unknown>;
+	const patch = [value.patch, value.input].find((item): item is string => typeof item === "string") ?? "";
+	return [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/gm)].map((match) => match[1].trim());
+}
+
+function sessionEntryPreview(entry: unknown): string | undefined {
+	if (!entry || typeof entry !== "object") return undefined;
+	const message = (entry as Record<string, unknown>).message;
+	if (!message || typeof message !== "object") return undefined;
+	const content = (message as Record<string, unknown>).content;
+	if (typeof content === "string") return content.replace(/\s+/g, " ").trim().slice(0, 240) || undefined;
+	if (!Array.isArray(content)) return undefined;
+	const text = content.map((block) => block && typeof block === "object" && typeof (block as Record<string, unknown>).text === "string"
+		? (block as Record<string, string>).text
+		: "").join(" ").replace(/\s+/g, " ").trim();
+	return text.slice(0, 240) || undefined;
+}
+
+function evaluatorPassed(result: string): boolean {
+	return independentEvaluationAccepted(result);
+}
+
+function subagentRegistry(): SubagentRegistry | undefined {
+	return (globalThis as Record<symbol, SubagentRegistry | undefined>)[Symbol.for("pi-subagents:manager")];
+}
+
+function normalizedTaskStatus(status: unknown): TaskStatus {
+	if (status === "queued") return "queued";
+	if (status === "running" || status === "steered") return "running";
+	if (status === "completed") return "completed";
+	if (status === "aborted" || status === "stopped" || status === "cancelled") return "cancelled";
+	return "failed";
+}
+
+function phaseText(state: WorkflowState): string {
+	if (state.status === "blocked") return `blocked · ${state.blockedStepId ?? "workflow"}`;
+	if (state.status === "needs-human") return `needs human · ${state.blockedStepId ?? "approval"}`;
+	if (state.status === "completed") return "verified";
+	const failed = state.steps.find((step) => step.status === "failed");
+	if (failed) return `failed · ${failed.label}`;
+	const running = state.steps.find((step) => step.status === "running");
+	if (running) return `running · ${running.label}`;
+	const waiting = state.steps.find((step) => step.status === "waiting");
+	if (waiting) return `waiting · ${waiting.label}`;
+	if (state.steps.length > 0 && state.steps.every((step) => ["passed", "skipped"].includes(step.status))) return "verified";
+	return state.profile;
 }
 
 export default function harness(pi: ExtensionAPI) {
 	if (process.env.PI_APP_HARNESS === "0") return;
+	const enabled = process.env.PI_APP_HARNESS_PROFILE !== "baseline";
 	const debugLog = process.env.PI_APP_HARNESS_LOG === "1";
-	const strict = isStrictHarness(process.env.PI_APP_HARNESS_STRICT);
-
-	/** Одноразовые наджи, потребляются первым же `context` после старта рана. */
-	let pendingNudges: string[] = [];
-	/** Правки в текущем ране, после которых не было ни одной команды. */
-	let editsUnverified = false;
-	/** Сколько раз verify-надж уже вставлен в этом ране (потолок 2). */
-	let verifyNudgesSent = 0;
-	/** Скиллы из систем-промпта (кэш с before_agent_start) — для todo-роутинга. */
-	let skillsCache: SkillInfo[] = [];
-	/** Скиллы, уже подсказанные в этом ране (не повторяемся). */
-	const hintedSkills = new Set<string>();
-	/** Анти-луп (H1): подпись последнего tool-вызова и длина серии повторов. */
-	let lastCallSig = "";
-	let sameCallStreak = 0;
-	/** Анти-луп (H2): длина серии todo-вызовов без содержательной работы. */
-	let todoStreak = 0;
-	/** Сколько вызовов уже заблокировано в этом ране (предохранитель на аборт). */
-	let blockedCalls = 0;
-	/** Подряд идущие assistant-сообщения со сломанными (пустые args) tool-вызовами. */
+	let state = createWorkflowState("");
+	let pendingNotes: string[] = [];
+	let lastCallSignature = "";
+	let repeatStreak = 0;
 	let malformedStreak = 0;
-	/** file-read-streak: последний читаемый path и длина серии его чтений подряд. */
-	let lastReadPath = "";
-	let readStreak = 0;
-	/** Одноразовые за ран флаги контекст-гарда и итога. */
-	let contextNudged = false;
-	let summaryNudged = false;
-	/** Были ли в этом ране луп-события (повторы/блоки/reread) — сигнал деградации. */
-	let loopSignals = 0;
+	let continuationQueued = false;
+	let verifierRunning = false;
+	let activeCwd = process.cwd();
+	let isolatedWorktree = false;
+	let parentWorkspaceRoot = "";
+	let activeModelPattern = "";
+	let workspaceBaselineFingerprint = "";
+	let lastObservedFingerprint = "";
+	let continuationWaiter: ContinuationWaiter | undefined;
+	let taskUi: { setWidget(key: string, value: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void; setStatus(key: string, value: string | undefined): void } | undefined;
+	const toolArgs = new Map<string, unknown>();
+	const backgroundTasks = new Map<string, BackgroundTask>();
 
 	const log = (line: string) => {
 		if (!debugLog) return;
 		try {
-			mkdirSync(join(process.cwd(), ".pi"), { recursive: true });
-			appendFileSync(join(process.cwd(), ".pi", "harness.log"), `${new Date().toISOString()} ${line}\n`);
+			mkdirSync(join(activeCwd, ".pi"), { recursive: true });
+			appendFileSync(join(activeCwd, ".pi", "harness.log"), `${new Date().toISOString()} ${line}\n`);
 		} catch {
-			// лог — только для отладки, молча пропускаем
+			// Diagnostics never affect a run.
 		}
 	};
 
-	const skillHint = (skill: SkillInfo, reason: string) => {
-		if (hintedSkills.has(skill.name)) return;
-		hintedSkills.add(skill.name);
-		pendingNudges.push(
-			`The "${skill.name}" skill matches ${reason}${skill.description ? ` (${skill.description})` : ""}. ` +
-				"Read its SKILL.md if applicable; the user's explicit instructions and task scope take priority.",
-		);
-		log(`nudge: skill ${skill.name} [${reason}]`);
+	/**
+	 * Extension sendMessage is intentionally fire-and-forget. Print mode would
+	 * otherwise dispose the runtime as soon as the current agent_settled handler
+	 * returns. Keep that handler pending until the triggered repair turn settles.
+	 */
+	const requestContinuation = (content: string, details: Record<string, unknown>): Promise<boolean> => {
+		if (continuationWaiter) return Promise.resolve(false);
+		continuationQueued = true;
+		return new Promise((resolve) => {
+			let settled = false;
+			const timeoutMs = Math.max(30_000, Number(process.env.PI_APP_HARNESS_REPAIR_TIMEOUT_MS ?? 1_800_000) || 1_800_000);
+			const timer = setTimeout(() => finish(false), timeoutMs);
+			const finish = (completed: boolean) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				continuationWaiter = undefined;
+				if (!completed) log(`repair continuation timed out after ${timeoutMs}ms`);
+				resolve(completed);
+			};
+			continuationWaiter = { started: false, finish };
+			pi.sendMessage({ customType: "pi-app-workflow", content, display: false, details }, { triggerTurn: true, deliverAs: "followUp" });
+		});
 	};
 
-	// /pi-rewind <entryId> — откат IN-SESSION (§5.12-4): navigateTree сдвигает
-	// leaf в том же файле сессии (в отличие от RPC fork, который всегда плодит
-	// новый файл). pi-app вызывает эту команду вместо fork, если она доступна.
+	const workspaceSnapshot = async (): Promise<{ fingerprint: string; files: string[]; head: string }> => {
+		try {
+			const [diff, status, head] = await Promise.all([
+				pi.exec("git", ["diff", "--binary", "HEAD", "--"], { cwd: activeCwd, timeout: 30_000 }),
+				pi.exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: activeCwd, timeout: 30_000 }),
+				pi.exec("git", ["rev-parse", "HEAD"], { cwd: activeCwd, timeout: 30_000 }),
+			]);
+			const revision = head.code === 0 ? head.stdout.trim() : "";
+			const snapshot = fingerprintWorkspace(activeCwd, diff.stdout, status.stdout, revision);
+			let committedFiles: string[] = [];
+			if (state.baseRevision && revision && state.baseRevision !== revision) {
+				const names = await pi.exec("git", ["diff", "--name-only", state.baseRevision, revision, "--"], { cwd: activeCwd, timeout: 30_000 });
+				if (names.code === 0) committedFiles = names.stdout.split("\n").map((value) => value.trim()).filter(Boolean);
+			}
+			return { ...snapshot, head: revision, files: [...new Set([...snapshot.files, ...committedFiles])] };
+		} catch {
+			return { fingerprint: "", files: [], head: "" };
+		}
+	};
+
+	const publishState = () => {
+		state.updatedAt = Date.now();
+		try {
+			pi.appendEntry("pi-app-workflow-state", state);
+		} catch {
+			// In-memory state remains authoritative until the next successful checkpoint.
+		}
+		if (taskUi) {
+			taskUi.setStatus("pi-app-workflow", `workflow: ${phaseText(state)}`);
+			taskUi.setWidget("pi-app-workflow-state", [JSON.stringify(state)], { placement: "aboveEditor" });
+		}
+	};
+
+	const publishTasks = () => {
+		if (!taskUi) return;
+		const maxConcurrent = Number(process.env.PI_APP_HARNESS_MAX_CONCURRENT ?? 2);
+		const tasks = decorateTaskQueue([...backgroundTasks.values()].slice(-50), maxConcurrent);
+		taskUi.setWidget("pi-app-background-state", tasks.length > 0 ? [JSON.stringify(tasks)] : undefined, { placement: "aboveEditor" });
+	};
+
+	const rememberTask = (task: BackgroundTask, persist = true) => {
+		backgroundTasks.set(task.id, { ...backgroundTasks.get(task.id), ...task });
+		while (backgroundTasks.size > 50) {
+			const oldest = backgroundTasks.keys().next().value as string | undefined;
+			if (!oldest) break;
+			backgroundTasks.delete(oldest);
+		}
+		if (persist) {
+			try { pi.appendEntry("pi-app-background-record", backgroundTasks.get(task.id)); } catch { /* UI history is best effort */ }
+		}
+	};
+
+	const rpc = <T,>(channel: string, payload: Record<string, unknown>, timeoutMs = 4_000): Promise<T> => new Promise((resolve, reject) => {
+		const requestId = `harness-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		const replyChannel = `${channel}:reply:${requestId}`;
+		let settled = false;
+		const unsubscribe = pi.events.on(replyChannel, (raw) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			unsubscribe();
+			const reply = raw as RpcReply<T>;
+			if (reply?.success) resolve(reply.data as T);
+			else reject(new Error(reply && "error" in reply ? reply.error : `No reply from ${channel}`));
+		});
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			unsubscribe();
+			reject(new Error(`${channel} timed out`));
+		}, timeoutMs);
+		pi.events.emit(channel, { ...payload, requestId });
+	});
+
+	const stopTask = async (id: string) => {
+		const prior = backgroundTasks.get(id);
+		const live = subagentRegistry()?.getRecord(id);
+		if (!live && prior && (prior.status === "queued" || prior.status === "running")) {
+			rememberTask({ ...prior, status: "cancelled", error: prior.error ?? "Task process is no longer live; stale state recovered.", completedAt: Date.now() });
+			publishTasks();
+			return;
+		}
+		await rpc<void>("subagents:rpc:stop", { agentId: id });
+		if (prior) rememberTask({ ...prior, status: "cancelled", completedAt: Date.now() });
+		publishTasks();
+	};
+
+	const spawnTask = async (type: string, prompt: string, description: string, isBackground = true, isolation?: "worktree"): Promise<string> => {
+		const reply = await rpc<{ id: string }>("subagents:rpc:spawn", {
+			type,
+			prompt,
+			priority: type === "independent-evaluator" ? "high" : "normal",
+			options: { isBackground, cwd: activeCwd, description, isolation },
+		}, 8_000);
+		const live = subagentRegistry()?.getRecord(reply.id);
+		rememberTask({
+			id: reply.id,
+			type,
+			description,
+			status: normalizedTaskStatus(live?.status ?? "queued"),
+			startedAt: live?.startedAt ?? Date.now(),
+			prompt,
+			branch: live?.worktreeResult?.branch ?? live?.worktree?.branch,
+			baseSha: live?.worktree?.baseSha,
+			worktreePath: live?.worktree?.path,
+			outputFile: live?.outputFile,
+		});
+		publishTasks();
+		return reply.id;
+	};
+
+	const taskData = (data: unknown): BackgroundTask => {
+		const value = (data ?? {}) as Record<string, unknown>;
+		const id = String(value.id ?? "");
+		const live = id ? subagentRegistry()?.getRecord(id) : undefined;
+		const lifetime = live?.lifetimeUsage;
+		const liveTokens = lifetime ? (lifetime.input ?? 0) + (lifetime.output ?? 0) + (lifetime.cacheWrite ?? 0) : undefined;
+		const startedAt = typeof value.startedAt === "number" ? value.startedAt : live?.startedAt;
+		const completedAt = typeof value.completedAt === "number" ? value.completedAt : live?.completedAt;
+		return {
+			id,
+			type: String(value.type ?? live?.type ?? "agent"),
+			description: String(value.description ?? live?.description ?? "background work"),
+			status: normalizedTaskStatus(value.status ?? live?.status ?? "queued"),
+			result: value.result == null ? live?.result : outputText(value.result, 20_000),
+			error: value.error == null ? live?.error : outputText(value.error, 4_000),
+			startedAt,
+			completedAt,
+			durationMs: typeof value.durationMs === "number" ? value.durationMs : startedAt ? (completedAt ?? Date.now()) - startedAt : undefined,
+			tokens: typeof value.tokens === "number"
+				? value.tokens
+				: value.tokens && typeof value.tokens === "object" && typeof (value.tokens as Record<string, unknown>).total === "number"
+					? (value.tokens as Record<string, number>).total
+					: liveTokens,
+			branch: typeof value.branch === "string" ? value.branch : live?.worktreeResult?.branch ?? live?.worktree?.branch,
+			baseSha: typeof value.baseSha === "string" ? value.baseSha : live?.worktree?.baseSha,
+			worktreePath: typeof value.worktreePath === "string" ? value.worktreePath : live?.worktree?.path,
+			outputFile: typeof value.outputFile === "string" ? value.outputFile : live?.outputFile,
+			prompt: typeof value.prompt === "string" ? value.prompt : undefined,
+			transcript: typeof value.transcript === "string" ? value.transcript : undefined,
+			diff: typeof value.diff === "string" ? value.diff : undefined,
+			mergedCommit: typeof value.mergedCommit === "string" ? value.mergedCommit : undefined,
+			priority: ["high", "normal", "low"].includes(String(value.priority)) ? String(value.priority) as TaskPriority : undefined,
+			queuePosition: typeof value.queuePosition === "number" ? value.queuePosition : undefined,
+			etaMs: typeof value.etaMs === "number" ? value.etaMs : undefined,
+			blockedReason: typeof value.blockedReason === "string" ? value.blockedReason : undefined,
+			evaluatorProtocolVersion: typeof value.evaluatorProtocolVersion === "number" ? value.evaluatorProtocolVersion : undefined,
+			evaluatorQuorum: typeof value.evaluatorQuorum === "boolean" ? value.evaluatorQuorum : undefined,
+		};
+	};
+
+	pi.events.on("subagents:created", (data) => {
+		const task = taskData(data);
+		if (!task.id) return;
+		rememberTask({ ...task, status: "queued" });
+		publishTasks();
+	});
+	pi.events.on("subagents:started", (data) => {
+		const task = taskData(data);
+		if (!task.id) return;
+		rememberTask({ ...task, status: "running" });
+		publishTasks();
+	});
+	for (const [channel, fallback] of [["subagents:completed", "completed"], ["subagents:failed", "failed"]] as const) {
+		pi.events.on(channel, (data) => {
+			const task = taskData(data);
+			if (!task.id) return;
+			const status = task.status === "failed" || task.status === "cancelled" ? task.status : fallback;
+			rememberTask({ ...task, status });
+			publishTasks();
+
+			if (task.id !== state.evaluatorTaskId) return;
+			state.evaluatorTaskId = undefined;
+			if (status === "completed" && evaluatorPassed(task.result ?? "")) {
+				state = updateWorkflowStep(state, "evaluate", "passed", "Independent evaluator accepted the implementation.");
+				const review = state.steps.find((step) => step.id === "review");
+				if (review) state = updateWorkflowStep(state, "review", "passed", "Workflow evidence is ready for handoff.");
+				state.editsPending = false;
+				publishState();
+				return;
+			}
+			state = updateWorkflowStep(state, "evaluate", "failed", task.error || task.result || "Evaluator did not return VERDICT: PASS.");
+			state.editsPending = true;
+			publishState();
+			if (!ABLATIONS.has("repair-loop") && state.autoLoops < MAX_AUTO_LOOPS) {
+				state.autoLoops++;
+				pi.sendMessage({
+					customType: "pi-app-workflow",
+					content: independentEvaluationRepairPrompt(task.error || task.result || "No evaluator details"),
+					display: false,
+					details: { reason: "evaluator-rejected", evaluatorTaskId: task.id },
+				}, { triggerTurn: true, deliverAs: "followUp" });
+			}
+		});
+	}
+
+	const stopActiveTasks = async (): Promise<string[]> => {
+		const active = [...backgroundTasks.values()].filter((task) => task.status === "queued" || task.status === "running");
+		const stopped: string[] = [];
+		for (const task of active) {
+			try {
+				await stopTask(task.id);
+				stopped.push(task.id);
+			} catch (error) {
+				log(`failed to stop ${task.id}: ${String(error)}`);
+				throw error;
+			}
+		}
+		return stopped;
+	};
+
 	pi.registerCommand("pi-rewind", {
-		description: "pi-app: откат разговора к сообщению внутри текущей сессии (без новой сессии)",
+		description: "Rewind inside the current session; cancel background work atomically",
 		handler: async (args, ctx) => {
 			const entryId = args.trim();
-			if (!entryId) {
-				ctx.ui.notify("pi-rewind: не передан entryId", "warning");
+			if (!entryId) return ctx.ui.notify("pi-rewind: missing entryId", "warning");
+			const target = ctx.sessionManager.getEntry(entryId)?.parentId ?? null;
+			if (!target) return ctx.ui.notify("pi-rewind: cannot navigate before the first entry", "warning");
+			const branch = ctx.sessionManager.getBranch();
+			const abandonedLeaf = branch.at(-1)?.id ?? null;
+			const targetIndex = branch.findIndex((entry) => entry.id === entryId);
+			const abandonedEntries = targetIndex >= 0 ? branch.slice(targetIndex) : [];
+			const abandonedUserMessages = abandonedEntries
+				.filter((entry) => entry.type === "message" && (entry as { message?: { role?: string } }).message?.role === "user")
+				.map(sessionEntryPreview)
+				.filter((text): text is string => Boolean(text))
+				.slice(0, 8);
+			let stopped: string[];
+			try {
+				stopped = await stopActiveTasks();
+			} catch (error) {
+				ctx.ui.notify(`Rewind aborted: a background task could not be cancelled (${String(error)})`, "error");
 				return;
 			}
-			const entry = ctx.sessionManager.getEntry(entryId);
-			// откат «до этого сообщения» = leaf на родителя выбранного user-сообщения
-			const target = entry?.parentId ?? null;
-			if (!target) {
-				// первое сообщение ветки — родителя нет; навигация «в начало» не
-				// выражается через navigateTree, пусть pi-app откатит через fork
-				ctx.ui.notify("pi-rewind: это первое сообщение — используйте форк", "info");
-				return;
-			}
-			await ctx.navigateTree(target, { summarize: false });
-			log(`rewind: navigateTree -> ${target}`);
+			const result = await ctx.navigateTree(target, { summarize: false, label: "rewind" });
+			if (result.cancelled) return ctx.ui.notify("pi-rewind: cancelled", "info");
+			const record = {
+				version: 1,
+				at: Date.now(),
+				type: "rewind" as const,
+				targetEntryId: entryId,
+				targetPreview: sessionEntryPreview(ctx.sessionManager.getEntry(entryId)),
+				newLeafId: target,
+				abandonedLeafId: abandonedLeaf,
+				abandonedEntryCount: abandonedEntries.length,
+				abandonedUserMessages,
+				stoppedTaskIds: stopped,
+			};
+			pi.appendEntry("pi-app-rewind-record", record);
+			state = createWorkflowState("");
+			pendingNotes = [];
+			toolArgs.clear();
+			publishState();
 		},
 	});
 
-	pi.on("before_agent_start", async (ev) => {
-		pendingNudges = [];
-		editsUnverified = false;
-		verifyNudgesSent = 0;
-		hintedSkills.clear();
-		lastCallSig = "";
-		sameCallStreak = 0;
-		todoStreak = 0;
-		blockedCalls = 0;
-		malformedStreak = 0;
-		lastReadPath = "";
-		readStreak = 0;
-		contextNudged = false;
-		summaryNudged = false;
-		loopSignals = 0;
-		skillsCache = (ev.systemPromptOptions?.skills ?? []) as SkillInfo[];
-
-		const prompt = (ev.prompt ?? "").trim();
-		log(`start: skills=${skillsCache.length}`);
-		if (!prompt || prompt.startsWith("/")) return; // слэш-команды не трогаем
-
-		if (isNonTrivial(prompt)) {
-			pendingNudges.push(TODO_NUDGE);
-			log("nudge: todo-first");
-		}
-		if (needsSequentialThinking(prompt)) {
-			pendingNudges.push(SEQUENTIAL_THINKING_NUDGE);
-			log("nudge: sequential-thinking");
-		}
-		// свежие факты → web-инструменты (H4): модель сама о них не вспоминает
-		if (/(найди в (интернете|сети)|погугли|поищи в|актуальн\w+ верси|последн\w+ верси|latest version|search the web|что нового в)/i.test(prompt)) {
-			pendingNudges.push(
-				"This task needs FRESH external facts. Use the web tools now: web_search for discovery, " +
-					"fetch_content for a specific page. Do not answer from memory. " +
-					"If web tools are not available, state that explicitly.",
-			);
-			log("nudge: web");
-		}
-		const skill = matchSkill(prompt, skillsCache);
-		if (skill) skillHint(skill, "this task");
+	pi.registerCommand("pi-branch-return", {
+		description: "Return to a saved leaf in the current session",
+		handler: async (args, ctx) => {
+			const leaf = args.trim();
+			if (!leaf || !ctx.sessionManager.getEntry(leaf)) return ctx.ui.notify("Branch leaf is unavailable", "warning");
+			await stopActiveTasks();
+			const result = await ctx.navigateTree(leaf, { summarize: false, label: "branch return" });
+			if (!result.cancelled) pi.appendEntry("pi-app-branch-record", { version: 1, at: Date.now(), type: "return", leafId: leaf });
+		},
 	});
 
-	// Анти-луп (§5.11-1): наблюдаемый отказ локальной 35B — карусель одинаковых
-	// вызовов (read того же файла, todo create→pending→completed) без прогресса.
-	// Эскалация: 2-й идентичный подряд → реминдер; 4-й → блокировка вызова
-	// только в strict-режиме. Todo: 3 → реминдер, 6 → strict-блок.
-	pi.on("tool_call", async (ev, ctx) => {
-		const name = String(ev.toolName ?? "").toLowerCase();
-		let sig = name;
-		try {
-			sig = `${name}:${JSON.stringify(ev.input ?? {})}`;
-		} catch {
-			// нестрокуемый input — различаем только по имени
-		}
-		if (sig === lastCallSig) {
-			sameCallStreak++;
-		} else {
-			lastCallSig = sig;
-			sameCallStreak = 1;
-		}
-
-		// Предохранитель strict-режима: блокировки не останавливают генерацию — модель может
-		// пробовать бесконечно (наблюдалось BLOCK todo x20 до таймаута). После
-		// 8 заблокированных вызовов ран прерывается целиком.
-		const blockCall = (reason: string) => {
-			if (!strict) {
-				log(`advisory only: ${reason}`);
-				return undefined;
+	pi.registerCommand("pi-workflow", {
+		description: "Workflow control: approve-plan | retry-gates",
+		handler: async (args, ctx) => {
+			const action = args.trim().toLowerCase();
+			if (action === "approve-plan") {
+				state.approved = true;
+				if (state.steps.some((step) => step.id === "plan" && step.status !== "passed")) state = updateWorkflowStep(state, "plan", "passed", "Plan approved in pi-app.");
+				if (state.steps.some((step) => step.id === "approve")) state = updateWorkflowStep(state, "approve", "passed", "Human approval recorded in session.");
+				publishState();
+				ctx.ui.notify("Workflow plan approved", "info");
+				return;
 			}
-			blockedCalls++;
-			if (blockedCalls >= 8) {
-				log(`loop: ABORT after ${blockedCalls} blocked calls`);
+			if (action === "retry-gates") {
+				// A project may add its verifier manifest during the implementation
+				// turn. Replace the generic no-verifier placeholder before retrying.
+				state = attachVerifierSteps(state, loadVerifierManifest(activeCwd));
+				for (const step of state.steps.filter((item) => item.kind === "gate" && item.status === "failed")) state = updateWorkflowStep(state, step.id, "pending", "Gate queued for retry.");
+				if (state.steps.some((step) => step.id === "evaluate" && ["failed", "running"].includes(step.status))) {
+					state = updateWorkflowStep(state, "evaluate", "pending", "Interrupted or rejected evaluator queued for retry.");
+				}
+				state.evaluatorTaskId = undefined;
+				state.editsPending = true;
+				// Protocol/parser upgrades must not spend another model turn when the
+				// same session already contains a complete, machine-checkable review.
+				// Re-evaluate only retained independent-evaluator output; semantic FAILs
+				// and incomplete prose remain rejected by evaluatorPassed().
+				const replay = [...backgroundTasks.values()]
+					.filter((task) => task.type === "independent-evaluator"
+						&& task.status === "completed"
+						&& task.evaluatorProtocolVersion === 2
+						&& task.evaluatorQuorum === true
+						&& Boolean(task.result))
+					.sort((left, right) => (right.completedAt ?? 0) - (left.completedAt ?? 0))
+					.find((task) => evaluatorPassed(task.result ?? ""));
+				if (replay && !state.steps.some((step) => step.kind === "gate" && !["passed", "skipped"].includes(step.status))) {
+					state = updateWorkflowStep(state, "evaluate", "passed", `Replayed accepted evaluator evidence from ${replay.id} under the current protocol.`);
+					if (state.steps.some((step) => step.id === "review")) state = updateWorkflowStep(state, "review", "passed", "Workflow evidence is ready for handoff.");
+					state.editsPending = false;
+					pi.appendEntry("pi-app-evaluator-replay-record", { version: 1, at: Date.now(), evaluatorTaskId: replay.id, runId: state.runId });
+					publishState();
+					ctx.ui.notify("Stored evaluator evidence accepted; workflow recovered in this session", "info");
+					return;
+				}
+				publishState();
+				await runDeterministicGates();
+				return;
+			}
+			ctx.ui.notify("Usage: /pi-workflow approve-plan | retry-gates", "warning");
+		},
+	});
+
+	const liveTaskRecord = (task: BackgroundTask): LiveSubagentRecord | undefined => subagentRegistry()?.getRecord(task.id);
+
+	const refreshTaskEvidence = (task: BackgroundTask): BackgroundTask => {
+		const live = liveTaskRecord(task);
+		if (!live) return task;
+		const lifetime = live.lifetimeUsage;
+		return {
+			...task,
+			status: normalizedTaskStatus(live.status),
+			result: live.result ?? task.result,
+			error: live.error ?? task.error,
+			startedAt: live.startedAt ?? task.startedAt,
+			completedAt: live.completedAt ?? task.completedAt,
+			tokens: lifetime ? (lifetime.input ?? 0) + (lifetime.output ?? 0) + (lifetime.cacheWrite ?? 0) : task.tokens,
+			branch: live.worktreeResult?.branch ?? live.worktree?.branch ?? task.branch,
+			baseSha: live.worktree?.baseSha ?? task.baseSha,
+			worktreePath: live.worktree?.path ?? task.worktreePath,
+			outputFile: live.outputFile ?? task.outputFile,
+		};
+	};
+
+	const collectTranscript = (task: BackgroundTask): string => {
+		const current = refreshTaskEvidence(task);
+		let transcript = "";
+		if (current.outputFile) {
+			try { transcript = readFileSync(current.outputFile, "utf8"); } catch { /* completed result remains available */ }
+		}
+		if (!transcript.trim()) transcript = current.result || current.error || `Task ${current.status}; no retained transcript is available.`;
+		return transcript.length > 30_000 ? `…earlier transcript omitted\n${transcript.slice(-30_000)}` : transcript;
+	};
+
+	const collectTaskDiff = async (task: BackgroundTask): Promise<string> => {
+		const current = refreshTaskEvidence(task);
+		if (!current.branch) throw new Error("This task has no isolated worktree branch; a task-specific diff cannot be proven.");
+		let base = current.baseSha;
+		if (!base) {
+			const mergeBase = await pi.exec("git", ["merge-base", "HEAD", current.branch], { cwd: activeCwd, timeout: 30_000 });
+			if (mergeBase.code !== 0) throw new Error(`Cannot resolve merge base for ${current.branch}: ${mergeBase.stderr}`);
+			base = mergeBase.stdout.trim();
+		}
+		const [stat, diff] = await Promise.all([
+			pi.exec("git", ["diff", "--stat", `${base}...${current.branch}`, "--"], { cwd: activeCwd, timeout: 30_000 }),
+			pi.exec("git", ["diff", "--no-ext-diff", `${base}...${current.branch}`, "--"], { cwd: activeCwd, timeout: 30_000 }),
+		]);
+		if (stat.code !== 0 || diff.code !== 0) throw new Error((stat.stderr || diff.stderr || "Task diff failed").trim());
+		const evidence = `${current.branch} from ${base}\n\n${stat.stdout.trim() || "No changed files."}\n\n${diff.stdout.trim() || "No diff."}`;
+		return evidence.length > 40_000 ? `${evidence.slice(0, 40_000)}\n…diff truncated` : evidence;
+	};
+
+	const runVerifierManifestAt = async (cwd: string): Promise<string> => {
+		const manifest = loadVerifierManifest(cwd);
+		const required = manifest.commands.filter((command) => command.required !== false);
+		if (required.length === 0) throw new Error("Merge refused: the candidate has no required verifier manifest or conventional project scripts.");
+		const evidence: string[] = [];
+		for (const command of required) {
+			const result = await pi.exec("/bin/zsh", ["-lc", command.command], { cwd, timeout: command.timeoutMs ?? 300_000 });
+			const detail = `$ ${command.command}\nexit ${result.code}${result.killed ? " (killed)" : ""}\n${result.stdout}\n${result.stderr}`.trim().slice(-12_000);
+			evidence.push(detail);
+			if (result.code !== 0 || result.killed) throw new Error(`Merge verifier failed (${command.label}).\n${detail}`);
+		}
+		return evidence.join("\n\n");
+	};
+
+	const mergeTaskBranch = async (task: BackgroundTask): Promise<string> => {
+		const current = refreshTaskEvidence(task);
+		if (current.status !== "completed") throw new Error(`Merge refused: task status is ${current.status}.`);
+		if (!current.branch) throw new Error("Merge refused: the task did not produce an isolated branch.");
+		const parentStatus = await pi.exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: activeCwd, timeout: 30_000 });
+		if (parentStatus.code !== 0) throw new Error(parentStatus.stderr || "Cannot inspect parent worktree.");
+		if (parentStatus.stdout.length > 0) throw new Error("Merge refused: the parent worktree is dirty. Commit or stash its changes first.");
+		const branchRef = `refs/heads/${current.branch}`;
+		const branchProbe = await pi.exec("git", ["show-ref", "--verify", branchRef], { cwd: activeCwd, timeout: 30_000 });
+		if (branchProbe.code !== 0) throw new Error(`Merge refused: branch ${current.branch} is unavailable.`);
+
+		const scratchRoot = mkdtempSync(join(tmpdir(), "pi-app-merge-"));
+		const integrationWorktree = join(scratchRoot, "candidate");
+		let attached = false;
+		try {
+			const add = await pi.exec("git", ["worktree", "add", "--detach", integrationWorktree, "HEAD"], { cwd: activeCwd, timeout: 60_000 });
+			if (add.code !== 0) throw new Error(`Cannot create merge sandbox: ${add.stderr}`);
+			attached = true;
+			const merge = await pi.exec("git", ["merge", "--no-ff", "--no-commit", current.branch], { cwd: integrationWorktree, timeout: 60_000 });
+			if (merge.code !== 0) throw new Error(`Candidate conflicts with the parent branch.\n${merge.stdout}\n${merge.stderr}`);
+			const headBefore = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: integrationWorktree, timeout: 30_000 });
+			const staged = await pi.exec("git", ["diff", "--cached", "--quiet", "--exit-code"], { cwd: integrationWorktree, timeout: 30_000 });
+			if (staged.code === 0) return `Branch ${current.branch} is already integrated at ${headBefore.stdout.trim()}.`;
+			if (staged.code !== 1) throw new Error(`Cannot inspect staged merge result: ${staged.stderr}`);
+			const verifierEvidence = await runVerifierManifestAt(integrationWorktree);
+			const commit = await pi.exec("git", ["-c", "user.name=pi-app", "-c", "user.email=pi-app@local", "commit", "-m", `Merge background task ${task.id}: ${task.description}`], { cwd: integrationWorktree, timeout: 60_000 });
+			if (commit.code !== 0) throw new Error(`Cannot commit verified candidate: ${commit.stderr}`);
+			const merged = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: integrationWorktree, timeout: 30_000 });
+			const mergedCommit = merged.stdout.trim();
+			const parentStatusAgain = await pi.exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: activeCwd, timeout: 30_000 });
+			if (parentStatusAgain.code !== 0 || parentStatusAgain.stdout.length > 0) throw new Error("Parent worktree changed during verification; merge was not applied.");
+			const fastForward = await pi.exec("git", ["merge", "--ff-only", mergedCommit], { cwd: activeCwd, timeout: 60_000 });
+			if (fastForward.code !== 0) throw new Error(`Verified merge could not fast-forward the parent: ${fastForward.stderr}`);
+			rememberTask({ ...current, mergedCommit, result: `${current.result ? `${current.result}\n\n` : ""}Merged as ${mergedCommit}.\n\n${verifierEvidence}` });
+			publishTasks();
+			return `Merged ${current.branch} as ${mergedCommit}; every required verifier passed in an isolated integration worktree.`;
+		} finally {
+			if (attached) await pi.exec("git", ["worktree", "remove", "--force", integrationWorktree], { cwd: activeCwd, timeout: 60_000 }).catch(() => undefined);
+			rmSync(scratchRoot, { recursive: true, force: true });
+		}
+	};
+
+	pi.registerCommand("pi-task", {
+		description: "Background task: cancel|steer|transcript|diff|retry|merge <id> [message]",
+		handler: async (args, ctx) => {
+			const [action, id, ...rest] = args.trim().split(/\s+/);
+			const task = backgroundTasks.get(id);
+			if (!action || !id || !task) return ctx.ui.notify("Task not found", "warning");
+			if (action === "cancel") {
+				try { await stopTask(id); } catch (error) { ctx.ui.notify(String(error), "error"); }
+				return;
+			}
+			if (action === "retry") {
 				try {
-					ctx.abort();
-				} catch {
-					// abort вне стрима кидает — игнорируем
+					const prompt = task.prompt || `Retry this bounded workstream and satisfy its original description with evidence: ${task.description}`;
+					const nextId = await spawnTask(task.type, prompt, `Retry: ${task.description}`, true, task.branch || task.worktreePath ? "worktree" : undefined);
+					ctx.ui.notify(`Task retried as ${nextId}`, "info");
+				} catch (error) { ctx.ui.notify(String(error), "error"); }
+				return;
+			}
+			const message = rest.join(" ").trim();
+			try {
+				if (action === "steer") {
+					const live = liveTaskRecord(task);
+					if (!live || !["queued", "running", "steered"].includes(live.status ?? "")) throw new Error("Task is no longer live and cannot be steered.");
+					const guidance = message || "Report current evidence, then continue toward the original acceptance criteria.";
+					if (live.session) await live.session.steer(guidance);
+					else (live.pendingSteers ??= []).push(guidance);
+					ctx.ui.notify(`Guidance delivered directly to ${id}`, "info");
+					return;
+				}
+				if (action === "transcript") {
+					const current = refreshTaskEvidence(task);
+					rememberTask({ ...current, transcript: collectTranscript(current) });
+					publishTasks();
+					return;
+				}
+				if (action === "diff") {
+					const current = refreshTaskEvidence(task);
+					rememberTask({ ...current, diff: await collectTaskDiff(current) });
+					publishTasks();
+					return;
+				}
+				if (action === "merge") {
+					if (message !== "confirmed") throw new Error("Merge requires an explicit UI confirmation.");
+					ctx.ui.notify(await mergeTaskBranch(task), "info");
+					return;
+				}
+				ctx.ui.notify("Unknown task action", "warning");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		activeCwd = ctx.cwd;
+		isolatedWorktree = false;
+		parentWorkspaceRoot = "";
+		try {
+			isolatedWorktree = /^gitdir:\s*/i.test(readFileSync(join(activeCwd, ".git"), "utf8"));
+			if (isolatedWorktree) {
+				const common = await pi.exec("git", ["rev-parse", "--git-common-dir"], { cwd: activeCwd, timeout: 30_000 });
+				if (common.code === 0) parentWorkspaceRoot = dirname(resolve(activeCwd, common.stdout.trim()));
+			}
+		} catch {
+			// A normal checkout has a .git directory; only linked worktrees need this boundary.
+		}
+		taskUi = ctx.ui;
+		const branch = ctx.sessionManager.getBranch();
+		const saved = [...branch].reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-app-workflow-state") as { data?: WorkflowState } | undefined;
+		if (saved?.data?.version === 3) state = normalizeWorkflowState(saved.data);
+		for (const entry of branch) {
+			if (entry.type !== "custom" || !["subagents:record", "pi-app-background-record", "pi-app-evaluator-record"].includes(entry.customType)) continue;
+			const task = taskData(entry.data);
+			if (task.id) rememberTask(task, false);
+		}
+		for (const task of backgroundTasks.values()) {
+			if (task.status !== "queued" && task.status !== "running") continue;
+			const live = liveTaskRecord(task);
+			if (live) rememberTask(refreshTaskEvidence(task), false);
+			else {
+				rememberTask({ ...task, status: "cancelled", completedAt: Date.now(), error: task.error ?? "Interrupted before this session resumed; no live process was found." }, false);
+				if (task.id === state.evaluatorTaskId) {
+					state.evaluatorTaskId = undefined;
+					if (state.steps.some((step) => step.id === "evaluate" && step.status === "running")) {
+						state = updateWorkflowStep(state, "evaluate", "failed", "Evaluator process was interrupted; retry resumes from deterministic gates without creating a new session.");
+					}
 				}
 			}
-			return { block: true, reason };
-		};
-
-		if (sameCallStreak === 2) {
-			pendingNudges.push(REPEAT_NUDGE);
-			log(`loop: repeat x2 ${name}`);
-			loopSignals++;
-		} else if (sameCallStreak >= 4) {
-			log(`loop: BLOCK repeat x${sameCallStreak} ${name}`);
-			loopSignals++;
-			return blockCall(
-				"pi-app-harness: this exact tool call was already executed several times in a row. " +
-					"Use the earlier result or take a different action.",
-			);
 		}
+		const restoredSnapshot = await workspaceSnapshot();
+		if (!state.baseRevision) state.baseRevision = restoredSnapshot.head || undefined;
+		// A resumed workflow can contain an unverified diff whose original baseline is
+		// no longer in memory. Preserve that persisted pending state and run its gates.
+		workspaceBaselineFingerprint = state.editsPending && state.changedFiles.length > 0 ? "" : restoredSnapshot.fingerprint;
+		lastObservedFingerprint = restoredSnapshot.fingerprint;
+		if (enabled) publishState();
+		publishTasks();
+	});
 
-		if (name === "todo") {
-			todoStreak++;
-			if (todoStreak === 3) {
-				pendingNudges.push(TODO_LOOP_NUDGE);
-				log("loop: todo x3");
-			loopSignals++;
-			} else if (todoStreak >= 6) {
-				log(`loop: BLOCK todo x${todoStreak}`);
-			loopSignals++;
-				return blockCall(
-					"pi-app-harness: too many consecutive todo updates without real work. " +
-						"Advance the task with read/edit/bash first.",
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (!enabled) return;
+		activeModelPattern = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+		const prompt = event.prompt.trim();
+		if (!prompt || prompt.startsWith("/")) return;
+		const resumes = state.editsPending && /^(?:continue|resume|go on|продолж(?:ай|и)?|дальше)\b/i.test(prompt);
+		if (!resumes) {
+			const classifierAblated = ABLATIONS.has("classifier");
+			const routingPrompt = classifierAblated ? "Implement the requested repository change with verification." : prompt;
+			state = createWorkflowState(routingPrompt);
+			if (classifierAblated) state.objective = prompt.slice(0, 2_000);
+			if (state.intent.allowsMutation) {
+				const manifest = loadVerifierManifest(ctx.cwd);
+				state = createWorkflowState(routingPrompt, Date.now(), manifest.profile);
+				if (classifierAblated) state.objective = prompt.slice(0, 2_000);
+				state = attachVerifierSteps(state, manifest);
+			}
+			const baseline = await workspaceSnapshot();
+			state.baseRevision = baseline.head || undefined;
+			workspaceBaselineFingerprint = baseline.fingerprint;
+			lastObservedFingerprint = workspaceBaselineFingerprint;
+		}
+		pendingNotes = [];
+		lastCallSignature = "";
+		repeatStreak = 0;
+		malformedStreak = 0;
+		continuationQueued = false;
+		toolArgs.clear();
+		publishState();
+		let addition = WORKFLOW_GUIDANCE;
+		let systemPrompt = event.systemPrompt;
+		if (isolatedWorktree && parentWorkspaceRoot) {
+			// Append-mode subagents inherit a generated parent environment block. Rebase
+			// exact parent-root references without corrupting the child path nested below
+			// it, then make the worktree boundary explicit at the end of the prompt.
+			systemPrompt = rebaseWorktreePrompt(systemPrompt, parentWorkspaceRoot, activeCwd);
+			addition += `\nIsolated child boundary: ${activeCwd} is the authoritative project root. Every project read, write, patch, and shell operation must stay inside it. Never access or modify the parent checkout directly.`;
+		}
+		if (!ABLATIONS.has("ponytail")) addition += PONYTAIL_POLICY;
+		addition += `\nActive profile: ${state.profile}. Risk: ${state.intent.risk}. Research: ${state.intent.needsResearch}. Mutation: ${state.intent.allowsMutation}. Deletion authorized: ${state.intent.allowsDeletion}. Human approval: ${state.intent.requiresHumanApproval}.`;
+		return { systemPrompt: systemPrompt + `\n\n${addition}` };
+	});
+
+	pi.on("agent_start", async () => {
+		continuationQueued = false;
+		if (continuationWaiter) continuationWaiter.started = true;
+	});
+
+	pi.on("tool_call", async (event) => {
+		const name = String(event.toolName ?? "").toLowerCase();
+		if (isolatedWorktree) {
+			const input = event.input && typeof event.input === "object" ? event.input as Record<string, unknown> : {};
+			const paths = [...toolPaths(input), ...(name === "apply_patch" ? patchPaths(input) : [])];
+			const escapedPath = paths.find((path) => !isWorkspacePath(activeCwd, path));
+			if (escapedPath) {
+				const reason = `Isolated worktree boundary: ${escapedPath} is outside ${activeCwd}. Use the current child working directory; never access the parent checkout directly.`;
+				log(`blocked worktree path escape tool=${name} path=${escapedPath}`);
+				return { block: true, reason };
+			}
+			if (name === "bash") {
+				const command = typeof input.command === "string" ? input.command : "";
+				const withoutWorktree = command.split(activeCwd).join("$WORKTREE");
+				const redirects = [...command.matchAll(/(?:^|[^>])>>?\s*['\"]?(\/[^\s'\";|&]+)/g)].map((match) => match[1]);
+				const escapesParent = Boolean(parentWorkspaceRoot && withoutWorktree.includes(parentWorkspaceRoot));
+				const escapesTraversal = /(?:^|[\s'\"=])\.\.\//.test(command);
+				const escapedRedirect = redirects.find((path) => !isWorkspacePath(activeCwd, path));
+				if (escapesParent || escapesTraversal || escapedRedirect) {
+					const reason = "Isolated worktree boundary: shell commands may not address the parent checkout, traverse above the child root, or redirect output outside the child worktree.";
+					log(`blocked worktree shell escape parent=${escapesParent} traversal=${escapesTraversal} redirect=${escapedRedirect ?? ""}`);
+					return { block: true, reason };
+				}
+			}
+		}
+		if (!enabled) return;
+		if (state.intent.requiresHumanApproval && !state.approved && (WRITE_TOOLS.has(name) || ["bash", "agent"].includes(name))) {
+			const reason = "Workflow approval gate: approve the persisted plan in pi-app before mutation, shell execution, or delegated work.";
+			state.events = [...state.events, { id: `gate-${Date.now().toString(36)}`, stepId: "approve", type: "waiting", at: Date.now(), message: reason }].slice(-160);
+			publishState();
+			return { block: true, reason };
+		}
+		let signature = name;
+		try { signature += `:${JSON.stringify(event.input ?? {})}`; } catch { /* weak signal */ }
+		repeatStreak = signature === lastCallSignature ? repeatStreak + 1 : 1;
+		lastCallSignature = signature;
+		if (repeatStreak === 2 && state.loopSignals === 0) {
+			state.loopSignals++;
+			pendingNotes.push(LOOP_NOTE);
+			publishState();
+		}
+	});
+
+	pi.on("message_end", async (event) => {
+		if (!enabled) return;
+		const message = event.message as { role?: string; content?: unknown };
+		if (message.role !== "assistant" || !Array.isArray(message.content)) return;
+		const calls = (message.content as Array<{ type?: string; name?: string; arguments?: unknown }>).filter((block) => block?.type === "toolCall");
+		if (calls.length === 0) return;
+		const broken = calls.some((block) => ["read", "write", "edit", "bash"].includes(String(block.name ?? "").toLowerCase()) &&
+			(block.arguments == null || (typeof block.arguments === "object" && Object.keys(block.arguments as object).length === 0)));
+		malformedStreak = broken ? malformedStreak + 1 : 0;
+		if (malformedStreak === 2 && state.loopSignals === 0) pendingNotes.push(MALFORMED_NOTE);
+	});
+
+	pi.on("tool_execution_start", async (event) => { toolArgs.set(event.toolCallId, event.args); });
+
+	pi.on("tool_execution_end", async (event) => {
+		const name = String(event.toolName ?? "").toLowerCase();
+		const args = toolArgs.get(event.toolCallId);
+		toolArgs.delete(event.toolCallId);
+		if (name === "agent" && !event.isError && args && typeof args === "object") {
+			const value = args as Record<string, unknown>;
+			const result = outputText(event.result, 20_000);
+			const id = parseBackgroundAgentId(result);
+			if (id) {
+				const live = subagentRegistry()?.getRecord(id);
+				rememberTask({
+					id,
+					type: String(value.subagent_type ?? value.type ?? live?.type ?? "agent"),
+					description: String(value.description ?? live?.description ?? "background work"),
+					status: normalizedTaskStatus(live?.status ?? "running"),
+					startedAt: live?.startedAt ?? Date.now(),
+					prompt: typeof value.prompt === "string" ? value.prompt : undefined,
+					branch: live?.worktreeResult?.branch ?? live?.worktree?.branch,
+					baseSha: live?.worktree?.baseSha,
+					worktreePath: live?.worktree?.path,
+					outputFile: live?.outputFile,
+				});
+				publishTasks();
+			}
+		}
+		if (!enabled) return;
+		if (WRITE_TOOLS.has(name) && !event.isError) {
+			const path = changedPath(args);
+			if (path && !state.changedFiles.includes(path)) state.changedFiles.push(path);
+			for (const planId of ["plan", "reproduce"]) {
+				if (state.steps.some((step) => step.id === planId && step.status === "pending")) state = updateWorkflowStep(state, planId, "passed", "Planning boundary completed before first edit.");
+			}
+			if (state.steps.some((step) => step.id === "build" && step.status !== "running")) state = updateWorkflowStep(state, "build", "running", "Implementation changed project files.");
+			state.editsPending = true;
+			publishState();
+			return;
+		}
+		if (state.steps.some((step) => step.kind === "gate" && step.status === "passed") && executionFailed(event.isError, event.result)) {
+			state.editsPending = true;
+			for (const step of state.steps.filter((item) => item.kind === "gate" && item.status === "passed")) state = updateWorkflowStep(state, step.id, "pending", "A later direct probe invalidated the previous green gate.");
+			publishState();
+		}
+	});
+
+	pi.on("context", async (event, ctx) => {
+		if (!enabled) return;
+		const usage = ctx.getContextUsage();
+		if (!state.contextCheckpointed && usage?.percent != null && usage.percent >= CHECKPOINT_PERCENT) {
+			state.contextCheckpointed = true;
+			const next = readySteps(state).map((step) => step.id);
+			const checkpoint = {
+				version: 1,
+				at: Date.now(),
+				runId: state.runId,
+				objective: state.objective,
+				profile: state.profile,
+				changedFiles: state.changedFiles,
+				decisions: state.events.filter((item) => item.type === "passed" || item.type === "note").slice(-12).map((item) => item.message),
+				gateEvidence: state.steps.filter((item) => item.kind === "gate").map(({ id, status, command, detail }) => ({ id, status, command, detail })),
+				risks: state.steps.filter((item) => item.status === "failed" || item.status === "waiting").map((item) => `${item.label}: ${item.detail ?? item.acceptance}`),
+				steps: state.steps.map(({ id, status, detail }) => ({ id, status, detail })),
+				nextReadySteps: next,
+				nextAction: next.length > 0 ? `Continue ${next.join(", ")}` : "Resolve waiting/failed gates or hand off the verified result.",
+				context: { percent: usage.percent, tokens: usage.tokens, contextWindow: usage.contextWindow },
+			};
+			pi.appendEntry("pi-app-checkpoint", checkpoint);
+			taskUi?.setWidget("pi-app-checkpoint-state", [JSON.stringify(checkpoint)], { placement: "aboveEditor" });
+			pendingNotes.push("Context is past 75%. Finish the current atomic step and preserve this structured checkpoint before opening another workstream.");
+			publishState();
+		}
+		if (pendingNotes.length === 0) return;
+		const notes = pendingNotes.splice(0);
+		const reminder = { role: "user", content: [{ type: "text", text: `<system-reminder source="pi-app-workflow">${notes.join("\n\n")}</system-reminder>` }], timestamp: Date.now() } as unknown as (typeof event.messages)[number];
+		return { messages: [...event.messages, reminder] };
+	});
+
+	pi.on("session_compact", async (event) => {
+		state.contextCheckpointed = false;
+		pi.appendEntry("pi-app-compaction-record", {
+			version: 1,
+			at: Date.now(),
+			reason: event.reason,
+			tokensBefore: event.compactionEntry.tokensBefore,
+			summary: event.compactionEntry.summary,
+			firstKeptEntryId: event.compactionEntry.firstKeptEntryId,
+		});
+		publishState();
+	});
+
+	const runEvaluator = async (): Promise<"passed" | "repaired" | "failed"> => {
+		if (ABLATIONS.has("semantic-gates") || !state.intent.requiresEvaluator) {
+			if (state.steps.some((step) => step.id === "evaluate")) state = updateWorkflowStep(state, "evaluate", "skipped", "Independent evaluator disabled for this ablation/profile.");
+			if (state.steps.some((step) => step.id === "review")) state = updateWorkflowStep(state, "review", "passed", "Deterministic workflow complete.");
+			state.editsPending = false;
+			publishState();
+			return "passed";
+		}
+		if (state.evaluatorTaskId) return "failed";
+		if (!state.steps.some((step) => step.id === "evaluate")) return "passed";
+		state = updateWorkflowStep(state, "evaluate", "running", "Independent read-only evaluator is inspecting the contract, diff and gate evidence.");
+		const evidence = state.steps.filter((step) => step.kind === "gate").map((step) => `${step.label}: ${step.status}\n${step.detail ?? ""}`).join("\n\n");
+		const evaluatorId = `eval-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		const description = `Independent evaluation: ${state.objective.slice(0, 120)}`;
+		state.evaluatorTaskId = evaluatorId;
+		rememberTask({ id: evaluatorId, type: "independent-evaluator", description, status: "running", startedAt: Date.now() });
+		publishState();
+		publishTasks();
+		try {
+			const diffBase = state.baseRevision || "HEAD";
+			const diffResult = await pi.exec("git", ["diff", "--no-ext-diff", diffBase, "--"], { cwd: activeCwd, timeout: 30_000 });
+			const deletionResult = await pi.exec("git", ["diff", "--name-status", "--diff-filter=D", diffBase, "--"], { cwd: activeCwd, timeout: 30_000 });
+			const deletedFiles = deletionResult.stdout.split("\n").map((line) => line.split("\t").at(-1)?.trim()).filter((path): path is string => Boolean(path));
+			const promptInput = {
+				objective: state.objective,
+				profile: state.profile,
+				changedFiles: state.changedFiles,
+				evidence,
+				diff: diffResult.stdout,
+			};
+			const prompt = buildIndependentEvaluatorPrompt(promptInput);
+			const evaluatorThinking = process.env.PI_APP_HARNESS_EVALUATOR_THINKING ?? "high";
+			const args = ["-a", "--no-session", "--no-extensions", "--no-skills", "--no-context-files", "--tools", "read,grep,find,ls", "--thinking", evaluatorThinking];
+			if (activeModelPattern) args.push("--model", activeModelPattern);
+			args.push("-p", prompt);
+			let result: { stdout: string; stderr: string; code: number; killed?: boolean };
+			if (deletedFiles.length > 0 && state.intent.allowsDeletion !== true) {
+				const blocked = `Tracked pre-existing files were deleted without explicit deletion authorization: ${deletedFiles.join(", ")}. Restore the public surface and repair drift by delegation.\n\nCLAUSE public-surface: FAIL\nBLOCKING: unauthorized tracked-file deletion\nPROTOCOL: COMPLETE\nVERDICT: FAIL`;
+				result = { stdout: blocked, stderr: "", code: 0, killed: false };
+				log(`semantic preflight blocked evaluator ${evaluatorId}: deleted=${deletedFiles.join(",")}`);
+			} else {
+				log(`waiting for evaluator ${evaluatorId}`);
+				result = await pi.exec("pi", args, { cwd: activeCwd, timeout: Math.max(30_000, Number(process.env.PI_APP_HARNESS_EVALUATOR_TIMEOUT_MS ?? 1_800_000) || 1_800_000) });
+			}
+			let verdict = `${result.stdout}\n${result.stderr}`.trim();
+			let quorumCompleted = false;
+			let passed = false;
+			if (result.code === 0 && !result.killed && evaluatorPassed(verdict)) {
+				const falsifierArgs = args.slice(0, -2);
+				falsifierArgs.push("-p", buildIndependentFalsifierPrompt(promptInput, verdict));
+				log(`waiting for evaluator falsifier ${evaluatorId}`);
+				const falsifier = await pi.exec("pi", falsifierArgs, { cwd: activeCwd, timeout: Math.max(30_000, Number(process.env.PI_APP_HARNESS_EVALUATOR_TIMEOUT_MS ?? 1_800_000) || 1_800_000) });
+				const falsifierVerdict = `${falsifier.stdout}\n${falsifier.stderr}`.trim();
+				quorumCompleted = true;
+				passed = falsifier.code === 0 && !falsifier.killed && evaluatorPassed(falsifierVerdict);
+				result = falsifier;
+				verdict = `PRIMARY EVALUATOR:\n${verdict}\n\nCOUNTEREXAMPLE FALSIFIER:\n${falsifierVerdict}`;
+			}
+			const task: BackgroundTask = {
+				...backgroundTasks.get(evaluatorId)!,
+				status: passed ? "completed" : "failed",
+				result: verdict.slice(-20_000),
+				error: result.code === 0 ? undefined : `Evaluator exit ${result.code}${result.killed ? " (killed)" : ""}`,
+				completedAt: Date.now(),
+				durationMs: Date.now() - (backgroundTasks.get(evaluatorId)?.startedAt ?? Date.now()),
+				evaluatorProtocolVersion: 2,
+				evaluatorQuorum: quorumCompleted,
+			};
+			rememberTask(task);
+			pi.appendEntry("pi-app-evaluator-record", task);
+			state.evaluatorTaskId = undefined;
+			if (passed) {
+				state = updateWorkflowStep(state, "evaluate", "passed", "Independent evaluator accepted the implementation.");
+				if (state.steps.some((step) => step.id === "review")) state = updateWorkflowStep(state, "review", "passed", "Workflow evidence is ready for handoff.");
+				state.editsPending = false;
+			} else {
+				state = updateWorkflowStep(state, "evaluate", "failed", verdict || task.error || "Evaluator returned no accepted verdict.");
+				state.editsPending = true;
+				if (!ABLATIONS.has("repair-loop") && state.autoLoops < MAX_AUTO_LOOPS) {
+					state.autoLoops++;
+					publishTasks();
+					publishState();
+					log(`evaluator ${evaluatorId} completed pass=${passed}; starting repair ${state.autoLoops}/${MAX_AUTO_LOOPS}`);
+					const repaired = await requestContinuation(
+						independentEvaluationRepairPrompt(verdict),
+						{ reason: "evaluator-rejected", evaluatorTaskId: evaluatorId },
+					);
+					return repaired ? "repaired" : "failed";
+				}
+			}
+			publishTasks();
+			publishState();
+			log(`evaluator ${evaluatorId} completed pass=${passed}`);
+			return passed ? "passed" : "failed";
+		} catch (error) {
+			const prior = backgroundTasks.get(evaluatorId);
+			if (prior) rememberTask({
+				...prior,
+				status: "failed",
+				error: String(error),
+				completedAt: Date.now(),
+				durationMs: Date.now() - (prior.startedAt ?? Date.now()),
+			});
+			state.evaluatorTaskId = undefined;
+			publishTasks();
+			if (state.steps.some((step) => step.id === "evaluate" && step.status === "running")) {
+				state = updateWorkflowStep(state, "evaluate", "failed", `Evaluator could not complete: ${String(error)}`);
+				publishState();
+			}
+			return "failed";
+		}
+	};
+
+	const runDeterministicGates = async () => {
+		if (verifierRunning) return;
+		verifierRunning = true;
+		try {
+			while (true) {
+				const gates = state.steps.filter((step) => step.kind === "gate" && step.command && ["pending", "failed"].includes(step.status));
+				if (gates.length === 0) {
+					const waiting = state.steps.find((step) => step.kind === "gate" && step.status === "waiting");
+					if (waiting) {
+						state = updateWorkflowStep(state, waiting.id, "failed", "No executable project verifier manifest was found. Add .pi/verifiers.json or conventional package scripts.");
+						publishState();
+						return;
+					}
+				}
+				let repairedGate = false;
+				for (const candidate of gates) {
+				const current = state.steps.find((step) => step.id === candidate.id);
+				if (!current || !current.command) continue;
+				state = updateWorkflowStep(state, current.id, "running", `$ ${current.command}`);
+				publishState();
+				const result = await pi.exec("/bin/zsh", ["-lc", current.command], { cwd: activeCwd, timeout: current.timeoutMs ?? 300_000 });
+				const details = `$ ${current.command}\nexit ${result.code}${result.killed ? " (killed)" : ""}\n${result.stdout}\n${result.stderr}`.trim().slice(-12_000);
+				if (result.code === 0 && !result.killed) {
+					state = updateWorkflowStep(state, current.id, "passed", details);
+					publishState();
+					continue;
+				}
+				state = updateWorkflowStep(state, current.id, "failed", details);
+				state.editsPending = true;
+				publishState();
+				if (!ABLATIONS.has("repair-loop") && !continuationQueued && state.autoLoops < MAX_AUTO_LOOPS) {
+					state.autoLoops++;
+					publishState();
+					const repaired = await requestContinuation(
+						`Continue the existing objective. Declared project gate failed (${state.autoLoops}/${MAX_AUTO_LOOPS}). Repair the cause in scope, then let the harness rerun every required gate. Do not mask the exit code.\n\n${details.slice(-6_000)}`,
+						{ reason: "verifier-failed", gate: current.id },
+					);
+					repairedGate = repaired;
+				}
+				break;
+			}
+				if (repairedGate) continue;
+				if (state.steps.some((step) => step.kind === "gate" && step.status === "failed")) return;
+				const evaluatorOutcome = await runEvaluator();
+				if (evaluatorOutcome === "repaired") continue;
+				return;
+			}
+		} finally {
+			verifierRunning = false;
+		}
+	};
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (!enabled || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+		if (!state.intent.allowsMutation) {
+			for (const step of state.steps) if (step.status === "pending") state = updateWorkflowStep(state, step.id, "passed", "Read-only workflow completed by the agent.");
+			publishState();
+			return;
+		}
+		const activeDelegatedWork = [...backgroundTasks.values()].filter((task) =>
+			task.type !== "independent-evaluator"
+			&& (task.startedAt ?? state.createdAt) >= state.createdAt
+			&& (task.status === "queued" || task.status === "running"));
+		if (activeDelegatedWork.length > 0) {
+			if (state.steps.some((step) => step.id === "build" && step.status !== "waiting")) {
+				state = updateWorkflowStep(
+					state,
+					"build",
+					"waiting",
+					`Waiting for ${activeDelegatedWork.length} delegated background task(s) before observing the parent workspace and running gates.`,
 				);
 			}
-		} else if (WORK_TOOLS.has(name)) {
-			todoStreak = 0;
-		}
-
-		// file-read-streak: чтение одного файла ломтями (offset меняется — детектор
-		// идентичных вызовов не ловит). 3 подряд → надж, 5 → блок.
-		if (name === "read") {
-			const input = (ev.input ?? {}) as { path?: string; file_path?: string };
-			const p = String(input.path ?? input.file_path ?? "");
-			if (p && p === lastReadPath) {
-				readStreak++;
-				if (readStreak === 3) {
-					pendingNudges.push(REREAD_NUDGE);
-					log(`loop: reread x3 ${p.split("/").pop()}`);
-			loopSignals++;
-				} else if (readStreak >= 5) {
-					log(`loop: BLOCK reread x${readStreak} ${p.split("/").pop()}`);
-			loopSignals++;
-					return blockCall(
-						"pi-app-harness: this file was just read several times in slices. " +
-							"Use what you already have or read one large range, then act.",
-					);
-				}
-			} else {
-				lastReadPath = p;
-				readStreak = 1;
+			state.editsPending = true;
+			publishState();
+			// Interactive/RPC app processes remain alive naturally. Headless print-mode
+			// would dispose the extension as soon as this handler returns and abort
+			// every genuine background worker. The benchmark opts into this settlement
+			// barrier so it can observe real overlapping work without inventing a
+			// foreground Agent call or a polling model turn.
+			if (process.env.PI_APP_HARNESS_WAIT_FOR_BACKGROUND === "1") {
+				log(`waiting for ${activeDelegatedWork.length} background task(s) before headless settlement`);
+				await subagentRegistry()?.waitForAll();
+				log("background settlement barrier released");
+				await requestContinuation(
+					"All delegated background tasks have settled. Continue the existing objective now: inspect their retained branch/diff evidence, integrate only accepted isolated worktree branches into the parent, then run every declared gate. Do not reimplement their work in the parent.",
+					{ reason: "background-completed", taskIds: activeDelegatedWork.map((task) => task.id) },
+				);
 			}
+			return;
+		}
+		const currentWorkspace = await workspaceSnapshot();
+		const changedThisTurn = Boolean(currentWorkspace.fingerprint && currentWorkspace.fingerprint !== lastObservedFingerprint);
+		const hasObjectiveDiff = Boolean(currentWorkspace.fingerprint && currentWorkspace.fingerprint !== workspaceBaselineFingerprint);
+		lastObservedFingerprint = currentWorkspace.fingerprint || lastObservedFingerprint;
+		if (changedThisTurn) {
+			for (const step of state.steps.filter((item) => item.kind === "gate" && item.status === "passed")) {
+				state = updateWorkflowStep(state, step.id, "pending", "Repository changed after this gate passed; verification must run again.");
+			}
+		}
+		if (hasObjectiveDiff) {
+			state.changedFiles = [...new Set([...state.changedFiles, ...currentWorkspace.files])].slice(-200);
+			for (const planId of ["plan", "reproduce"]) {
+				if (state.steps.some((step) => step.id === planId && step.status === "pending")) state = updateWorkflowStep(state, planId, "passed", "Planning boundary completed before observed repository change.");
+			}
+			if (state.steps.some((step) => step.id === "build" && step.status !== "running")) state = updateWorkflowStep(state, "build", "running", "Repository diff changed during the implementation turn.");
+			state.editsPending = true;
 		} else {
-			lastReadPath = "";
-			readStreak = 0;
+			state.editsPending = false;
 		}
-		return undefined;
-	});
-
-	// Детектор сломанных tool-вызовов (формат-дрейф Qwable): вызовы с пустыми
-	// arguments отбраковываются ДО tool_call-события — детекторы выше их не видят
-	// (наблюдалось 60×write{} подряд до таймаута). Ловим на message_end.
-	pi.on("message_end", async (ev, ctx) => {
-		const msg = ev.message as { role?: string; content?: unknown } | undefined;
-		if (msg?.role !== "assistant" || !Array.isArray(msg.content)) return;
-		let sawCall = false;
-		let sawBroken = false;
-		for (const b of msg.content as Array<{ type?: string; name?: string; arguments?: unknown }>) {
-			if (b?.type !== "toolCall") continue;
-			sawCall = true;
-			const name = String(b.name ?? "").toLowerCase();
-			const args = b.arguments;
-			const empty = args == null || (typeof args === "object" && Object.keys(args as object).length === 0);
-			if (ARGS_REQUIRED.has(name) && empty) sawBroken = true;
-		}
-		if (!sawCall) return;
-		if (!sawBroken) {
-			malformedStreak = 0;
+		if (!state.editsPending) {
+			if (state.steps.some((step) => step.id === "build")) state = updateWorkflowStep(state, "build", "failed", "The implementation turn settled without an observed repository change.");
+			if (!ABLATIONS.has("repair-loop") && !continuationQueued && state.autoLoops < MAX_AUTO_LOOPS) {
+				state.autoLoops++;
+				state.editsPending = true;
+				publishState();
+				await requestContinuation(
+					`Continue the existing objective. No repository change was observed (${state.autoLoops}/${MAX_AUTO_LOOPS}). Inspect the current state, make the smallest supported implementation change, then let the harness run declared gates.`,
+					{ reason: "no-observed-mutation" },
+				);
+			}
+			publishState();
 			return;
 		}
-		malformedStreak++;
-		if (malformedStreak === 2) {
-			pendingNudges.push(MALFORMED_NUDGE);
-			log("loop: malformed x2");
-			loopSignals++;
-		} else if (malformedStreak >= 6 && strict) {
-			log(`loop: ABORT malformed x${malformedStreak}`);
-			try {
-				ctx.abort();
-			} catch {
-				// вне стрима — игнорируем
-			}
-		}
+		if (!state.approved) return;
+		if (state.steps.some((step) => step.id === "build" && step.status === "running")) state = updateWorkflowStep(state, "build", "passed", "Implementation turn settled; deterministic gates are next.");
+		publishState();
+		await runDeterministicGates();
 	});
 
-	/** bash-команды по toolCallId: у tool_execution_end нет args — берём из start. */
-	const cmdByCall = new Map<string, string>();
-
-	pi.on("tool_execution_start", async (ev) => {
-		if (String(ev.toolName ?? "").toLowerCase() === "bash") {
-			cmdByCall.set(ev.toolCallId, String((ev.args as { command?: string } | undefined)?.command ?? ""));
-		}
+	// Registered after the workflow handler: a nested repair turn first updates
+	// fingerprints/state, then releases the outer print-mode settlement barrier.
+	pi.on("agent_settled", async () => {
+		if (continuationWaiter?.started) continuationWaiter.finish(true);
 	});
 
-	pi.on("tool_execution_end", async (ev) => {
-		const name = String(ev.toolName ?? "").toLowerCase();
-		if (name === "edit" || name === "write") {
-			editsUnverified = true;
-			return;
-		}
-		if (name === "todo" && !ev.isError) {
-			// F5: роутинг по активной задаче. Сабджект in_progress-задачи берём
-			// (а) структурно из details.params, (б) из list-формата «[in_progress] #3 subject»,
-			// (в) из create/update-формата «#1: subject (in_progress)».
-			const details = (ev.result as { details?: { params?: { subject?: unknown; status?: unknown } } } | null)
-				?.details;
-			const subjects: string[] = [];
-			if (details?.params?.status === "in_progress" && typeof details.params.subject === "string") {
-				subjects.push(details.params.subject);
-			}
-			const text = JSON.stringify(ev.result ?? "");
-			const listM = /\[in_progress\]\s+#\d+\s+([^"\\(]+)/.exec(text);
-			if (listM) subjects.push(listM[1]);
-			const inlineM = /#\d+:?\s+([^"\\(]+?)\s*\(in_progress\)/.exec(text);
-			if (inlineM) subjects.push(inlineM[1]);
-			for (const subject of subjects) {
-				const skill = matchSkill(subject, skillsCache);
-				if (skill) {
-					skillHint(skill, `the active todo ("${subject.trim().slice(0, 60)}")`);
-					break;
-				}
-			}
-			// итог по завершению: все задачи completed → потребовать финальное резюме
-			if (!summaryNudged) {
-				const text = JSON.stringify(ev.result ?? "");
-				// только статус-маркеры в скобках: «(pending →» перехода не считается открытой задачей
-				const hasCompleted = /[\[(]completed[\])]|(→|->)\s*completed/.test(text);
-				const hasOpen = /[\[(](pending|in_progress)[\])]/.test(text);
-				if (hasCompleted && !hasOpen) {
-					summaryNudged = true;
-					pendingNudges.push(SUMMARY_NUDGE);
-					log("nudge: summary");
-				}
-			}
-			return;
-		}
-		if (name !== "bash") return;
-		const cmd = cmdByCall.get(ev.toolCallId) ?? "";
-		cmdByCall.delete(ev.toolCallId);
-		// надж снимает только УСПЕШНАЯ команда, похожая на проверку проекта,
-		// а не любой bash (F2): `echo done` — не верификация
-		if (editsUnverified && !ev.isError && isVerifyCommand(cmd)) {
-			editsUnverified = false;
-			log(`verified by: ${cmd.slice(0, 60)}`);
-		}
+	pi.on("session_shutdown", async (_event, ctx) => {
+		ctx.ui.setStatus("pi-app-workflow", undefined);
+		for (const key of ["pi-app-workflow-state", "pi-app-background-state", "pi-app-checkpoint-state"]) ctx.ui.setWidget(key, undefined);
+		taskUi = undefined;
+		backgroundTasks.clear();
 	});
 
-	pi.on("context", async (ev) => {
-		// контекст-гард: за пределами надёжного размера — курс на завершение и компакцию
-		if (!contextNudged) {
-			let chars = 0;
-			for (const m of ev.messages) {
-				try {
-					chars += JSON.stringify((m as { content?: unknown }).content ?? "").length;
-				} catch {
-					// не считаем нестрокуемое
-				}
-			}
-			const tokens = chars / 4;
-			// жёсткий порог — всегда; серая зона (½ порога…порог) — только при
-			// наблюдаемой деградации (луп-события в этом ране)
-			if (tokens > CONTEXT_NUDGE_TOKENS || (tokens > CONTEXT_NUDGE_TOKENS / 2 && loopSignals > 0)) {
-				contextNudged = true;
-				pendingNudges.push(CONTEXT_NUDGE);
-				log(`nudge: context ~${Math.round(tokens / 1000)}K (loopSignals=${loopSignals})`);
-			}
-		}
-		const notes = [...pendingNudges];
-		pendingNudges = [];
-		if (editsUnverified && verifyNudgesSent < 2) {
-			notes.push(VERIFY_NUDGE);
-			verifyNudgesSent++;
-			log("nudge: verify");
-		}
-		if (notes.length === 0) return;
-		log(`inject: ${notes.length} note(s)`);
-		const text = `<system-reminder source="pi-app-harness">\n${notes.join("\n\n")}\n</system-reminder>`;
-		const injected = {
-			role: "user",
-			content: [{ type: "text", text }],
-			timestamp: Date.now(),
-		} as unknown as (typeof ev.messages)[number];
-		return { messages: [...ev.messages, injected] };
-	});
-
-	pi.on("agent_end", async () => {
-		pendingNudges = [];
-		editsUnverified = false;
-		verifyNudgesSent = 0;
-		cmdByCall.clear();
-		hintedSkills.clear();
-		lastCallSig = "";
-		sameCallStreak = 0;
-		todoStreak = 0;
-		lastReadPath = "";
-		readStreak = 0;
-		contextNudged = false;
-		summaryNudged = false;
-		loopSignals = 0;
-	});
-
-	log(`loaded mode=${strict ? "strict" : "advisory"}`);
+	log(`loaded v3 profile=${enabled ? "workflow" : "baseline"} maxLoops=${MAX_AUTO_LOOPS} ablations=${[...ABLATIONS].join(",")}`);
 }

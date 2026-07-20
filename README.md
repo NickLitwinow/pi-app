@@ -17,13 +17,14 @@ Lightweight native macOS app for **[pi](https://pi.dev)** — a full-featured AI
 ## ✨ Features
 
 - **Streaming chats** — real-time token streaming with thinking, tool calls, and markdown rendering
-- **Session management** — workspaces, search, fork, rewind, pin, archive, grouped sessions
+- **Session management** — workspaces, search, in-session change-and-resend rewind, explicit fork, pin, archive, grouped sessions
 - **Full git center** — staging, commits, branches, fetch/pull/push, commit history with diffs
 - **Code review** — checkpoints, unified diffs, line comments, file revert
 - **Live sessions** — file watcher on `~/.pi/agent/sessions`, new sessions appear instantly
 - **Context window control** — ring indicator, tokens/cost details, auto-compaction toggle
 - **Permission system** — native extension UI (select/confirm/input/editor), non-blocking
-- **Parallel sessions** — read-only view of another session while agent works in background
+- **Background work** — queued subagents remain visible above the composer with isolated worktree support
+- **Adaptive execution workflow** — observable project gates, independent evaluation, bounded repair, and always-on hardened Ponytail policy
 - **Memory-efficient** — background history offloaded to files, tool outputs bounded
 - **Create PR/MR** — GitHub (`gh`), GitLab (`glab`), or browser-based
 - **Self-update** — check latest version on GitHub, rebuild from source, relaunch
@@ -208,6 +209,9 @@ The mock backend simulates sessions, tool calls, permissions, and analytics.
 
 Development is planned and tracked in **[docs/ROADMAP.md](docs/ROADMAP.md)** — a detailed,
 iteration-by-iteration plan (harness, memory/performance, ecosystem, design system).
+The implemented workflow contract and evidence-backed residual gaps are documented in
+**[Harness v3](docs/HARNESS-REDESIGN-2026-07-18.md)** and the
+**[Russian gap audit](docs/HARNESS-GAP-AUDIT-RU-2026-07-18.md)**.
 Open items are filed as [issues](https://github.com/NickLitwinow/pi-app/issues).
 
 ## 🤝 Contributing

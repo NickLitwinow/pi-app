@@ -1,5 +1,45 @@
 use serde::Serialize;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::process::Command;
+
+static CHECKPOINT_INDEX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TemporaryGitIndex {
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+impl Drop for TemporaryGitIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn temporary_git_index() -> Result<TemporaryGitIndex, String> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for _ in 0..128 {
+        let sequence = CHECKPOINT_INDEX_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "pi-app-checkpoint-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&directory) {
+            Ok(()) => {
+                return Ok(TemporaryGitIndex {
+                    path: directory.join("index"),
+                    directory,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("cannot reserve temporary Git index: {error}")),
+        }
+    }
+    Err("cannot reserve a unique temporary Git index after 128 attempts".into())
+}
 
 async fn run_git(cwd: &str, args: &[&str]) -> Result<(String, String, i32), String> {
     let out = Command::new("git")
@@ -137,14 +177,12 @@ async fn worktree_snapshot(cwd: &str) -> Result<String, String> {
     // the run would be falsely attributed to the agent. A temporary index lets
     // us snapshot tracked + untracked (respecting .gitignore) without touching
     // the user's real index or working tree.
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let index_path = std::env::temp_dir().join(format!(
-        "pi-app-checkpoint-{}-{nonce}.index",
-        std::process::id()
-    ));
+    // Reserve a unique directory atomically. SystemTime alone has insufficient
+    // resolution on some filesystems, so concurrent checkpoint calls used to
+    // race on the same `<index>.lock` path. The guard also removes stale lock
+    // files on every return path.
+    let temporary_index = temporary_git_index()?;
+    let index_path = &temporary_index.path;
     let run_index = |args: &[&str]| {
         let mut command = Command::new("git");
         command
@@ -158,7 +196,6 @@ async fn worktree_snapshot(cwd: &str) -> Result<String, String> {
         .await
         .map_err(|error| error.to_string())?;
     if !read.status.success() {
-        let _ = std::fs::remove_file(&index_path);
         return Err(String::from_utf8_lossy(&read.stderr).trim().to_string());
     }
     // First update only paths already present in HEAD (including deletions).
@@ -167,7 +204,6 @@ async fn worktree_snapshot(cwd: &str) -> Result<String, String> {
         .await
         .map_err(|error| error.to_string())?;
     if !add.status.success() {
-        let _ = std::fs::remove_file(&index_path);
         return Err(String::from_utf8_lossy(&add.stderr).trim().to_string());
     }
     // Then add existing tracked/staged files and small untracked files. Large
@@ -190,7 +226,6 @@ async fn worktree_snapshot(cwd: &str) -> Result<String, String> {
         command.args(chunk);
         let output = command.output().await.map_err(|error| error.to_string())?;
         if !output.status.success() {
-            let _ = std::fs::remove_file(&index_path);
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
     }
@@ -198,7 +233,6 @@ async fn worktree_snapshot(cwd: &str) -> Result<String, String> {
         .output()
         .await
         .map_err(|error| error.to_string())?;
-    let _ = std::fs::remove_file(&index_path);
     if !tree_out.status.success() {
         return Err(String::from_utf8_lossy(&tree_out.stderr).trim().to_string());
     }
@@ -853,7 +887,21 @@ pub async fn git_file_diff(cwd: String, path: String, staged: bool) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::fs;
+
+    #[test]
+    fn temporary_git_indexes_are_unique_and_cleaned() {
+        let guards: Vec<_> = (0..32)
+            .map(|_| std::thread::spawn(temporary_git_index))
+            .map(|thread| thread.join().unwrap().unwrap())
+            .collect();
+        let directories: HashSet<_> = guards.iter().map(|guard| guard.directory.clone()).collect();
+        assert_eq!(directories.len(), guards.len());
+        assert!(directories.iter().all(|directory| directory.is_dir()));
+        drop(guards);
+        assert!(directories.iter().all(|directory| !directory.exists()));
+    }
 
     async fn init_repo() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();

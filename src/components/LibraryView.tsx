@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { getBackend } from "../lib/backend";
-import type { ConfigFile, PackageKind } from "../lib/types";
+import type { ConfigFile, PackageKind, PackageSetting } from "../lib/types";
 import { updateAppConfig, useStore } from "../state/store";
-import Marketplace, { useInstalledPackages, useRunPi } from "./Marketplace";
+import Marketplace, { setPackageResourceEnabled, useInstalledPackages, useRunPi } from "./Marketplace";
 import { CheckIcon, PackageIcon } from "./icons";
 
 type LibraryTab = PackageKind | "profiles";
@@ -15,7 +15,19 @@ const COLLECTIONS: { id: LibraryTab; label: string; desc: string }[] = [
   { id: "profiles", label: "Профили", desc: "Готовые связки" },
 ];
 
-const PROFILES = [
+type ProfilePackage = string | { name: string; source: string; disableSkills?: boolean };
+
+const profilePackageName = (pkg: ProfilePackage) => typeof pkg === "string" ? pkg : pkg.name;
+const profilePackageSource = (pkg: ProfilePackage) => typeof pkg === "string" ? `npm:${pkg}` : pkg.source;
+
+const PROFILES: {
+  id: string;
+  name: string;
+  desc: string;
+  packages: ProfilePackage[];
+  context: string;
+  tone: string;
+}[] = [
   {
     id: "minimal",
     name: "Minimal",
@@ -27,9 +39,16 @@ const PROFILES = [
   {
     id: "recommended",
     name: "Recommended",
-    desc: "Web access, todo-first, ask-user и безопасные разрешения — ежедневный профиль pi-app.",
-    packages: ["@gotgenes/pi-permission-system", "pi-web-access", "@juicesharp/rpiv-todo", "@juicesharp/rpiv-ask-user-question"],
-    context: "≈4.8K токенов",
+    desc: "Web, адаптивный workflow, queued background agents и Ponytail full на каждом ходе — ежедневный профиль pi-app.",
+    packages: [
+      "@gotgenes/pi-permission-system",
+      "pi-web-access",
+      "@juicesharp/rpiv-todo",
+      "@juicesharp/rpiv-ask-user-question",
+      "@tintinweb/pi-subagents",
+      { name: "ponytail", source: "git:github.com/DietrichGebert/ponytail" },
+    ],
+    context: "≈4.2K токенов + lazy Ponytail skills",
     tone: "recommended",
   },
   {
@@ -104,21 +123,44 @@ function useReasoningPreset(scope: "global" | "project", cwd: string | null) {
 }
 
 function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | null }) {
-  const { installed, reload } = useInstalledPackages(scope, cwd);
+  const { installed, specs, reload } = useInstalledPackages(scope, cwd);
   const runner = useRunPi(reload);
   const reasoning = useReasoningPreset(scope, cwd);
 
-  const installProfile = async (packages: string[]) => {
-    for (const name of packages) {
-      if (installed.has(name)) continue;
-      await runner.runPi(["install", ...(scope === "project" ? ["-l"] : []), `npm:${name}`], scope === "project" ? cwd : null);
+  const hasProfilePackage = (pkg: ProfilePackage) => {
+    const source = profilePackageSource(pkg);
+    return source.startsWith("npm:") ? installed.has(profilePackageName(pkg)) : specs.includes(source);
+  };
+
+  const applyProfilePolicy = async (pkg: ProfilePackage) => {
+    if (typeof pkg === "string" || !pkg.disableSkills) return;
+    const be = await getBackend();
+    const file = scope === "project"
+      ? await be.invoke<ConfigFile>("read_project_settings", { cwd })
+      : await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
+    const settings = JSON.parse(file.content) as Record<string, unknown>;
+    const entries = Array.isArray(settings.packages) ? settings.packages as PackageSetting[] : [];
+    const packages = setPackageResourceEnabled(entries, pkg.name, "skill", false);
+    const content = JSON.stringify({ ...settings, packages }, null, 2) + "\n";
+    if (scope === "project") await be.invoke("write_project_settings", { cwd, content });
+    else await be.invoke("write_pi_config", { name: "settings", content });
+  };
+
+  const installProfile = async (packages: ProfilePackage[]) => {
+    for (const pkg of packages) {
+      if (!hasProfilePackage(pkg)) {
+        const installedOk = await runner.runPi(["install", ...(scope === "project" ? ["-l"] : []), profilePackageSource(pkg)], scope === "project" ? cwd : null);
+        if (!installedOk) continue;
+      }
+      await applyProfilePolicy(pkg);
     }
+    reload();
   };
 
   return (
     <div className="profile-grid">
       {PROFILES.map((profile) => {
-        const installedCount = profile.packages.filter((name) => installed.has(name)).length;
+        const installedCount = profile.packages.filter(hasProfilePackage).length;
         const complete = installedCount === profile.packages.length;
         return (
           <article className={`profile-card ${profile.tone}`} key={profile.id}>
@@ -132,7 +174,11 @@ function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | n
               <span>{profile.packages.length} пак.</span>
             </div>
             <div className="profile-packages">
-              {profile.packages.map((name) => <code key={name} className={installed.has(name) ? "installed" : ""}>{installed.has(name) && <CheckIcon size={10} />}{name}</code>)}
+              {profile.packages.map((pkg) => {
+                const name = profilePackageName(pkg);
+                const present = hasProfilePackage(pkg);
+                return <code key={profilePackageSource(pkg)} className={present ? "installed" : ""}>{present && <CheckIcon size={10} />}{name}</code>;
+              })}
             </div>
             <button className={complete ? "" : "primary"} disabled={complete || runner.running || (scope === "project" && !cwd)} onClick={() => void installProfile(profile.packages)}>
               {complete ? "Установлен" : installedCount > 0 ? `Доустановить ${profile.packages.length - installedCount}` : "Установить профиль"}

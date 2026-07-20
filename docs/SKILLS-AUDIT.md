@@ -1,7 +1,7 @@
 # Аудит скиллов pi и автоподбор под задачу
 
 **Дата исходного среза:** 2026-07-11 · Дополняет [ROADMAP.md](ROADMAP.md) §5.1 (harness) и [AGENT-ENV.md](AGENT-ENV.md) (аудит окружения).
-**Актуализация:** полный повторный аудит 2026-07-13 — [HARNESS-EXTENSIONS-AUDIT-2026-07-13.md](HARNESS-EXTENSIONS-AUDIT-2026-07-13.md). Утверждения ниже про 7 активных skills и Qwable-v2 являются историческим срезом: сейчас package-provided skills увеличивают фактический набор до 17, а runtime-модель без зонда не подтверждена.
+**Актуализация 2026-07-19:** решения ниже являются историческим срезом; текущий дизайн — в [HARNESS-REDESIGN-2026-07-18.md](HARNESS-REDESIGN-2026-07-18.md). В глобальном discovery оставлены только `code-review` и `ship`; пакетный `librarian` доступен по узкому research-триггеру. Рутинные `debug/testing/verify` дублировали AGENTS/workflow, `frontend-design` и `skill-creator` стали opt-in, а экспериментальный Fable skill удалён. Официальный Ponytail подключён отдельно как always-on extension policy в режиме `full`, а не как ещё один выбираемый workflow skill.
 
 ## 1. Что было (диагноз «несвязанная каша» подтверждён)
 

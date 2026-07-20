@@ -134,6 +134,149 @@ export interface TimelineItem {
   viaExtension?: boolean;
 }
 
+export interface ComposerAttachment {
+  data: string;
+  mimeType: string;
+  name: string;
+}
+
+export type WorkflowStepStatus = "pending" | "running" | "waiting" | "passed" | "failed" | "skipped";
+
+export interface WorkflowStepView {
+  id: string;
+  label: string;
+  kind: "plan" | "research" | "build" | "gate" | "evaluate" | "review";
+  deps: string[];
+  status: WorkflowStepStatus;
+  acceptance: string;
+  required: boolean;
+  owner: "orchestrator" | "researcher" | "executor" | "gate-runner" | "evaluator" | "human";
+  maxAttempts: number;
+  command?: string;
+  attempts: number;
+  detail?: string;
+  failureReason?: string;
+  startedAt?: number;
+  completedAt?: number;
+}
+
+export interface WorkflowEventView {
+  id: string;
+  stepId?: string;
+  type: "created" | "started" | "passed" | "failed" | "waiting" | "note" | "rewound";
+  at: number;
+  message: string;
+}
+
+export interface WorkflowViewState {
+  version: 3;
+  runId: string;
+  createdAt: number;
+  updatedAt: number;
+  objective: string;
+  profile: "feature" | "bug" | "chore" | "hotfix" | "research" | "assessment";
+  status: "active" | "needs-human" | "blocked" | "completed";
+  blockedStepId?: string;
+  blockedReason?: string;
+  terminationReason?: string;
+  approved: boolean;
+  editsPending: boolean;
+  changedFiles: string[];
+  evaluatorTaskId?: string;
+  intent: {
+    primary: "trivial" | "assessment" | "research" | "debug" | "build";
+    profile: WorkflowViewState["profile"];
+    risk: "low" | "medium" | "high";
+    needsResearch: boolean;
+    allowsMutation: boolean;
+    allowsDeletion: boolean;
+    requiresPlan: boolean;
+    requiresSandbox: boolean;
+    requiresEvaluator: boolean;
+    requiresHumanApproval: boolean;
+    signals: string[];
+  };
+  steps: WorkflowStepView[];
+  events: WorkflowEventView[];
+}
+
+export interface BackgroundTaskView {
+  id: string;
+  type: string;
+  description: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  result?: string;
+  error?: string;
+  startedAt?: number;
+  completedAt?: number;
+  durationMs?: number;
+  tokens?: number;
+  branch?: string;
+  baseSha?: string;
+  worktreePath?: string;
+  outputFile?: string;
+  prompt?: string;
+  transcript?: string;
+  diff?: string;
+  mergedCommit?: string;
+  evaluatorProtocolVersion?: number;
+  evaluatorQuorum?: boolean;
+  priority?: "high" | "normal" | "low";
+  queuePosition?: number;
+  etaMs?: number;
+  blockedReason?: string;
+}
+
+export interface CompactionRecord {
+  version?: number;
+  at: number;
+  reason?: string;
+  summary: string;
+  tokensBefore?: number;
+  firstKeptEntryId?: string;
+}
+
+export interface BranchRecord {
+  version?: number;
+  at: number;
+  type?: "rewind" | "return";
+  targetEntryId?: string;
+  newLeafId?: string | null;
+  abandonedLeafId?: string | null;
+  leafId?: string;
+  stoppedTaskIds?: string[];
+  targetPreview?: string;
+  abandonedEntryCount?: number;
+  abandonedUserMessages?: string[];
+}
+
+export interface StructuredCheckpoint {
+  version?: number;
+  at: number;
+  runId?: string;
+  objective: string;
+  profile?: string;
+  changedFiles?: string[];
+  decisions?: string[];
+  gateEvidence?: Array<{ id: string; status: WorkflowStepStatus; command?: string; detail?: string }>;
+  risks?: string[];
+  steps?: Array<{ id: string; status: WorkflowStepStatus; detail?: string }>;
+  nextReadySteps?: string[];
+  nextAction?: string;
+  context?: { percent?: number; tokens?: number | null; contextWindow?: number };
+}
+
+export interface PlannedTaskView {
+  id: number;
+  subject: string;
+  description?: string;
+  activeForm?: string;
+  status: "pending" | "in_progress" | "completed" | "deleted";
+  blockedBy?: number[];
+  owner?: string;
+  metadata?: Record<string, unknown>;
+}
+
 export interface ChatState {
   items: TimelineItem[];
   toolExecs: Record<string, ToolExec>;
@@ -156,7 +299,16 @@ export interface ChatState {
   toasts: Toast[];
   statusEntries: Record<string, string>;
   widgets: Record<string, string>;
+  workflow: WorkflowViewState | null;
+  /** Latest persisted snapshot emitted by rpiv-todo's model-facing tool. */
+  plannedTasks: PlannedTaskView[];
+  backgroundTasks: BackgroundTaskView[];
+  compactions: CompactionRecord[];
+  branches: BranchRecord[];
+  structuredCheckpoints: StructuredCheckpoint[];
   editorPrefill: string | null;
+  editorAttachments: ComposerAttachment[] | null;
+  editorContextFiles: string[] | null;
   lastError: string | null;
   seq: number;
 }
@@ -179,7 +331,15 @@ export function emptyChatState(): ChatState {
     toasts: [],
     statusEntries: {},
     widgets: {},
+    workflow: null,
+    plannedTasks: [],
+    backgroundTasks: [],
+    compactions: [],
+    branches: [],
+    structuredCheckpoints: [],
     editorPrefill: null,
+    editorAttachments: null,
+    editorContextFiles: null,
     lastError: null,
     seq: 0,
   };
@@ -228,6 +388,8 @@ export interface AppConfig {
   editor: string;
   processLimit: number;
   processLimitAuto?: boolean;
+  /** Write boundary for newly spawned agent process trees. */
+  agentSandboxMode?: "workspace-write" | "unrestricted";
   idleKillSecs: number;
   previewIdleKillSecs?: number;
   theme: string;

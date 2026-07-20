@@ -126,6 +126,20 @@ describe("applyAgentEvent — streaming lifecycle", () => {
     expect(chat.items).toHaveLength(1);
   });
 
+  it("replaces an optimistic vision prompt with the authoritative image echo", () => {
+    let chat = addUserMessage(emptyChatState(), "inspect", [{ data: "abc", mimeType: "image/png" }]);
+    chat = applyAgentEvent({ ...chat }, {
+      type: "message_end",
+      message: { role: "user", content: [{ type: "text", text: "inspect" }, { type: "image", data: "abc", mimeType: "image/png" }] },
+    });
+    expect(chat.items).toHaveLength(1);
+    expect(Array.isArray(chat.items[0].msg.content) && chat.items[0].msg.content[1]).toMatchObject({
+      type: "image",
+      data: "abc",
+      mimeType: "image/png",
+    });
+  });
+
   it("keeps two identical consecutive user messages (each echo consumes one optimistic)", () => {
     let chat = emptyChatState();
     chat = addUserMessage({ ...chat }, "again");
@@ -227,6 +241,13 @@ describe("applyAgentEvent — auxiliary events", () => {
       widgetText: "TODO: 2/5",
     });
     expect(chat.widgets.todos).toBe("TODO: 2/5");
+    chat = applyAgentEvent({ ...chat }, {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "agents",
+      widgetLines: ["Background tasks", "● running · reviewer"],
+    });
+    expect(chat.widgets.agents).toBe("Background tasks\n● running · reviewer");
     chat = applyAgentEvent({ ...chat }, { type: "extension_ui_request", method: "setWidget", widgetKey: "todos" });
     expect(chat.widgets.todos).toBeUndefined();
   });
@@ -288,15 +309,64 @@ describe("applyAgentEvent — auxiliary events", () => {
     expect(chat.isCompacting).toBe(true);
     chat = applyAgentEvent({ ...chat }, { type: "compaction_end", summary: "..." });
     expect(chat.isCompacting).toBe(false);
+    expect(chat.compactions.at(-1)?.summary).toBe("...");
 
     chat = applyAgentEvent({ ...chat }, { type: "auto_retry_start", attempt: 2 });
     expect(chat.retryActive).toBe(true);
     chat = applyAgentEvent({ ...chat }, { type: "auto_retry_end", success: true });
     expect(chat.retryActive).toBe(false);
   });
+
+  it("tracks the latest model-generated todo backlog live", () => {
+    const chat = applyAgentEvent(emptyChatState(), {
+      type: "message_end",
+      message: {
+        role: "toolResult",
+        toolCallId: "todo-1",
+        toolName: "todo",
+        content: [{ type: "text", text: "Created #2" }],
+        details: {
+          tasks: [
+            { id: 1, subject: "Inspect contract", status: "completed" },
+            { id: 2, subject: "Implement migration", activeForm: "implementing migration", status: "in_progress", blockedBy: [1] },
+          ],
+        },
+      },
+    });
+    expect(chat.plannedTasks).toEqual([
+      expect.objectContaining({ id: 1, status: "completed" }),
+      expect.objectContaining({ id: 2, activeForm: "implementing migration", blockedBy: [1] }),
+    ]);
+  });
 });
 
 describe("entriesToChatState", () => {
+  it("restores workflow, tasks, compaction, checkpoint, and rewind metadata", () => {
+    const workflow = {
+      version: 3,
+      runId: "wf-1",
+      profile: "feature",
+      approved: true,
+      steps: [],
+      events: [],
+      intent: {},
+    };
+    const chat = entriesToChatState([
+      { type: "custom", customType: "pi-app-workflow-state", data: workflow },
+      { type: "custom", customType: "subagents:record", data: { id: "a1", type: "reviewer", description: "review", status: "completed", result: "ok" } },
+      { type: "compaction", timestamp: "2026-07-18T00:00:00Z", summary: "compact summary", tokensBefore: 200000, firstKeptEntryId: "e1" },
+      { type: "custom", customType: "pi-app-checkpoint", data: { at: 2, objective: "ship", nextReadySteps: ["verify"] } },
+      { type: "custom", customType: "pi-app-rewind-record", data: { at: 3, abandonedLeafId: "leaf-old", targetEntryId: "u1", stoppedTaskIds: ["a1"] } },
+      { type: "message", message: { role: "toolResult", toolCallId: "todo-1", toolName: "todo", content: [], details: { tasks: [{ id: 1, subject: "Verify UI", status: "pending", owner: "main" }] } } },
+    ]);
+    expect(chat.workflow?.runId).toBe("wf-1");
+    expect(chat.backgroundTasks[0]).toMatchObject({ id: "a1", result: "ok" });
+    expect(chat.compactions[0]).toMatchObject({ summary: "compact summary", tokensBefore: 200000 });
+    expect(chat.structuredCheckpoints[0].nextReadySteps).toEqual(["verify"]);
+    expect(chat.branches[0]).toMatchObject({ abandonedLeafId: "leaf-old", stoppedTaskIds: ["a1"] });
+    expect(chat.plannedTasks[0]).toMatchObject({ id: 1, subject: "Verify UI", owner: "main" });
+  });
+
   it("builds a read-only timeline from session JSONL entries", () => {
     const chat = entriesToChatState([
       { type: "session", id: "s1", cwd: "/tmp" },

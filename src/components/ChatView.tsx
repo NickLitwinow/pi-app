@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { getBackend } from "../lib/backend";
-import { messageDialog } from "../lib/dialog";
+import { confirmDialog, messageDialog } from "../lib/dialog";
 import { stripAnsi } from "../lib/markdown";
 import { contentText } from "../lib/reducer";
 import { modelAliasKey, modelDisplayName, modelIdDisplayName } from "../lib/models";
-import type { ExtUiRequest, GitSummary, ModelInfo } from "../lib/types";
+import type { ComposerAttachment, ExtUiRequest, GitSummary, ModelInfo } from "../lib/types";
 import {
   abortAgent,
   compactContext,
+  controlBackgroundTask,
+  controlWorkflow,
   isBrowsingAway,
   loadModelsAndCommands,
   msgPinId,
@@ -16,6 +18,7 @@ import {
   notifyChat,
   refreshStats,
   respondToUiRequest,
+  returnToSessionBranch,
   returnToLiveSession,
   sendFollowUp,
   sendPrompt,
@@ -154,7 +157,7 @@ function ModeSelector({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
                   void setAgentMode(cwd, m.id).catch(() => {});
                 }}
               >
-                <div>
+	                <div>
                   <div>{m.label}</div>
                   <div className="dd-sub">{m.desc}</div>
                 </div>
@@ -533,10 +536,188 @@ function ExtensionUIDock({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
 
 // ---------- composer ----------
 
-interface Attachment {
-  data: string;
-  mimeType: string;
-  name: string;
+type Attachment = ComposerAttachment;
+
+type WorkflowTab = "tasks" | "plan" | "workflow" | "context" | "branches";
+
+function WorkflowDock({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
+  const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<WorkflowTab>("workflow");
+  const [steerId, setSteerId] = useState<string | null>(null);
+  const [steerText, setSteerText] = useState("");
+  const [expandedTask, setExpandedTask] = useState<string | null>(null);
+  const [taskEvidence, setTaskEvidence] = useState<"transcript" | "diff">("transcript");
+  const [clock, setClock] = useState(() => Date.now());
+  const workflow = ws.chat.workflow;
+  const plannedTasks = ws.chat.plannedTasks.filter((task) => task.status !== "deleted");
+  const tasks = ws.chat.backgroundTasks;
+  const compactions = ws.chat.compactions;
+  const checkpoints = ws.chat.structuredCheckpoints;
+  const branches = ws.chat.branches;
+  const liveContext = ws.stats?.contextUsage;
+  const activeTasks = tasks.filter((task) => task.status === "queued" || task.status === "running").length;
+  useEffect(() => {
+    if (activeTasks === 0) return;
+    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [activeTasks]);
+  if (!workflow && plannedTasks.length === 0 && tasks.length === 0 && compactions.length === 0 && checkpoints.length === 0 && branches.length === 0) return null;
+  const failedSteps = workflow?.steps.filter((step) => step.status === "failed").length ?? 0;
+  const tabs: Array<{ id: WorkflowTab; label: string; count?: number }> = [
+    { id: "tasks", label: "Tasks", count: activeTasks || tasks.length },
+    { id: "plan", label: "Plan", count: plannedTasks.length || workflow?.steps.filter((step) => step.kind === "plan" || step.id === "approve").length },
+    { id: "workflow", label: "Workflow", count: failedSteps || workflow?.steps.length },
+    { id: "context", label: "Context", count: compactions.length + checkpoints.length },
+    { id: "branches", label: "Branches", count: branches.length },
+  ];
+  const invoke = (fn: () => Promise<void>) => void fn().catch((error) => notifyChat(cwd, "warning", error instanceof Error ? error.message : String(error)));
+
+  return (
+    <section className={`workflow-dock ${open ? "open" : ""}`} aria-label="Workflow control center">
+      <button className="workflow-summary" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+        <span className={`workflow-pulse ${failedSteps ? "failed" : activeTasks ? "running" : ""}`} />
+        <strong>{workflow ? `${workflow.profile} · ${workflow.status ?? "active"} · ${workflow.steps.filter((step) => step.status === "passed" || step.status === "skipped").length}/${workflow.steps.length}` : "Session workflow"}</strong>
+        {activeTasks > 0 && <span>{activeTasks} active</span>}
+        {failedSteps > 0 && <span className="workflow-error">{failedSteps} failed</span>}
+        <ChevronIcon size={12} open={open} />
+      </button>
+      {open && (
+        <div className="workflow-panel">
+          <nav className="workflow-tabs">
+            {tabs.map((item) => (
+              <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => setTab(item.id)}>
+                {item.label}{item.count ? <small>{item.count}</small> : null}
+              </button>
+            ))}
+          </nav>
+
+          {tab === "tasks" && (
+            <div className="workflow-list">
+              {tasks.length === 0 && <p className="workflow-empty">Фоновых задач пока нет.</p>}
+              {[...tasks].reverse().map((task) => (
+                <article className="task-card" key={task.id}>
+                  <div className="task-head">
+                    <span className={`step-state ${task.status}`} />
+                    <strong>{task.description}</strong><small>{task.type} · {task.status}</small>
+                  </div>
+                  <div className="task-meta">
+					{(task.durationMs != null || task.startedAt != null) && <span>{Math.max(1, Math.round((task.durationMs ?? Math.max(0, clock - task.startedAt!)) / 1000))}s</span>}
+                    {task.tokens != null && <span>{task.tokens.toLocaleString()} tok</span>}
+					{task.priority && <span>priority: {task.priority}</span>}
+					{task.queuePosition != null && <span>queue #{task.queuePosition}</span>}
+					{task.etaMs != null && <span title="Estimated from completed task durations">ETA ≈ {Math.max(1, Math.ceil(task.etaMs / 60_000))}m</span>}
+					{task.type === "independent-evaluator" && <span>read-only · tied to current run</span>}
+                    {task.branch && <span title={task.baseSha}>branch: {task.branch}</span>}
+                    {task.mergedCommit && <span>merged: {task.mergedCommit.slice(0, 10)}</span>}
+                  </div>
+				  {task.blockedReason && <small className="workflow-error">{task.blockedReason}</small>}
+                  <div className="task-actions">
+					{task.type !== "independent-evaluator" && (task.status === "queued" || task.status === "running") && <button onClick={() => invoke(() => controlBackgroundTask(cwd, "cancel", task.id))}>Cancel</button>}
+					{task.type !== "independent-evaluator" && (task.status === "queued" || task.status === "running") && <button onClick={() => setSteerId(steerId === task.id ? null : task.id)}>Steer</button>}
+                    <button onClick={() => {
+                      setExpandedTask(expandedTask === task.id ? null : task.id);
+                      setTaskEvidence("transcript");
+                      if (!task.transcript) invoke(() => controlBackgroundTask(cwd, "transcript", task.id));
+                    }}>Transcript</button>
+                    <button disabled={!task.branch} title={task.branch ? "Inspect isolated branch diff" : "Task has no isolated branch"} onClick={() => {
+                      setExpandedTask(task.id);
+                      setTaskEvidence("diff");
+                      invoke(() => controlBackgroundTask(cwd, "diff", task.id));
+                    }}>Diff</button>
+					{task.type !== "independent-evaluator" && <button onClick={() => invoke(() => controlBackgroundTask(cwd, "retry", task.id))}>Retry</button>}
+                    <button disabled={task.status !== "completed" || !task.branch || Boolean(task.mergedCommit)} onClick={() => invoke(async () => {
+                      const ok = await confirmDialog(
+                        `Слить проверенную ветку «${task.branch}» из фоновой задачи?\n\n${task.description}\n\nMerge будет выполнен только из чистого parent worktree и только после прохождения обязательных verifier-команд в отдельном integration worktree.`,
+                        { title: "Merge background task", kind: "warning", okLabel: "Verify & Merge" },
+                      );
+                      if (ok) await controlBackgroundTask(cwd, "merge", task.id, "confirmed");
+                    })}>Merge</button>
+                  </div>
+                  {steerId === task.id && <div className="task-steer"><input value={steerText} onChange={(event) => setSteerText(event.target.value)} placeholder="Новая инструкция задаче" /><button onClick={() => { invoke(() => controlBackgroundTask(cwd, "steer", task.id, steerText)); setSteerId(null); setSteerText(""); }}>Send</button></div>}
+                  {expandedTask === task.id && <pre className="task-transcript">{
+                    taskEvidence === "diff"
+                      ? task.diff || "Diff evidence is being collected from the isolated branch."
+                      : task.transcript || task.result || task.error || "Transcript evidence is being collected directly from the task record."
+                  }</pre>}
+                </article>
+              ))}
+            </div>
+          )}
+
+          {tab === "plan" && (
+            <div className="workflow-list">
+              {!workflow && <p className="workflow-empty">Workflow ещё не создан.</p>}
+              {workflow && <article className="workflow-objective">
+                <strong>{workflow.objective || "Current session objective"}</strong>
+                <small>{workflow.intent.primary} · risk {workflow.intent.risk} · {workflow.intent.signals.join(", ") || "no special routing signals"}</small>
+              </article>}
+              {workflow?.steps.filter((step) => step.kind === "plan" || step.id === "approve").map((step) => (
+                <article className="workflow-step" key={step.id}>
+                  <span className={`step-state ${step.status}`} /><div><strong>{step.label}</strong><p>{step.acceptance}</p><small>deps: {step.deps.join(", ") || "none"}</small></div><b>{step.status}</b>
+                </article>
+              ))}
+              {plannedTasks.length > 0 && <div className="plan-backlog-head"><strong>Execution backlog</strong><small>{plannedTasks.filter((task) => task.status === "completed").length}/{plannedTasks.length} complete</small></div>}
+              {plannedTasks.map((task) => (
+                <article className="workflow-step plan-task" key={`plan-task-${task.id}`}>
+                  <span className={`step-state ${task.status}`} />
+                  <div className="plan-task-body">
+                    <strong>#{task.id} {task.status === "in_progress" && task.activeForm ? task.activeForm : task.subject}</strong>
+                    {task.description && <p>{task.description}</p>}
+                    <small>{task.blockedBy?.length ? `blocked by ${task.blockedBy.map((id) => `#${id}`).join(", ")}` : "ready"}{task.owner ? ` · ${task.owner}` : ""}</small>
+                  </div>
+                  <b>{task.status.replace("_", " ")}</b>
+                </article>
+              ))}
+              {workflow && !workflow.approved && <button className="workflow-primary" onClick={() => invoke(() => controlWorkflow(cwd, "approve-plan"))}>Approve plan</button>}
+              {workflow?.approved && workflow.intent.requiresPlan && <p className="workflow-empty">Plan approved · workflow can continue.</p>}
+            </div>
+          )}
+
+          {tab === "workflow" && (
+            <div className="workflow-list">
+              {workflow?.steps.map((step) => (
+                <article className="workflow-step" key={step.id} title={step.detail}>
+                  <span className={`step-state ${step.status}`} /><div><strong>{step.label}</strong><p>{step.acceptance}</p><small>{step.deps.length ? `after ${step.deps.join(", ")}` : "ready first"}{step.command ? ` · ${step.command}` : ""} · {step.owner ?? "orchestrator"} · attempt {step.attempts}/{step.maxAttempts ?? "?"}</small>{step.failureReason && <small className="workflow-error">{step.failureReason}</small>}</div><b>{step.status}</b>
+                </article>
+              ))}
+              {workflow?.blockedReason && <article className="workflow-objective"><strong>{workflow.status === "needs-human" ? "Human input required" : "Workflow blocked"}</strong><p>{workflow.blockedReason}</p>{workflow.terminationReason && <small>{workflow.terminationReason}</small>}</article>}
+              {workflow?.events.length ? <details className="workflow-timeline"><summary>Timeline · {workflow.events.length} events</summary>{[...workflow.events].reverse().slice(0, 40).map((event) => <div key={event.id}><time>{new Date(event.at).toLocaleTimeString()}</time><span>{event.message}</span></div>)}</details> : null}
+              {failedSteps > 0 && <button className="workflow-primary" onClick={() => invoke(() => controlWorkflow(cwd, "retry-gates"))}>Retry failed gates</button>}
+            </div>
+          )}
+
+          {tab === "context" && (
+            <div className="workflow-list">
+              {liveContext && <article className="context-live">
+                <div><strong>Live context</strong><span>{liveContext.percent?.toFixed(1) ?? "?"}%</span></div>
+                <progress max={100} value={liveContext.percent ?? 0} />
+                <small>{liveContext.tokens?.toLocaleString() ?? "?"} / {liveContext.contextWindow?.toLocaleString() ?? ws.agentState?.model?.contextWindow?.toLocaleString() ?? "?"} tokens · checkpoint at 75% · compact at window − configured reserve</small>
+              </article>}
+              {[...checkpoints].reverse().map((item) => <details key={`cp-${item.at}`} className="context-record"><summary>Checkpoint · {new Date(item.at).toLocaleTimeString()} · {item.context?.percent?.toFixed(0) ?? "?"}%</summary><p>{item.objective}</p><small>{item.nextAction ?? `next: ${item.nextReadySteps?.join(", ") || "none"}`}</small><pre>{JSON.stringify({ decisions: item.decisions, gates: item.gateEvidence, risks: item.risks, steps: item.steps }, null, 2)}</pre></details>)}
+              {[...compactions].reverse().map((item) => <details key={`compact-${item.at}`} className="context-record"><summary>Compaction · {item.tokensBefore?.toLocaleString() ?? "?"} tokens</summary><p>{item.summary}</p></details>)}
+              {checkpoints.length + compactions.length === 0 && <p className="workflow-empty">Сжатий и checkpoint пока нет.</p>}
+            </div>
+          )}
+
+          {tab === "branches" && (
+            <div className="workflow-list">
+              {[...branches].reverse().map((item) => (
+                <article className="branch-card" key={`${item.at}-${item.abandonedLeafId ?? item.leafId}`}>
+                  <div>
+                    <strong>{item.abandonedLeafId ? "Rewind" : "Branch return"}</strong>
+                    <p>{item.targetPreview || item.abandonedUserMessages?.[0] || new Date(item.at).toLocaleString()}</p>
+                    <small>{new Date(item.at).toLocaleString()} · removed entries: {item.abandonedEntryCount ?? "?"} · stopped tasks: {item.stoppedTaskIds?.length ?? 0}</small>
+                  </div>
+                  {item.abandonedLeafId && <button onClick={() => invoke(() => returnToSessionBranch(cwd, item.abandonedLeafId!))}>Return</button>}
+                </article>
+              ))}
+              {branches.length === 0 && <p className="workflow-empty">В этой сессии ещё нет rewind-веток.</p>}
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
 }
 
 function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
@@ -599,11 +780,13 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   useEffect(() => {
     if (ws.chat.editorPrefill != null) {
       setText(ws.chat.editorPrefill);
+      if (ws.chat.editorAttachments != null) setAttachments(ws.chat.editorAttachments);
+      if (ws.chat.editorContextFiles != null) setContextFiles(ws.chat.editorContextFiles);
       const s = useStore.getState();
       const w = s.chats[cwd];
-      if (w) s.set({ chats: { ...s.chats, [cwd]: { ...w, chat: { ...w.chat, editorPrefill: null } } } });
+      if (w) s.set({ chats: { ...s.chats, [cwd]: { ...w, chat: { ...w.chat, editorPrefill: null, editorAttachments: null, editorContextFiles: null } } } });
     }
-  }, [ws.chat.editorPrefill, cwd]);
+  }, [ws.chat.editorPrefill, ws.chat.editorAttachments, ws.chat.editorContextFiles, cwd]);
 
   useEffect(() => {
     const ta = taRef.current;
@@ -802,6 +985,7 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
     <div className="composer-wrap">
       <ExtensionUIDock cwd={cwd} ws={ws} />
       <GitBar cwd={cwd} ws={ws} />
+      <WorkflowDock cwd={cwd} ws={ws} />
       {Object.entries(ws.chat.widgets).map(([k, v]) => (
         <div key={k} className="widgetbar">
           {stripAnsi(v)}
@@ -1351,7 +1535,10 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   ), [items, ws.chat.isStreaming, ws.chat.streaming, ws.chat.lastError]);
   const userIndexes = useMemo(() => {
     let userCounter = 0;
-    return items.map((it) => (it.msg.role === "user" ? userCounter++ : undefined));
+    // Extension follow-ups are implementation details, not user-editable turns.
+    // Excluding them keeps the UI index aligned with get_fork_messages and
+    // prevents rewind from selecting the wrong duplicate prompt.
+    return items.map((it) => (it.msg.role === "user" && !it.viaExtension ? userCounter++ : undefined));
   }, [items]);
   // Аватар модели — на первом сообщении каждой группы ответов (как в ChatGPT/
   // Claude): user-сообщение или смена модели начинает новую группу. Модель

@@ -121,6 +121,10 @@ pub struct AppConfig {
     pub process_limit: u32,
     /// При локальном endpoint ограничивать параллелизм одним агентом.
     pub process_limit_auto: bool,
+    /// Filesystem write boundary for newly spawned agents. On macOS,
+    /// "workspace-write" is enforced by sandbox-exec for the whole process
+    /// tree; "unrestricted" preserves the legacy behavior.
+    pub agent_sandbox_mode: String,
     pub idle_kill_secs: u64,
     pub preview_idle_kill_secs: u64,
     pub theme: String,
@@ -182,6 +186,7 @@ impl Default for AppConfig {
             editor: "code".into(),
             process_limit: 2,
             process_limit_auto: true,
+            agent_sandbox_mode: "workspace-write".into(),
             idle_kill_secs: 900,
             preview_idle_kill_secs: 600,
             theme: "system".into(),
@@ -761,6 +766,7 @@ mod tests {
         assert_eq!(c.editor, "code");
         assert_eq!(c.process_limit, 2);
         assert!(c.process_limit_auto);
+        assert_eq!(c.agent_sandbox_mode, "workspace-write");
         assert_eq!(c.idle_kill_secs, 900);
         assert_eq!(c.preview_idle_kill_secs, 600);
         assert!(c.lang.is_none());
@@ -777,6 +783,7 @@ mod tests {
     fn app_config_new_fields_default_for_existing_files() {
         let c: AppConfig = serde_json::from_str(r#"{"editor":"zed","processLimit":3}"#).unwrap();
         assert!(c.process_limit_auto);
+        assert_eq!(c.agent_sandbox_mode, "workspace-write");
         assert_eq!(c.preview_idle_kill_secs, 600);
         assert_eq!(c.editor, "zed");
         assert_eq!(c.process_limit, 3);

@@ -19,13 +19,18 @@ function packageSource(spec: PackageSetting): string {
   return typeof spec === "string" ? spec : spec.source;
 }
 
-/** Convert npm:name@version / npm:@scope/name@version into the catalog package name. */
+/** Convert package specs into the stable display/resource-filter name. */
 export function packageNameFromSpec(spec: PackageSetting | unknown): string | null {
   const sourceSpec = typeof spec === "string"
     ? spec
     : spec && typeof spec === "object" && "source" in spec && typeof spec.source === "string"
       ? spec.source
       : "";
+  if (sourceSpec.startsWith("git:")) {
+    const clean = sourceSpec.slice(4).split(/[?#]/, 1)[0].replace(/\/$/, "");
+    const name = clean.slice(clean.lastIndexOf("/") + 1).replace(/\.git$/, "");
+    return name || null;
+  }
   if (!sourceSpec.startsWith("npm:")) return null;
   const source = sourceSpec.slice(4);
   if (source.startsWith("@")) {
