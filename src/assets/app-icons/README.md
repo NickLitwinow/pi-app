@@ -7,7 +7,8 @@ matching the optical footprint of current macOS application icons.
 The icon has one stable, deliberately minimal π mark. Settings → Interface
 persists any `#RRGGBB` value as `appIconBackground`; the native macOS command
 rebuilds the SVG with that background and picks a contrasting light or dark
-glyph before calling `NSApplication.setApplicationIconImage`.
+glyph. It updates both `NSApplication` and the writable `.app` bundle's Finder
+custom icon, so the selected background remains visible after the app exits.
 
 Legacy `appIconStyle` values are migrated to equivalent background colors.
 The Dock background is independent from the application theme and UI glyphs.

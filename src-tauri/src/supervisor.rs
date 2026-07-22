@@ -20,6 +20,26 @@ fn sandbox_quote(path: &Path) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn sandbox_regex_literal(path: &Path) -> String {
+    let mut escaped = String::new();
+    for ch in path.to_string_lossy().chars() {
+        match ch {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            // Keep the Seatbelt #"..." regex literal structurally intact even
+            // for unusual user directory names.
+            '"' => escaped.push_str("\\x22"),
+            '\n' => escaped.push_str("\\x0A"),
+            '\r' => escaped.push_str("\\x0D"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+#[cfg(target_os = "macos")]
 fn canonical_or_original(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -42,6 +62,11 @@ fn workspace_sandbox_profile(cwd: &Path, session_path: Option<&str>) -> String {
         agent_dir.join("auth.json.lock"),
         agent_dir.join("models-store.json"),
         agent_dir.join("models-store.json.lock"),
+        // Pi 0.81+ acquires this lock while resolving project-local resources.
+        // Without it, the sandboxed RPC process exits with EPERM before the
+        // first prompt can be processed.
+        agent_dir.join("trust.json"),
+        agent_dir.join("trust.json.lock"),
         agent_dir.join("mcp-cache.json"),
         agent_dir.join("mcp-npx-cache.json"),
         agent_dir.join("mcp-onboarding.json"),
@@ -63,8 +88,17 @@ fn workspace_sandbox_profile(cwd: &Path, session_path: Option<&str>) -> String {
         .map(|path| format!("(subpath \"{}\")", sandbox_quote(path)))
         .collect::<Vec<_>>()
         .join(" ");
+    // pi-mcp-adapter writes these caches atomically next to their final file.
+    // The PID is not known until after Seatbelt is configured, so allow only
+    // the adapter's exact <name>.<numeric-pid>.tmp shape.
+    let agent_dir_pattern = sandbox_regex_literal(&canonical_or_original(&agent_dir));
+    let atomic_runtime_rules = ["mcp-cache", "mcp-npx-cache", "mcp-onboarding"]
+        .iter()
+        .map(|name| format!("(regex #\"^{agent_dir_pattern}/{name}[.]json[.][0-9]+[.]tmp$\")"))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
-        "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* {rules} (literal \"/dev/null\") (literal \"/dev/tty\"))"
+        "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* {rules} {atomic_runtime_rules} (literal \"/dev/null\") (literal \"/dev/tty\"))"
     )
 }
 
@@ -1057,6 +1091,11 @@ mod tests {
         assert!(profile.contains("project with \\\"quote\\\""));
         assert!(profile.contains("(subpath \"/tmp/sessions\")"));
         assert!(profile.contains("settings.json.lock"));
+        assert!(profile.contains("trust.json"));
+        assert!(profile.contains("trust.json.lock"));
+        assert!(profile.contains("mcp-cache[.]json[.][0-9]+[.]tmp"));
+        assert!(profile.contains("mcp-npx-cache[.]json[.][0-9]+[.]tmp"));
+        assert!(profile.contains("mcp-onboarding[.]json[.][0-9]+[.]tmp"));
         assert!(profile.contains("ponytail"));
         assert!(profile.contains("(literal \"/dev/null\")"));
     }

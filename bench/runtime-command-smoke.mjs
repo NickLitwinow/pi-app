@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,9 @@ const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-runtime-command-smoke-")));
 const scratch = join(cwd, ".pi", "tmp");
 mkdirSync(scratch, { recursive: true });
+// Force Pi's normal project-trust lookup instead of testing only a workspace
+// without local resources (which never touches trust.json.lock).
+writeFileSync(join(cwd, ".pi", "settings.json"), "{}\n");
 const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 const runtimeState = [
   "settings.json.lock",
@@ -31,12 +34,17 @@ const runtimeState = [
   "auth.json.lock",
   "models-store.json",
   "models-store.json.lock",
+  "trust.json",
+  "trust.json.lock",
   "mcp-cache.json",
   "mcp-npx-cache.json",
   "mcp-onboarding.json",
   "mcp-oauth",
 ].map((name) => join(agentDir, name));
-const invocation = sandboxedPiCommand(["--mode", "rpc", "--no-session", "--offline", "--no-approve"], repoRoot, true, cwd, [], runtimeState);
+// Keep the normal project-trust path enabled. Pi 0.81+ takes a trust.json.lock
+// even for read-only trust lookup, so --no-approve would hide a broken sandbox
+// allowlist and let the exact app-start regression escape this smoke test.
+const invocation = sandboxedPiCommand(["--mode", "rpc", "--no-session", "--offline"], repoRoot, true, cwd, [], runtimeState);
 const child = spawn(invocation.command, invocation.args, {
 	cwd,
 	stdio: ["pipe", "pipe", "pipe"],

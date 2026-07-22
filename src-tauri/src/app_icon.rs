@@ -43,10 +43,18 @@ fn icon_svg(background: &str) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn apply_macos_icon(bytes: &[u8]) -> Result<(), String> {
+fn current_app_bundle() -> Option<std::path::PathBuf> {
+    std::env::current_exe().ok()?.ancestors().find_map(|path| {
+        (path.extension().and_then(|value| value.to_str()) == Some("app"))
+            .then(|| path.to_path_buf())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_icon(bytes: &[u8], bundle_path: Option<&std::path::Path>) -> Result<(), String> {
     use objc2::{AllocAnyThread, MainThreadMarker};
-    use objc2_app_kit::{NSApplication, NSImage};
-    use objc2_foundation::NSData;
+    use objc2_app_kit::{NSApplication, NSImage, NSWorkspace, NSWorkspaceIconCreationOptions};
+    use objc2_foundation::{NSData, NSString};
 
     let marker = MainThreadMarker::new()
         .ok_or_else(|| "смена Dock-иконки должна выполняться в main thread".to_string())?;
@@ -55,20 +63,42 @@ fn apply_macos_icon(bytes: &[u8]) -> Result<(), String> {
     let image = NSImage::initWithData(NSImage::alloc(), &data)
         .ok_or_else(|| "macOS не смогла декодировать SVG иконки".to_string())?;
     unsafe { app.setApplicationIconImage(Some(&image)) };
+
+    // NSApplication only changes the running process. Assign a Finder custom
+    // icon to the writable .app bundle as well so Dock keeps the selected
+    // background after the process exits. Signed Contents/Resources remain
+    // untouched; macOS stores this as file metadata on the bundle.
+    if let Some(bundle_path) = bundle_path {
+        let path = NSString::from_str(&bundle_path.to_string_lossy());
+        let workspace = NSWorkspace::sharedWorkspace();
+        let persisted = workspace.setIcon_forFile_options(
+            Some(&image),
+            &path,
+            NSWorkspaceIconCreationOptions::empty(),
+        );
+        if !persisted {
+            return Err(format!(
+                "иконка применена к запущенному приложению, но macOS не смогла сохранить её для {} — bundle должен быть доступен для записи",
+                bundle_path.display()
+            ));
+        }
+        workspace.noteFileSystemChanged_(&path);
+    }
     Ok(())
 }
 
 /// Rebuilds the minimalist Dock icon with a user-selected background. The
-/// persisted color is applied again at startup; the bundle uses the default.
+/// running app and its writable .app bundle both receive the generated image.
 #[tauri::command]
 pub async fn set_app_icon(app: tauri::AppHandle, background: String) -> Result<(), String> {
     let bytes = icon_svg(&background)?;
 
     #[cfg(target_os = "macos")]
     {
+        let bundle_path = current_app_bundle();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         app.run_on_main_thread(move || {
-            let _ = sender.send(apply_macos_icon(&bytes));
+            let _ = sender.send(apply_macos_icon(&bytes, bundle_path.as_deref()));
         })
         .map_err(|error| error.to_string())?;
         return receiver

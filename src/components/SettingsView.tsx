@@ -1428,9 +1428,9 @@ function AppTab() {
           </div>
           <div className={`app-icon-apply-status ${appIconApplyStatus?.state ?? "idle"}`} role="status" aria-live="polite">
             <span aria-hidden="true" />
-            {!appIconApplyStatus && "Выбор применяется к Dock сразу и сохраняется после перезапуска"}
+            {!appIconApplyStatus && "Выбор применяется сразу и остаётся в Dock даже после выхода"}
             {appIconApplyStatus?.state === "applying" && "Применяем новую иконку…"}
-            {appIconApplyStatus?.state === "applied" && "Иконка Dock обновлена"}
+            {appIconApplyStatus?.state === "applied" && "Иконка Dock обновлена и сохранена"}
             {appIconApplyStatus?.state === "error" && (appIconApplyStatus.message || "Не удалось обновить иконку Dock")}
           </div>
         </div>
