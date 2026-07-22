@@ -71,6 +71,13 @@ fn workspace_sandbox_profile(cwd: &Path, session_path: Option<&str>) -> String {
         agent_dir.join("mcp-npx-cache.json"),
         agent_dir.join("mcp-onboarding.json"),
         agent_dir.join("mcp-oauth"),
+        // pi-permission-system 20.10 writes its default-on permission review
+        // audit stream here. Keep the grant scoped to logs rather than making
+        // the extension/package tree writable.
+        agent_dir
+            .join("extensions")
+            .join("pi-permission-system")
+            .join("logs"),
         canonical_or_original(&std::env::temp_dir()),
         PathBuf::from("/tmp"),
         PathBuf::from("/private/tmp"),
@@ -1096,6 +1103,7 @@ mod tests {
         assert!(profile.contains("mcp-cache[.]json[.][0-9]+[.]tmp"));
         assert!(profile.contains("mcp-npx-cache[.]json[.][0-9]+[.]tmp"));
         assert!(profile.contains("mcp-onboarding[.]json[.][0-9]+[.]tmp"));
+        assert!(profile.contains("pi-permission-system/logs"));
         assert!(profile.contains("ponytail"));
         assert!(profile.contains("(literal \"/dev/null\")"));
     }
