@@ -1129,11 +1129,13 @@ const APP_ICON_STYLE_OPTIONS: {
   description: string;
   image?: string;
 }[] = [
-  { id: "auto", label: "По теме", description: "Меняется вместе с основным пресетом" },
-  { id: "liquid-glass", label: "Liquid Glass", description: "Глубина и мягкая рефракция", image: liquidGlassIcon },
-  { id: "aurora", label: "Aurora", description: "Цветной системный акцент", image: auroraIcon },
-  { id: "graphite", label: "Graphite", description: "Спокойный монохром", image: graphiteIcon },
+  { id: "auto", label: "По теме", description: "Автоматически подбирается под пресет интерфейса" },
+  { id: "liquid-glass", label: "Liquid Glass", description: "Тёмное стекло и мягкая рефракция", image: liquidGlassIcon },
+  { id: "aurora", label: "Aurora", description: "Чистый сине-пурпурный градиент", image: auroraIcon },
+  { id: "graphite", label: "Graphite", description: "Матовый нейтральный графит", image: graphiteIcon },
 ];
+
+type AppIconApplyStatus = { state: "applying" | "applied" | "error"; style: string; message?: string };
 
 const APP_ICON_IMAGES = {
   "liquid-glass": liquidGlassIcon,
@@ -1192,6 +1194,12 @@ function AppTab() {
   const iconColor = appConfig.iconColor ?? accentColor;
   const appIconStyle = appConfig.appIconStyle ?? "auto";
   const resolvedAutoIconStyle = resolveAppIconStyle({ ...appConfig, appIconStyle: "auto" });
+  const [appIconApplyStatus, setAppIconApplyStatus] = useState<AppIconApplyStatus | null>(null);
+  useEffect(() => {
+    const onStatus = (event: Event) => setAppIconApplyStatus((event as CustomEvent<AppIconApplyStatus>).detail);
+    window.addEventListener("pi:app-icon-status", onStatus);
+    return () => window.removeEventListener("pi:app-icon-status", onStatus);
+  }, []);
   const setCustomAccent = (color: string) => void updateAppConfig({
     accentColor: color,
     appearancePreset: "custom",
@@ -1375,7 +1383,7 @@ function AppTab() {
               <strong>Стиль иконок</strong>
               <span>Dock-иконка и glyphs интерфейса используют одну визуальную семью</span>
             </div>
-            <span className="app-icon-style-badge">macOS 26/27</span>
+            <span className="app-icon-style-badge">Системный размер</span>
           </div>
           <div className="app-icon-style-grid" role="group" aria-label="Стиль иконок приложения">
             {APP_ICON_STYLE_OPTIONS.map((option) => {
@@ -1402,6 +1410,13 @@ function AppTab() {
                 </button>
               );
             })}
+          </div>
+          <div className={`app-icon-apply-status ${appIconApplyStatus?.state ?? "idle"}`} role="status" aria-live="polite">
+            <span aria-hidden="true" />
+            {!appIconApplyStatus && "Выбор применяется к Dock сразу и сохраняется после перезапуска"}
+            {appIconApplyStatus?.state === "applying" && "Применяем новую иконку…"}
+            {appIconApplyStatus?.state === "applied" && "Иконка Dock обновлена"}
+            {appIconApplyStatus?.state === "error" && (appIconApplyStatus.message || "Не удалось обновить иконку Dock")}
           </div>
         </div>
 

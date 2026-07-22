@@ -202,7 +202,20 @@ export default function App() {
   useEffect(() => {
     if (!ready) return;
     const style = resolveAppIconStyle({ appIconStyle, appearancePreset });
-    void getBackend().then((be) => be.invoke("set_app_icon", { style })).catch(() => {});
+    let cancelled = false;
+    const publish = (detail: { state: "applying" | "applied" | "error"; style: string; message?: string }) => {
+      if (!cancelled) window.dispatchEvent(new CustomEvent("pi:app-icon-status", { detail }));
+    };
+    publish({ state: "applying", style });
+    void getBackend()
+      .then((be) => be.invoke("set_app_icon", { style }))
+      .then(() => publish({ state: "applied", style }))
+      .catch((error: unknown) => publish({
+        state: "error",
+        style,
+        message: error instanceof Error ? error.message : "Не удалось обновить иконку Dock",
+      }));
+    return () => { cancelled = true; };
   }, [ready, appIconStyle, appearancePreset]);
 
   useEffect(() => {

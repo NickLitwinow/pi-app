@@ -59,11 +59,20 @@ mod tests {
 
     #[test]
     fn embeds_every_supported_icon_style() {
-        for style in ["liquid-glass", "aurora", "graphite"] {
+        let styles = ["liquid-glass", "aurora", "graphite"];
+        for style in styles {
             let bytes = icon_bytes(style).unwrap();
             assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
             assert!(bytes.len() > 100_000);
         }
+        assert_ne!(
+            icon_bytes(styles[0]).unwrap(),
+            icon_bytes(styles[1]).unwrap()
+        );
+        assert_ne!(
+            icon_bytes(styles[1]).unwrap(),
+            icon_bytes(styles[2]).unwrap()
+        );
         assert!(icon_bytes("unknown").is_err());
     }
 }

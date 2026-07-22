@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="166" y1="120" x2="857" y2="924" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#14266C"/>
+      <stop offset=".47" stop-color="#141B57"/>
+      <stop offset="1" stop-color="#0A0E2B"/>
+    </linearGradient>
+    <radialGradient id="blue" cx="0" cy="0" r="1" gradientTransform="translate(790 330) rotate(140) scale(518 490)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#26D6FF" stop-opacity=".92"/>
+      <stop offset=".36" stop-color="#1786FF" stop-opacity=".52"/>
+      <stop offset="1" stop-color="#0A49FF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="magenta" cx="0" cy="0" r="1" gradientTransform="translate(380 805) rotate(-57) scale(505 470)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FF55C8" stop-opacity=".82"/>
+      <stop offset=".42" stop-color="#8C4DFF" stop-opacity=".52"/>
+      <stop offset="1" stop-color="#5A3BFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glyph" x1="298" y1="332" x2="681" y2="709" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset=".5" stop-color="#F4F7FF"/>
+      <stop offset="1" stop-color="#D8EEFF"/>
+    </linearGradient>
+    <clipPath id="clip">
+      <path d="M255 82C148 82 82 148 82 255V769C82 876 148 942 255 942H769C876 942 942 876 942 769V255C942 148 876 82 769 82H255Z"/>
+    </clipPath>
+    <filter id="shadow" x="44" y="47" width="936" height="947" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#050821" flood-opacity=".52"/>
+    </filter>
+    <filter id="glyphShadow" x="222" y="291" width="580" height="470" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="16" stdDeviation="16" flood-color="#081346" flood-opacity=".48"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="8" flood-color="#77DBFF" flood-opacity=".38"/>
+    </filter>
+  </defs>
+
+  <path d="M255 82C148 82 82 148 82 255V769C82 876 148 942 255 942H769C876 942 942 876 942 769V255C942 148 876 82 769 82H255Z" fill="url(#tile)" filter="url(#shadow)"/>
+  <g clip-path="url(#clip)">
+    <path d="M82 82H942V942H82Z" fill="url(#blue)"/>
+    <path d="M82 82H942V942H82Z" fill="url(#magenta)"/>
+    <path d="M67 745C266 567 430 606 551 506C677 403 716 232 961 203" fill="none" stroke="#56E9FF" stroke-opacity=".16" stroke-width="76" stroke-linecap="round"/>
+    <path d="M46 876C285 620 433 725 596 569C726 445 735 340 971 291" fill="none" stroke="#CE6CFF" stroke-opacity=".14" stroke-width="106" stroke-linecap="round"/>
+    <path d="M117 179C309 99 683 112 907 277V82H82V238C91 216 103 196 117 179Z" fill="#FFFFFF" fill-opacity=".075"/>
+  </g>
+  <path d="M255 83.5C149 83.5 83.5 149 83.5 255V769C83.5 875 149 940.5 255 940.5H769C875 940.5 940.5 875 940.5 769V255C940.5 149 875 83.5 769 83.5H255Z" fill="none" stroke="#A9C9FF" stroke-opacity=".52" stroke-width="3"/>
+
+  <g filter="url(#glyphShadow)" fill="url(#glyph)">
+    <rect x="267" y="337" width="490" height="100" rx="50"/>
+    <path d="M349 404H445V650C445 681 424 704 397 704C370 704 349 681 349 650V404Z"/>
+    <path d="M579 404H675V650C675 681 654 704 627 704C600 704 579 681 579 650V404Z"/>
+  </g>
+  <path d="M310 354H714C727 354 738 361 745 372" fill="none" stroke="#FFFFFF" stroke-opacity=".76" stroke-width="5" stroke-linecap="round"/>
+</svg>
