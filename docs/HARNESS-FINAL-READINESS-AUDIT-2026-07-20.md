@@ -1,7 +1,7 @@
 # Итоговая сверка harness с исходными требованиями
 
 Дата: 2026-07-20. Платформа проверки: macOS, локальная модель
-`ollama/ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision` на `127.0.0.1:8003`.
+`ollama/ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision` на `127.0.0.1:8003`.
 
 ## Вердикт
 
@@ -28,7 +28,7 @@ classifier по имеющимся одиночным component trials не ус
 | Background tasks уровня coding apps | Выполнено | Queue/run/cancel/steer/transcript/diff/retry/verified merge, retained history, priority, queue position, evidence-based ETA и wait reason; `maxConcurrent=2` |
 | Worktree и sandbox | Выполнено для текущей платформы | Isolated Git worktrees + transactional integration merge; macOS Seatbelt workspace-write smoke запрещает записи за boundary |
 | UI/UX workflow | Выполнено | Tasks, Plan, Workflow, Context, Branches; live transcript, timeline, compaction/checkpoint inspector и task controls |
-| Same-session rewind | Выполнено | Stop foreground/background work → preview → `navigateTree(..., summarize:false)` → restore text/images → edit/resend; abandoned leaf и Return остаются в том же JSONL |
+| Same-session rewind | Выполнено | Stop foreground/background work → preview с обязательным Да/Нет при file diff → restore выбранного Git checkpoint → `navigateTree(..., summarize:false)` → restore text/images → edit/resend; navigation failure откатывает файлы через safety checkpoint; abandoned leaf и Return остаются в том же JSONL |
 | Rewind не создаёт новую сессию | Доказано | CLI smoke: `sameFile=true`, `noDuplicate=true`, mid-session duplicate prompt, persisted record и branch round-trip; Playwright проверяет click→preview→image restore→edit→resend и неизменное число sessions |
 | Compaction для окна 262144 | Доказано | Live run: 81,489 → 41,921 tokens, original hash unchanged, structured checkpoint present, required sections complete |
 | ThinkingCap/vision/262144 | Доказано | Pi config и живой `/v1/models`: reasoning+image, `contextWindow/max_model_len=262144`, high thinking, max output 16384 |
@@ -73,8 +73,9 @@ Component evidence:
 
 ## Осознанные границы, не скрытые под словом «готово»
 
-1. Rewind меняет conversation branch, но намеренно не откатывает workspace files.
-   Это безопаснее неявного destructive rollback и соответствует выбранному UX.
+1. Для старых сообщений, созданных до появления per-turn Git checkpoints, rewind
+   честно сообщает, что доступен только conversation rollback. Новые ходы по умолчанию
+   восстанавливают файлы после явного подтверждения потери изменений.
 2. macOS sandbox доказан; Linux bubblewrap и Windows backend не реализованы. Это не
    блокирует эксплуатацию на текущем Mac.
 3. Network/process isolation не абсолютна: network нужен research tools, а process

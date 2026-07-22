@@ -21,7 +21,7 @@ const skipRust = process.argv.includes("--skip-rust");
 const skipRelease = process.argv.includes("--skip-release");
 const reportPath = join(resultsDir, "final-readiness-report.json");
 const agentRoot = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-const modelId = "ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision";
+const modelId = "ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision";
 
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 const failures = [];

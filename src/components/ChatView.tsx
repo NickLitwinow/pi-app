@@ -5,9 +5,11 @@ import { confirmDialog, messageDialog } from "../lib/dialog";
 import { stripAnsi } from "../lib/markdown";
 import { contentText } from "../lib/reducer";
 import { modelAliasKey, modelDisplayName, modelIdDisplayName } from "../lib/models";
-import type { ComposerAttachment, ExtUiRequest, GitSummary, ModelInfo } from "../lib/types";
+import type { BackgroundTaskView, ComposerAttachment, ExtUiRequest, GitSummary, ModelInfo } from "../lib/types";
+import { formatRunDuration } from "../lib/turn-timing";
 import {
   abortAgent,
+  activeBackgroundTaskCount,
   compactContext,
   controlBackgroundTask,
   controlWorkflow,
@@ -20,6 +22,7 @@ import {
   respondToUiRequest,
   returnToSessionBranch,
   returnToLiveSession,
+  selectWorkspace,
   sendFollowUp,
   sendPrompt,
   setAgentMode,
@@ -40,7 +43,7 @@ import { buildTranscript } from "../lib/transcript";
 import StartScreen from "./StartScreen";
 import PreviewPane from "./PreviewView";
 import { ModelAvatar, ModelAvatarPicker } from "./AgentAvatar";
-import { ChevronIcon, EditIcon, ImageIcon, MinusIcon, ModelIcon, PaperclipIcon, PinIcon, PlusIcon, PreviewIcon, SendIcon, ShieldIcon, SteerIcon, StopIcon } from "./icons";
+import { ChevronIcon, EditIcon, ImageIcon, MinusIcon, ModelIcon, PaperclipIcon, PinIcon, PlusIcon, PreviewIcon, SendIcon, ShieldIcon, SteerIcon, StopIcon, TasksIcon } from "./icons";
 
 // ---------- agent mode selector ----------
 
@@ -133,13 +136,14 @@ function ModeSelector({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const [open, setOpen] = useState(false);
   const current = MODES.find((m) => m.id === ws.mode) ?? MODES[0];
   const planActive = Object.values(ws.chat.statusEntries).some((s) => stripAnsi(s).includes("plan"));
+  const backgroundCount = activeBackgroundTaskCount(ws);
 
   return (
     <div style={{ position: "relative" }}>
       <button
         className="chip"
         title={current.desc}
-        disabled={ws.chat.isStreaming}
+        disabled={ws.chat.isStreaming || backgroundCount > 0}
         onClick={() => setOpen(!open)}
         style={ws.mode === "bypass" ? { color: "var(--warn)" } : ws.mode === "plan" || planActive ? { color: "var(--accent)" } : undefined}
       >
@@ -154,7 +158,8 @@ function ModeSelector({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
                 className={`dd-item ${ws.mode === m.id ? "sel" : ""}`}
                 onClick={() => {
                   setOpen(false);
-                  void setAgentMode(cwd, m.id).catch(() => {});
+                  void setAgentMode(cwd, m.id).catch((error) =>
+                    notifyChat(cwd, "warning", error instanceof Error ? error.message : String(error)));
                 }}
               >
 	                <div>
@@ -301,7 +306,7 @@ function ModelPicker({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         }}
       >
         {current
-          ? <ModelAvatar modelKey={modelAliasKey(current.provider, current.id)} size={17} working={ws.liveStreaming} />
+          ? <ModelAvatar modelKey={modelAliasKey(current.provider, current.id)} size={17} />
           : <ModelIcon size={12} motion={open ? "pulse" : undefined} />}
         {current ? shortModel(modelDisplayName(current, aliases)) : "модель"}
       </button>
@@ -310,7 +315,7 @@ function ModelPicker({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
           <input autoFocus placeholder="Поиск модели…" value={q} onChange={(e) => setQ(e.target.value)} />
           {aliasModel && (
             <div className="model-alias-editor">
-              <ModelAvatarPicker modelKey={modelAliasKey(aliasModel.provider, aliasModel.id)} size={32} working={current?.provider === aliasModel.provider && current?.id === aliasModel.id && ws.liveStreaming} />
+              <ModelAvatarPicker modelKey={modelAliasKey(aliasModel.provider, aliasModel.id)} size={32} />
               <div>
                 <strong>Название в интерфейсе</strong>
                 <span>{aliasModel.provider}/{aliasModel.id}</span>
@@ -341,7 +346,7 @@ function ModelPicker({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
                 className={`dd-item ${current?.id === m.id ? "sel" : ""}`}
                 onClick={() => void pick(m)}
               >
-                <ModelAvatar modelKey={modelAliasKey(m.provider, m.id)} size={25} working={current?.provider === m.provider && current?.id === m.id && ws.liveStreaming} />
+                <ModelAvatar modelKey={modelAliasKey(m.provider, m.id)} size={25} />
                 <div className="model-option-copy">
                   <div>{modelDisplayName(m, aliases)}</div>
                   <div className="dd-sub">
@@ -540,6 +545,108 @@ type Attachment = ComposerAttachment;
 
 type WorkflowTab = "tasks" | "plan" | "workflow" | "context" | "branches";
 
+type LocatedBackgroundTask = { cwd: string; task: BackgroundTaskView };
+
+function BackgroundTasksTopbar({ currentCwd, tasks }: { currentCwd: string; tasks: LocatedBackgroundTask[] }) {
+  const [open, setOpen] = useState(false);
+  const [clock, setClock] = useState(() => Date.now());
+  const [cancelling, setCancelling] = useState<string | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const active = tasks.filter(({ task }) => task.status === "queued" || task.status === "running");
+  const running = active.filter(({ task }) => task.status === "running").length;
+
+  useEffect(() => {
+    if (active.length === 0) return;
+    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [active.length]);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("mousedown", closeOutside);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("mousedown", closeOutside);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (active.length === 0) setOpen(false);
+  }, [active.length]);
+
+  if (active.length === 0) return null;
+
+  const cancel = (cwd: string, task: BackgroundTaskView) => {
+    const key = `${cwd}:${task.id}`;
+    setCancelling(key);
+    void controlBackgroundTask(cwd, "cancel", task.id)
+      .catch((error) => notifyChat(cwd, "warning", error instanceof Error ? error.message : String(error)))
+      .finally(() => setCancelling(null));
+  };
+
+  return (
+    <div className="background-topbar" ref={rootRef}>
+      <button
+        type="button"
+        className={`chip background-task-trigger ${running > 0 ? "running" : "queued"}`}
+        aria-label={`Фоновые задачи: ${active.length}`}
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className="background-task-pulse" />
+        <TasksIcon size={13} />
+        <span className="background-task-label">{active.length === 1 ? "Background task" : `${active.length} background`}</span>
+        <ChevronIcon size={11} open={open} />
+      </button>
+      {open && (
+        <section className="background-task-popover" role="dialog" aria-label="Активные фоновые задачи">
+          <header>
+            <div><strong>Background tasks</strong><small>Продолжаются после завершения хода</small></div>
+            <span>{running} running · {active.length - running} queued</span>
+          </header>
+          <div className="background-task-list">
+            {active.map(({ cwd, task }) => {
+              const elapsed = task.startedAt == null ? 0 : Math.max(0, clock - task.startedAt);
+              const heartbeatAge = task.heartbeatAt == null ? null : Math.max(0, clock - task.heartbeatAt);
+              const heartbeatFresh = heartbeatAge == null || heartbeatAge < 90_000;
+              return (
+                <article key={`${cwd}:${task.id}`} className="background-task-row">
+                  <span className={`step-state ${task.status}`} />
+                  <div>
+                    <strong>{task.description}</strong>
+                    <small>{cwd.split("/").pop()} · {task.type} · {task.status}{elapsed > 0 ? ` · ${formatRunDuration(elapsed)}` : ""}</small>
+                    {task.status === "running" && <em className={heartbeatFresh ? "live" : "stale"}>{heartbeatFresh ? "Protected · live" : "Heartbeat delayed"}</em>}
+                    {task.status === "queued" && task.queuePosition != null && <em>Queue #{task.queuePosition}</em>}
+                  </div>
+                  <button type="button" disabled={cancelling === `${cwd}:${task.id}`} onClick={() => cancel(cwd, task)}>
+                    {cancelling === `${cwd}:${task.id}` ? "Stopping…" : "Stop"}
+                  </button>
+                </article>
+              );
+            })}
+          </div>
+          <footer>
+            <span>Idle cleanup и session eviction отключены, пока задачи активны.</span>
+            <button type="button" onClick={() => {
+              setOpen(false);
+              const target = active.find((item) => item.cwd === currentCwd) ?? active[0];
+              if (target && target.cwd !== currentCwd) selectWorkspace(target.cwd);
+              window.setTimeout(() => window.dispatchEvent(new CustomEvent("pi:open-background-tasks")), 0);
+            }}>Task center</button>
+          </footer>
+        </section>
+      )}
+    </div>
+  );
+}
+
 function WorkflowDock({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<WorkflowTab>("workflow");
@@ -561,6 +668,14 @@ function WorkflowDock({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
     const timer = window.setInterval(() => setClock(Date.now()), 1_000);
     return () => window.clearInterval(timer);
   }, [activeTasks]);
+  useEffect(() => {
+    const openTasks = () => {
+      setTab("tasks");
+      setOpen(true);
+    };
+    window.addEventListener("pi:open-background-tasks", openTasks);
+    return () => window.removeEventListener("pi:open-background-tasks", openTasks);
+  }, []);
   if (!workflow && plannedTasks.length === 0 && tasks.length === 0 && compactions.length === 0 && checkpoints.length === 0 && branches.length === 0) return null;
   const failedSteps = workflow?.steps.filter((step) => step.status === "failed").length ?? 0;
   const tabs: Array<{ id: WorkflowTab; label: string; count?: number }> = [
@@ -1720,11 +1835,16 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
 export default function ChatView() {
   const cwd = useStore((s) => s.currentCwd);
   const ws = useWorkspace(cwd);
+  const chats = useStore((s) => s.chats);
   const previewOpen = useStore((s) => s.previewOpen);
   const set = useStore((s) => s.set);
   const uiScale = useStore((s) => s.appConfig.uiScale || 1);
-  const piDefaults = useStore((s) => s.piDefaults);
   const [previewWidth, setPreviewWidth] = useState(560);
+  const backgroundTasks = useMemo(
+    () => Object.entries(chats).flatMap(([taskCwd, workspace]) =>
+      workspace.chat.backgroundTasks.map((task) => ({ cwd: taskCwd, task }))),
+    [chats],
+  );
 
   // drag-resize границы сплита чат/превью (физические координаты → делим на uiScale)
   const onSplitResize = (e: React.MouseEvent) => {
@@ -1791,16 +1911,13 @@ export default function ChatView() {
 
   const sessionName = ws.agentState?.sessionName ?? (ws.sessionPath ? "Сессия" : "Новая сессия");
   const browsing = isBrowsingAway(ws);
-  // до старта агента — модель из дефолтов pi, чтобы аватар не пропадал
-  const currentModel = effectiveModel(ws, piDefaults);
-
   return (
     <div className="chat">
       <div className="topbar" data-tauri-drag-region>
-        {currentModel && <ModelAvatarPicker modelKey={modelAliasKey(currentModel.provider, currentModel.id)} size={20} working={ws.liveStreaming} />}
         <span className="title">{cwd.split("/").pop()}</span>
         <span className="sub">{String(sessionName)}</span>
         <div className="spacer" data-tauri-drag-region />
+        <BackgroundTasksTopbar currentCwd={cwd} tasks={backgroundTasks} />
         <TranscriptModeSelector />
         <button
           className={`chip ${previewOpen ? "active" : ""}`}

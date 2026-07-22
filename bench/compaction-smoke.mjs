@@ -52,7 +52,7 @@ for (const file of ["models.json", "auth.json"]) {
 }
 writeFileSync(join(agentRoot, "settings.json"), JSON.stringify({
 	defaultProvider: "ollama",
-	defaultModel: "ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision",
+	defaultModel: "ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision",
 	defaultThinkingLevel: thinking,
 	packages: [],
 	compaction: { enabled: true, reserveTokens: 32768, keepRecentTokens: 24000 },
@@ -68,7 +68,7 @@ const args = [
 	"--no-context-files",
 	"--session", sessionFile,
 	"--session-dir", sessionRoot,
-	"--model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision",
+	"--model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision",
 	"--thinking", thinking,
 ];
 const invocation = sandboxedPiCommand(args, repoRoot, true, root);

@@ -87,6 +87,16 @@ export function isBrowsingAway(ws: WorkspaceChat): boolean {
   return Boolean(ws.alive && ws.liveSessionPath && ws.sessionPath && !samePath(ws.sessionPath, ws.liveSessionPath));
 }
 
+export function activeBackgroundTaskCount(ws: WorkspaceChat): number {
+  return ws.chat.backgroundTasks.filter((task) => task.status === "queued" || task.status === "running").length;
+}
+
+/** Foreground generation and harness background workers share one pi process.
+ * Both therefore protect its live session from switching, restart, and close. */
+export function workspaceHasActiveWork(ws: WorkspaceChat): boolean {
+  return ws.liveStreaming || activeBackgroundTaskCount(ws) > 0;
+}
+
 export function emptyWorkspaceChat(): WorkspaceChat {
   return {
     chat: emptyChatState(),
@@ -177,7 +187,7 @@ export const useStore = create<Store>((set) => ({
   ready: false,
   isMock: false,
   piInfo: null,
-  appConfig: { editor: "code", processLimit: 2, processLimitAuto: true, agentSandboxMode: "workspace-write", idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, modelAliases: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: false, modelAvatars: {} },
+  appConfig: { editor: "code", processLimit: 2, processLimitAuto: true, agentSandboxMode: "workspace-write", idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, modelAliases: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appIconStyle: "auto", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: false, modelAvatars: {} },
   projects: [],
   extraWorkspaces: [],
   currentCwd: null,
@@ -559,6 +569,9 @@ export async function ensureAgent(cwd: string, sessionPath?: string | null): Pro
   const promise = (async () => {
     const be = await getBackend();
     if (ws.agentId) {
+      if (workspaceHasActiveWork(ws)) {
+        throw new Error("Живая сессия выполняет foreground/background работу и не может быть перезапущена");
+      }
       await be.invoke("kill_agent", { agentId: ws.agentId }).catch(() => {});
       agentToCwd.delete(ws.agentId);
     }
@@ -700,9 +713,9 @@ export async function sendPrompt(cwd: string, text: string, images?: { data: str
   // отправка в просматриваемую сессию, отличную от той, где занят агент
   const before = getChat(cwd);
   if (before.alive && before.agentId && isBrowsingAway(before)) {
-    if (before.liveStreaming) {
+    if (workspaceHasActiveWork(before)) {
       throw new Error(
-        "Агент занят в другой сессии этой папки. Дождитесь завершения или нажмите «Вернуться к активной».",
+        "Агент выполняет foreground/background работу в другой сессии этой папки. Дождитесь завершения или нажмите «Вернуться к активной».",
       );
     }
     // агент простаивает — переносим его в открытую сессию, затем отправляем
@@ -765,14 +778,21 @@ export async function newSession(cwd: string): Promise<void> {
   const ws = getChat(cwd);
   useStore.setState({ currentCwd: cwd, view: "chat" });
   // нельзя увести занятого агента с текущей задачи
-  if (ws.alive && ws.agentId && ws.liveStreaming) {
+  if (ws.alive && ws.agentId && workspaceHasActiveWork(ws)) {
+    const backgroundCount = activeBackgroundTaskCount(ws);
     updateChat(cwd, (w) => ({
       ...w,
       chat: {
         ...w.chat,
         toasts: [
           ...w.chat.toasts,
-          { id: Date.now(), kind: "warning" as const, text: "Агент занят — дождитесь завершения, чтобы начать новую сессию" },
+          {
+            id: Date.now(),
+            kind: "warning" as const,
+            text: backgroundCount > 0
+              ? `В этой сессии ${backgroundCount} background-задач — остановите их в top bar перед созданием новой сессии`
+              : "Агент занят — дождитесь завершения, чтобы начать новую сессию",
+          },
         ].slice(-5),
         seq: w.chat.seq + 1,
       },
@@ -797,8 +817,15 @@ export async function newSession(cwd: string): Promise<void> {
  */
 export async function closeCurrentSession(cwd: string): Promise<void> {
   const ws = getChat(cwd);
-  if (ws.alive && ws.agentId && ws.liveStreaming) {
-    notifyChat(cwd, "warning", "Агент занят — дождитесь завершения, прежде чем закрывать сессию");
+  if (ws.alive && ws.agentId && workspaceHasActiveWork(ws)) {
+    const backgroundCount = activeBackgroundTaskCount(ws);
+    notifyChat(
+      cwd,
+      "warning",
+      backgroundCount > 0
+        ? `Сессия защищена: ${backgroundCount} background-задач ещё выполняются. Остановите их в top bar перед закрытием.`
+        : "Агент занят — дождитесь завершения, прежде чем закрывать сессию",
+    );
     return;
   }
   if (ws.agentId) {
@@ -925,6 +952,10 @@ async function loadPermissionMode(cwd: string): Promise<void> {
 export async function setAgentMode(cwd: string, mode: AgentMode): Promise<void> {
   const prev = getChat(cwd).mode;
   if (prev === mode) return;
+  const current = getChat(cwd);
+  if (activeBackgroundTaskCount(current) > 0) {
+    throw new Error("Нельзя перезапустить permission mode, пока выполняются background-задачи");
+  }
   updateChat(cwd, (w) => ({ ...w, mode }));
 
   // Контракт гейтов (§5.10-2): write_permission_preset сам синхронизирует
@@ -1062,9 +1093,12 @@ export async function openSession(cwd: string, meta: SessionMeta): Promise<void>
   // pending-диалоги живого агента переносим в новый вид.
   const returningToLive = cur.alive && Boolean(cur.agentId) && samePath(cur.liveSessionPath, meta.path);
   const willBrowse =
-    cur.alive && Boolean(cur.liveSessionPath) && !samePath(cur.liveSessionPath, meta.path) && cur.liveStreaming;
+    cur.alive && Boolean(cur.liveSessionPath) && !samePath(cur.liveSessionPath, meta.path) && workspaceHasActiveWork(cur);
   if ((returningToLive || willBrowse) && cur.chat.uiRequests.length > 0) {
     fileChat.uiRequests = cur.chat.uiRequests;
+  }
+  if (returningToLive || willBrowse) {
+    fileChat.backgroundTasks = cur.chat.backgroundTasks;
   }
   if (returningToLive) {
     fileChat.isStreaming = cur.liveStreaming;
@@ -1090,7 +1124,7 @@ export async function openSession(cwd: string, meta: SessionMeta): Promise<void>
     return;
   }
 
-  if (!cur.liveStreaming) {
+  if (!workspaceHasActiveWork(cur)) {
     // агент простаивает — безопасно перенести его в открытую сессию
     try {
       await rpcRequest(cwd, { type: "switch_session", sessionPath: meta.path }, 15000);
@@ -1273,7 +1307,12 @@ async function waitForAgentIdle(cwd: string, timeoutMs = 20_000): Promise<void> 
   if (getChat(cwd).liveStreaming) throw new Error("Не удалось остановить текущий ход перед rewind");
 }
 
-export async function rewindToMessage(cwd: string, userIndex: number, msg: ChatMessage): Promise<void> {
+export async function rewindToMessage(
+  cwd: string,
+  userIndex: number,
+  msg: ChatMessage,
+  options: { fileCheckpoint?: string | null; confirmedFileChanges?: boolean } = {},
+): Promise<void> {
   let ws = getChat(cwd);
   if (isBrowsingAway(ws)) throw new Error("Сначала вернитесь к активной сессии");
   if (ws.liveStreaming) {
@@ -1296,7 +1335,40 @@ export async function rewindToMessage(cwd: string, userIndex: number, msg: ChatM
   ws = getChat(cwd);
   const hasInSession = ws.commands.some((c) => c.name === "pi-rewind");
   if (!hasInSession) throw new Error("Внутрисессионный rewind недоступен: перезапустите агент с pi-app-harness");
-  await rpcRequest(cwd, { type: "prompt", message: `/pi-rewind ${target.entryId}` }, 180000);
+  const preStoppedTaskIds: string[] = [];
+  for (const task of ws.chat.backgroundTasks.filter((item) => item.status === "queued" || item.status === "running")) {
+    await rpcRequest(cwd, { type: "prompt", message: `/pi-task cancel ${task.id}` }, 180_000);
+    preStoppedTaskIds.push(task.id);
+  }
+
+  const backend = await getBackend();
+  let rollbackCheckpoint: string | null = null;
+  let filesRestored = false;
+  try {
+    if (options.fileCheckpoint) {
+      const latestDiff = await backend.invoke<string>("git_review_diff", { cwd, base: options.fileCheckpoint });
+      const nowHasFileChanges = latestDiff.trim().length > 0;
+      if (nowHasFileChanges && !options.confirmedFileChanges) {
+        throw new Error("Файлы изменились после preview. Повторите rewind и подтвердите их откат.");
+      }
+      if (nowHasFileChanges) {
+        rollbackCheckpoint = await backend.invoke<string>("git_checkpoint", { cwd, label: "before-rewind" });
+        await backend.invoke<string[]>("git_restore_checkpoint", { cwd, gitref: options.fileCheckpoint });
+        filesRestored = true;
+      }
+    }
+    const stoppedArg = preStoppedTaskIds.length > 0 ? ` ${preStoppedTaskIds.join(",")}` : "";
+    await rpcRequest(cwd, { type: "prompt", message: `/pi-rewind ${target.entryId}${stoppedArg}` }, 180000);
+  } catch (error) {
+    if (filesRestored && rollbackCheckpoint) {
+      try {
+        await backend.invoke("git_restore_checkpoint", { cwd, gitref: rollbackCheckpoint });
+      } catch (rollbackError) {
+        throw new Error(`Rewind failed: ${String(error)}. Не удалось восстановить файлы после сбоя: ${String(rollbackError)}`);
+      }
+    }
+    throw error;
+  }
   discardQueuedEvents(cwd);
   // полная история активной ветки — из файла живого агента (тот же при in-session)
   const live = getChat(cwd).liveSessionPath ?? ws.sessionPath;
@@ -1324,7 +1396,7 @@ export async function controlBackgroundTask(
 
 export async function returnToSessionBranch(cwd: string, leafId: string): Promise<void> {
   const ws = getChat(cwd);
-  if (ws.liveStreaming) throw new Error("Агент занят — дождитесь завершения перед сменой ветки");
+  if (workspaceHasActiveWork(ws)) throw new Error("Агент выполняет foreground/background работу — дождитесь завершения перед сменой ветки");
   await ensureAgent(cwd, ws.sessionPath);
   await rpcRequest(cwd, { type: "prompt", message: `/pi-branch-return ${leafId}` }, 180_000);
   discardQueuedEvents(cwd);
@@ -1339,7 +1411,7 @@ export async function returnToSessionBranch(cwd: string, leafId: string): Promis
 export async function forkFromMessage(cwd: string, userIndex: number, text: string): Promise<void> {
   const ws = getChat(cwd);
   if (!ws.sessionPath) throw new Error("Сессия ещё не сохранена на диск");
-  if (ws.liveStreaming) throw new Error("Агент занят — дождитесь завершения перед форком");
+  if (workspaceHasActiveWork(ws)) throw new Error("Агент выполняет foreground/background работу — дождитесь завершения перед форком");
   if (isBrowsingAway(ws)) throw new Error("Сначала вернитесь к активной сессии");
   await ensureAgent(cwd, ws.sessionPath);
   const data = await rpcRequest(cwd, { type: "get_fork_messages" }, 45000);

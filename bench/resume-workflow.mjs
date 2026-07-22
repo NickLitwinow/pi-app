@@ -20,7 +20,7 @@ const option = (name, fallback) => {
 };
 if (!reportPath) throw new Error("usage: node bench/resume-workflow.mjs <report.json> [--model provider/id] [--thinking high] [--timeout 3600]");
 
-const model = option("model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision");
+const model = option("model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision");
 const thinking = option("thinking", "high");
 const timeoutMs = Math.max(60_000, Number(option("timeout", "3600")) * 1_000 || 3_600_000);
 const sourceAgentRoot = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");

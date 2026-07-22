@@ -22,7 +22,7 @@ const option = (name, fallback) => {
 };
 if (!reportPath) throw new Error("usage: node bench/model-judge-replay.mjs <report.json> [--model provider/id] [--thinking high] [--timeout 1800]");
 
-const model = option("model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision");
+const model = option("model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision");
 const thinking = option("thinking", "high");
 const timeoutS = Math.max(30, Number(option("timeout", "1800")) || 1_800);
 const retryFailed = argv.includes("--retry-failed");

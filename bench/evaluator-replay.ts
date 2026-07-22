@@ -21,7 +21,7 @@ const option = (name: string, fallback = "") => {
 
 const workspace = option("workspace");
 const taskId = option("only", "config-migration");
-const model = option("model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision");
+const model = option("model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision");
 const thinking = option("thinking", "high");
 const timeoutS = Math.max(30, Number(option("timeout", "1800")) || 1_800);
 const label = option("label", "evaluator-replay");

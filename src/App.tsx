@@ -1,10 +1,11 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { getBackend } from "./lib/backend";
+import { confirmDialog } from "./lib/dialog";
 import { useT } from "./lib/i18n";
 import { notifyOS } from "./lib/notify";
 import { stripAnsi } from "./lib/markdown";
 import type { AppUpdateInfo } from "./lib/types";
-import { applyAppearanceConfig } from "./lib/theme";
+import { applyAppearanceConfig, resolveAppIconStyle } from "./lib/theme";
 import { contentText } from "./lib/reducer";
 import { splitTrailingTurnTiming } from "./lib/turn-timing";
 import { closeCurrentSession, initApp, newSession, selectWorkspace, updateAppConfig, useStore } from "./state/store";
@@ -28,6 +29,7 @@ export default function App() {
   const uiScale = useStore((s) => s.appConfig.uiScale);
   const accentColor = useStore((s) => s.appConfig.accentColor ?? "#8b5cf6");
   const iconColor = useStore((s) => s.appConfig.iconColor ?? s.appConfig.accentColor ?? "#8b5cf6");
+  const appIconStyle = useStore((s) => s.appConfig.appIconStyle ?? "auto");
   const appearancePreset = useStore((s) => s.appConfig.appearancePreset ?? "chatgpt");
   const visualEffects = useStore((s) => s.appConfig.visualEffects !== false);
   const interfaceDensity = useStore((s) => s.appConfig.interfaceDensity ?? "comfortable");
@@ -105,6 +107,35 @@ export default function App() {
     });
   }, [ready]);
 
+  // Native quit is paused by the Rust supervisor while background work is
+  // active. Obtain one explicit decision in the web UI, then use the
+  // programmatic exit path so the process group is terminated deliberately.
+  useEffect(() => {
+    if (!ready) return;
+    let unsubscribe: (() => void) | undefined;
+    let deciding = false;
+    void getBackend().then(async (be) => {
+      if (be.isMock) return;
+      unsubscribe = await be.listen("background-exit-requested", (payload) => {
+        if (deciding) return;
+        deciding = true;
+        const reported = Number(payload.taskCount ?? 0);
+        const active = Object.values(useStore.getState().chats)
+          .flatMap((workspace) => workspace.chat.backgroundTasks)
+          .filter((task) => task.status === "queued" || task.status === "running");
+        const count = Math.max(reported, active.length);
+        const names = active.slice(0, 5).map((task) => `• ${task.description}`).join("\n");
+        void confirmDialog(
+          `${count} ${count === 1 ? "фоновая задача ещё выполняется" : "фоновых задач ещё выполняются"}. При выходе процессы будут остановлены.${names ? `\n\n${names}` : ""}\n\nВыйти и остановить задачи?`,
+          { title: "Background tasks are running", kind: "warning", okLabel: "Выйти и остановить", cancelLabel: "Оставить работать" },
+        ).then((confirmed) => {
+          if (confirmed) return be.invoke("confirm_app_exit");
+        }).finally(() => { deciding = false; });
+      });
+    });
+    return () => unsubscribe?.();
+  }, [ready]);
+
   // Готовый GitHub Release скачивается и устанавливается поверх текущего .app
   // в фоне. Работающая копия не прерывается; новый бандл запустится при
   // следующем обычном перезапуске приложения.
@@ -165,8 +196,14 @@ export default function App() {
     el.dataset.preset = appearancePreset;
     el.dataset.effects = visualEffects ? "on" : "off";
     el.dataset.density = interfaceDensity;
-    applyAppearanceConfig({ ...useStore.getState().appConfig, appearancePreset, accentColor, iconColor, customTheme });
-  }, [accentColor, iconColor, appearancePreset, visualEffects, interfaceDensity, customTheme]);
+    applyAppearanceConfig({ ...useStore.getState().appConfig, appearancePreset, accentColor, iconColor, appIconStyle, customTheme });
+  }, [accentColor, iconColor, appIconStyle, appearancePreset, visualEffects, interfaceDensity, customTheme]);
+
+  useEffect(() => {
+    if (!ready) return;
+    const style = resolveAppIconStyle({ appIconStyle, appearancePreset });
+    void getBackend().then((be) => be.invoke("set_app_icon", { style })).catch(() => {});
+  }, [ready, appIconStyle, appearancePreset]);
 
   useEffect(() => {
     if (!visualEffects || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;

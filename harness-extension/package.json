@@ -10,6 +10,14 @@
     "url": "git+https://github.com/NickLitwinow/pi-app.git",
     "directory": "harness-extension"
   },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": { "optional": true },
+    "@earendil-works/pi-coding-agent": { "optional": true }
+  },
   "pi": {
     "extensions": ["./index.ts"]
   }

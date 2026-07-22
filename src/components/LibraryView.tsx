@@ -39,7 +39,7 @@ const PROFILES: {
   {
     id: "recommended",
     name: "Recommended",
-    desc: "Web, адаптивный workflow, queued background agents и Ponytail full на каждом ходе — ежедневный профиль pi-app.",
+    desc: "Web, AI-названия сессий, адаптивный workflow, queued background agents и Ponytail full на каждом ходе — ежедневный профиль pi-app.",
     packages: [
       "@gotgenes/pi-permission-system",
       "pi-web-access",
@@ -48,7 +48,7 @@ const PROFILES: {
       "@tintinweb/pi-subagents",
       { name: "ponytail", source: "git:github.com/DietrichGebert/ponytail" },
     ],
-    context: "≈4.2K токенов + lazy Ponytail skills",
+    context: "≈4.2K токенов + lazy Ponytail skills · auto-name thinking off",
     tone: "recommended",
   },
   {

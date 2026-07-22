@@ -17,7 +17,10 @@ Lightweight native macOS app for **[pi](https://pi.dev)** — a full-featured AI
 ## ✨ Features
 
 - **Streaming chats** — real-time token streaming with thinking, tool calls, and markdown rendering
-- **Session management** — workspaces, search, in-session change-and-resend rewind, explicit fork, pin, archive, grouped sessions
+- **Durable background tasks** — top-bar status and controls, heartbeat liveness, idle/eviction protection, and guarded app/session exit for multi-hour work
+- **Session management** — workspaces, search, in-session change-and-resend rewind with confirmed workspace rollback, explicit fork, pin, archive, grouped sessions
+- **AI session names** — the Recommended profile uses a short thinking-off Pi call to replace raw first-message snippets without overwriting manual names
+- **macOS 26/27 icon families** — Liquid Glass, Aurora, and Graphite masters with a live Dock/UI glyph selector that can follow the main appearance preset
 - **Full git center** — staging, commits, branches, fetch/pull/push, commit history with diffs
 - **Code review** — checkpoints, unified diffs, line comments, file revert
 - **Live sessions** — file watcher on `~/.pi/agent/sessions`, new sessions appear instantly

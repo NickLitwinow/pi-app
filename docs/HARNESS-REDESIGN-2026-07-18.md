@@ -1,7 +1,7 @@
 # Harness v3: workflows, sessions, and evaluation
 
 This is the implemented runtime contract for
-`ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision`. The model is an executor inside an
+`ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision`. The model is an executor inside an
 observable workflow; it is not asked to simulate every orchestration role in prose.
 
 ## Design rules
@@ -185,8 +185,12 @@ sequenceDiagram
     participant U as User
     participant UI as Composer
     participant H as Harness
+    participant W as Workspace checkpoint
     participant S as Same session file
     U->>UI: Change and resend old prompt
+    UI->>U: Confirm loss of changed files (Yes/No)
+    UI->>W: Save rollback checkpoint
+    UI->>W: Restore selected turn checkpoint
     UI->>H: /pi-rewind entryId
     H->>H: Stop queued/running leaf tasks
     H->>S: navigateTree(parentId), summarize=false
@@ -196,11 +200,15 @@ sequenceDiagram
 ```
 
 No second task/session is created, and there is no fallback to fork. The append-only
-file retains the abandoned leaf for the Branches inspector and explicit return. Rewind
-changes conversation state, not repository files; destructive file rollback remains a
-separate action. The preview lists later turns, attachments, and active tasks before
-confirmation. The branch record retains the abandoned entry count and prompt previews,
-so the Branches inspector remains useful after resume.
+file retains the abandoned leaf for the Branches inspector and explicit return. By
+default rewind also restores the Git checkpoint captured immediately before the
+selected user turn. When the current checkpointed tree differs, the preview explicitly
+warns that uncommitted changes will be lost and requires Yes/No confirmation. A safety
+checkpoint restores the pre-rewind files if session navigation fails. Old session turns
+without a file checkpoint fall back visibly to conversation-only rewind. The preview
+also lists later turns, attachments, and active tasks. The branch record retains the
+abandoned entry count and prompt previews, so the Branches inspector remains useful
+after resume.
 
 ## UI/UX contract
 

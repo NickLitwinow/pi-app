@@ -1,4 +1,18 @@
-import type { AppConfig, AppThemePalette } from "./types";
+import type { AppConfig, AppIconStyle, AppThemePalette } from "./types";
+
+export type ResolvedAppIconStyle = Exclude<AppIconStyle, "auto">;
+
+/**
+ * "Auto" keeps the app icon and interface glyphs in the same visual family as
+ * the selected main appearance. Explicit choices remain stable across themes.
+ */
+export function resolveAppIconStyle(config: Pick<AppConfig, "appIconStyle" | "appearancePreset">): ResolvedAppIconStyle {
+  const selected = config.appIconStyle ?? "auto";
+  if (["liquid-glass", "aurora", "graphite"].includes(selected)) return selected as ResolvedAppIconStyle;
+  if (config.appearancePreset === "gemini") return "aurora";
+  if (config.appearancePreset === "claude") return "graphite";
+  return "liquid-glass";
+}
 
 export const PI_THEME_TOKENS = [
   "accent", "border", "borderAccent", "borderMuted", "success", "error", "warning", "muted", "dim", "text", "thinkingText",
@@ -87,4 +101,5 @@ export function applyAppearanceConfig(config: AppConfig): void {
   }
   const effectiveAccent = preset === "custom" && config.customTheme ? config.customTheme.accent : accent;
   root.style.setProperty("--icon-accent", preset === "custom" ? config.iconColor || effectiveAccent : effectiveAccent);
+  root.dataset.iconStyle = resolveAppIconStyle(config);
 }

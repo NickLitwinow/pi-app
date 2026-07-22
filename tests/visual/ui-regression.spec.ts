@@ -58,6 +58,27 @@ test("Settings / Interface — Custom keeps button and icon colors independent",
   await expectNoHorizontalOverflow(page);
 });
 
+test("Settings / Interface — app icon family follows the main theme or stays explicit", async ({ page }) => {
+  await boot(page);
+  await page.getByRole("button", { name: "Настройки" }).click();
+  await page.getByRole("button", { name: /^Интерфейс/ }).click();
+  const iconStyles = page.getByRole("group", { name: "Стиль иконок приложения" });
+  await iconStyles.scrollIntoViewIfNeeded();
+  await expect(iconStyles).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-icon-style", "liquid-glass");
+
+  await page.getByRole("button", { name: "Gemini" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-icon-style", "aurora");
+  await page.getByRole("button", { name: "Стиль иконок: Graphite" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-icon-style", "graphite");
+  await page.getByRole("button", { name: "ChatGPT" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-icon-style", "graphite");
+  await page.getByRole("button", { name: "Стиль иконок: По теме" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-icon-style", "liquid-glass");
+  await expectNoHorizontalOverflow(page);
+  await expect(iconStyles).toHaveScreenshot("settings-icon-styles.png");
+});
+
 test("Library / Extensions — long scoped package and responsive actions", async ({ page }) => {
   await boot(page);
   await page.getByRole("button", { name: "Library" }).click();
@@ -127,7 +148,7 @@ test("Library harness profiles — context cost and scope", async ({ page }) => 
   await page.getByRole("button", { name: "Library" }).click();
   await page.getByRole("button", { name: /^Профили/ }).click();
   await expect(page.getByText("Recommended", { exact: true })).toBeVisible();
-  await expect(page.getByText("≈4.2K токенов + lazy Ponytail skills", { exact: true })).toBeVisible();
+  await expect(page.getByText("≈4.2K токенов + lazy Ponytail skills · auto-name thinking off", { exact: true })).toBeVisible();
   await expect(page.getByText("ponytail", { exact: true })).toBeVisible();
   await page.getByText("Local reasoning boost", { exact: true }).scrollIntoViewIfNeeded();
   await page.getByRole("button", { name: "Включить boost" }).click();
@@ -200,7 +221,25 @@ test("Workflow control center — plan, tasks, timeline and gates", async ({ pag
   await composer.press("Enter");
   const dock = page.getByRole("region", { name: "Workflow control center" });
   await expect(dock).toBeVisible();
-  await dock.locator(".workflow-summary").click();
+  const backgroundIndicator = page.getByRole("button", { name: "Фоновые задачи: 1" });
+  await expect(backgroundIndicator).toBeVisible();
+  await backgroundIndicator.click();
+  const backgroundPopover = page.getByRole("dialog", { name: "Активные фоновые задачи" });
+  await expect(backgroundPopover.getByText("Review rewind transaction", { exact: true })).toBeVisible();
+  await expect(backgroundPopover.getByText("Protected · live", { exact: true })).toBeVisible();
+  await expect(page).toHaveScreenshot("background-tasks-topbar.png", { fullPage: true });
+  await backgroundIndicator.click();
+
+  // The indicator is global: browsing another workspace must not hide or
+  // interrupt a long-running task. Task center navigates back to its owner.
+  await page.locator(".proj-head", { hasText: "website" }).click();
+  await expect(backgroundIndicator).toBeVisible();
+  await backgroundIndicator.click();
+  await expect(backgroundPopover.getByText("pi-app · reviewer · running", { exact: false })).toBeVisible();
+  await backgroundPopover.getByRole("button", { name: "Task center" }).click();
+  await expect(page.locator(".topbar .title")).toHaveText("pi-app");
+  await expect(dock.getByText("Review rewind transaction", { exact: true })).toBeVisible();
+  await dock.getByRole("button", { name: /Workflow/ }).click();
   await expect(dock.getByText("Build", { exact: true })).toBeVisible();
   await expect(dock.getByText("npm test", { exact: false })).toBeVisible();
   await expect(dock.getByText("executor · attempt 1/5", { exact: false })).toBeVisible();
@@ -228,8 +267,18 @@ test("Same-session rewind restores text and image, then resends without creating
   await expect(target).toBeVisible();
   await target.hover();
   page.once("dialog", (dialog) => {
+    expect(dialog.message()).toContain("Они будут потеряны. Продолжить?");
+    void dialog.dismiss();
+  });
+  await page.getByTitle("Изменить и повторить отсюда — в этой же сессии").last().click();
+  await expect(target).toBeVisible();
+  await expect(page.locator(".composer textarea")).toHaveValue("");
+
+  await target.hover();
+  page.once("dialog", (dialog) => {
     expect(dialog.message()).toContain("Session diff:");
     expect(dialog.message()).toContain("вложения (1)");
+    expect(dialog.message()).toContain("Они будут потеряны. Продолжить?");
     void dialog.accept();
   });
   await page.getByTitle("Изменить и повторить отсюда — в этой же сессии").last().click();
@@ -294,6 +343,7 @@ test("Turn timing notice uses the compact status card", async ({ page }) => {
 
 test("Model avatar — separate idle and LLM-working states", async ({ page }) => {
   await boot(page);
+  await expect(page.locator(".topbar .agent-avatar")).toHaveCount(0);
   await page.locator(".composer textarea").fill("Проверка аватара модели");
   await page.locator(".composer textarea").press("Enter");
   await page.getByRole("button", { name: "Заблокировать" }).click();
@@ -321,6 +371,9 @@ test("Model avatar — separate idle and LLM-working states", async ({ page }) =
   await page.locator(".composer textarea").press("Enter");
   const processing = page.locator(".processing");
   await expect(processing.locator(".agent-avatar.working")).toBeVisible();
+  const composerModel = page.locator(".composer").getByTitle("ollama/qwen-local", { exact: true });
+  await expect(composerModel.locator(".agent-avatar")).toBeVisible();
+  await expect(composerModel.locator(".agent-avatar.working")).toHaveCount(0);
   await expect(processing.locator(".pdots")).toHaveCount(0);
   await expect(processing.locator(".p-label")).toContainText("ThinkingCap 27B");
   await expect(processing.locator(".p-label")).toContainText(/(размышляет|анализирует запрос|изучает контекст|осматривается|планирует шаги|проверяет детали|исследует варианты|сопоставляет данные|формулирует ответ)/);

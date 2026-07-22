@@ -14,7 +14,7 @@ const option = (name, fallback) => {
 	return index >= 0 ? argv[index + 1] : fallback;
 };
 if (!report) throw new Error("usage: node bench/workflow-recovery.mjs <report.json> [--model provider/id]");
-const model = option("model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision");
+const model = option("model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision");
 const thinking = option("thinking", "high");
 const timeout = option("timeout", "3600");
 const judgeTimeout = option("judge-timeout", "1800");

@@ -539,6 +539,40 @@ pub async fn git_restore_run_files(
     Ok(())
 }
 
+/// Restore the complete checkpointed workspace tree without moving HEAD.
+/// Returns the paths whose contents were changed. The checkpoint is resolved to
+/// a commit first, so user-controlled ref syntax cannot be interpreted as a path.
+#[tauri::command]
+pub async fn git_restore_checkpoint(cwd: String, gitref: String) -> Result<Vec<String>, String> {
+    let object = format!("{gitref}^{{commit}}");
+    let resolved = git_ok(&cwd, &["rev-parse", "--verify", &object])
+        .await?
+        .trim()
+        .to_string();
+    if resolved.is_empty() {
+        return Err("checkpoint не найден".into());
+    }
+    let current = worktree_snapshot(&cwd).await?;
+    let (names, stderr, code) =
+        run_git(&cwd, &["diff", "--name-only", "-z", &resolved, &current]).await?;
+    if code != 0 {
+        return Err(if stderr.trim().is_empty() {
+            format!("git diff failed (exit {code})")
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    let mut files: Vec<String> = names
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect();
+    files.sort();
+    files.dedup();
+    git_restore_run_files(cwd, resolved, files.clone()).await?;
+    Ok(files)
+}
+
 // ---------- full git view: branches / staging / commits ----------
 
 #[derive(Serialize)]
@@ -979,6 +1013,28 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "line1\nline2\n"
+        );
+        assert!(!tmp.path().join("created.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn restore_checkpoint_restores_the_complete_snapshot_diff() {
+        let tmp = init_repo().await;
+        let cwd = tmp.path().to_str().unwrap().to_string();
+        let checkpoint = git_checkpoint(cwd.clone(), "rewind-target".into())
+            .await
+            .unwrap();
+
+        fs::write(tmp.path().join("a.txt"), "after\n").unwrap();
+        fs::write(tmp.path().join("created.txt"), "new\n").unwrap();
+        let restored = git_restore_checkpoint(cwd.clone(), checkpoint)
+            .await
+            .unwrap();
+
+        assert_eq!(restored, vec!["a.txt", "created.txt"]);
         assert_eq!(
             fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
             "line1\nline2\n"

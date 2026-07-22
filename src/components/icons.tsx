@@ -25,6 +25,7 @@ import {
   GitFork,
   Image,
   Info,
+  ListTodo,
   Pencil,
   MessageSquare,
   MessageSquarePlus,
@@ -56,57 +57,65 @@ interface IconProps {
 
 const SW = 1.75;
 const motionClass = (motion?: IconProps["motion"]) => motion ? `motion-icon motion-${motion}` : undefined;
+const iconClass = (motion?: IconProps["motion"]) => ["ui-icon", motionClass(motion)].filter(Boolean).join(" ");
+const iconProps = (size: number, motion?: IconProps["motion"], strokeWidth = SW) => ({
+  className: iconClass(motion),
+  size,
+  strokeWidth,
+});
 
-export const ChatIcon = ({ size = 15 }: IconProps) => <MessageSquare size={size} strokeWidth={SW} />;
-export const ReviewIcon = ({ size = 15 }: IconProps) => <GitBranch size={size} strokeWidth={SW} />;
-export const ChartIcon = ({ size = 15 }: IconProps) => <BarChart3 size={size} strokeWidth={SW} />;
-export const GearIcon = ({ size = 15 }: IconProps) => <Settings size={size} strokeWidth={SW} />;
-export const FolderIcon = ({ size = 15 }: IconProps) => <FolderOpen size={size} strokeWidth={SW} />;
-export const PlusIcon = ({ size = 15 }: IconProps) => <Plus size={size} strokeWidth={SW} />;
-export const SendIcon = ({ size = 15, motion }: IconProps) => <ArrowUp className={motionClass(motion)} size={size} strokeWidth={2.25} />;
-export const SteerIcon = ({ size = 15, motion }: IconProps) => <CornerUpRight className={motionClass(motion)} size={size} strokeWidth={2.1} />;
-export const StopIcon = ({ size = 15 }: IconProps) => <Square size={size} strokeWidth={SW} fill="currentColor" />;
-export const ExternalIcon = ({ size = 15 }: IconProps) => <ExternalLink size={size} strokeWidth={SW} />;
-export const PaperclipIcon = ({ size = 15 }: IconProps) => <Paperclip size={size} strokeWidth={SW} />;
-export const RefreshIcon = ({ size = 15, motion }: IconProps) => <RefreshCw className={motionClass(motion)} size={size} strokeWidth={SW} />;
-export const ModelIcon = ({ size = 15, motion }: IconProps) => <Cpu className={motionClass(motion)} size={size} strokeWidth={SW} />;
-export const ImageIcon = ({ size = 15 }: IconProps) => <Image size={size} strokeWidth={SW} />;
-export const RevertIcon = ({ size = 15 }: IconProps) => <Undo2 size={size} strokeWidth={SW} />;
-export const CommentIcon = ({ size = 15 }: IconProps) => <MessageSquarePlus size={size} strokeWidth={SW} />;
-export const CheckIcon = ({ size = 15 }: IconProps) => <Check size={size} strokeWidth={SW} />;
-export const CopyIcon = ({ size = 15 }: IconProps) => <Copy size={size} strokeWidth={SW} />;
-export const TimeIcon = ({ size = 15 }: IconProps) => <Clock3 size={size} strokeWidth={SW} />;
-export const FilesIcon = ({ size = 15 }: IconProps) => <Files size={size} strokeWidth={SW} />;
-export const EditIcon = ({ size = 15 }: IconProps) => <Pencil size={size} strokeWidth={SW} />;
+export const ChatIcon = ({ size = 15 }: IconProps) => <MessageSquare {...iconProps(size)} />;
+export const ReviewIcon = ({ size = 15 }: IconProps) => <GitBranch {...iconProps(size)} />;
+export const ChartIcon = ({ size = 15 }: IconProps) => <BarChart3 {...iconProps(size)} />;
+export const GearIcon = ({ size = 15 }: IconProps) => <Settings {...iconProps(size)} />;
+export const FolderIcon = ({ size = 15 }: IconProps) => <FolderOpen {...iconProps(size)} />;
+export const PlusIcon = ({ size = 15 }: IconProps) => <Plus {...iconProps(size)} />;
+export const SendIcon = ({ size = 15, motion }: IconProps) => <ArrowUp {...iconProps(size, motion, 2.25)} />;
+export const SteerIcon = ({ size = 15, motion }: IconProps) => <CornerUpRight {...iconProps(size, motion, 2.1)} />;
+export const StopIcon = ({ size = 15 }: IconProps) => <Square {...iconProps(size)} fill="currentColor" />;
+export const ExternalIcon = ({ size = 15 }: IconProps) => <ExternalLink {...iconProps(size)} />;
+export const PaperclipIcon = ({ size = 15 }: IconProps) => <Paperclip {...iconProps(size)} />;
+export const RefreshIcon = ({ size = 15, motion }: IconProps) => <RefreshCw {...iconProps(size, motion)} />;
+export const ModelIcon = ({ size = 15, motion }: IconProps) => <Cpu {...iconProps(size, motion)} />;
+export const ImageIcon = ({ size = 15 }: IconProps) => <Image {...iconProps(size)} />;
+export const RevertIcon = ({ size = 15 }: IconProps) => <Undo2 {...iconProps(size)} />;
+export const CommentIcon = ({ size = 15 }: IconProps) => <MessageSquarePlus {...iconProps(size)} />;
+export const CheckIcon = ({ size = 15 }: IconProps) => <Check {...iconProps(size)} />;
+export const CopyIcon = ({ size = 15 }: IconProps) => <Copy {...iconProps(size)} />;
+export const TimeIcon = ({ size = 15 }: IconProps) => <Clock3 {...iconProps(size)} />;
+export const TasksIcon = ({ size = 15, motion }: IconProps) => <ListTodo {...iconProps(size, motion)} />;
+export const FilesIcon = ({ size = 15 }: IconProps) => <Files {...iconProps(size)} />;
+export const EditIcon = ({ size = 15 }: IconProps) => <Pencil {...iconProps(size)} />;
 
-export const InfoIcon = ({ size = 15 }: IconProps) => <Info size={size} strokeWidth={SW} />;
-export const SuccessIcon = ({ size = 15 }: IconProps) => <CheckCircle2 size={size} strokeWidth={SW} />;
-export const WarnIcon = ({ size = 15 }: IconProps) => <AlertTriangle size={size} strokeWidth={SW} />;
-export const ErrorIcon = ({ size = 15 }: IconProps) => <AlertCircle size={size} strokeWidth={SW} />;
-export const ShieldIcon = ({ size = 15 }: IconProps) => <ShieldQuestion size={size} strokeWidth={SW} />;
-export const MinusIcon = ({ size = 15 }: IconProps) => <Minus size={size} strokeWidth={SW} />;
-export const CommitIcon = ({ size = 15 }: IconProps) => <GitCommitHorizontal size={size} strokeWidth={SW} />;
-export const BranchIcon = ({ size = 15 }: IconProps) => <GitBranch size={size} strokeWidth={SW} />;
-export const TrashIcon = ({ size = 15 }: IconProps) => <Trash2 size={size} strokeWidth={SW} />;
-export const PullIcon = ({ size = 15 }: IconProps) => <ArrowDown size={size} strokeWidth={SW} />;
-export const PushIcon = ({ size = 15 }: IconProps) => <ArrowUp size={size} strokeWidth={SW} />;
-export const FetchIcon = ({ size = 15 }: IconProps) => <CloudDownload size={size} strokeWidth={SW} />;
-export const ForkIcon = ({ size = 15 }: IconProps) => <GitFork size={size} strokeWidth={SW} />;
-export const RewindIcon = ({ size = 15 }: IconProps) => <RotateCcw size={size} strokeWidth={SW} />;
-export const PinIcon = ({ size = 15 }: IconProps) => <Pin size={size} strokeWidth={SW} />;
-export const PinOffIcon = ({ size = 15 }: IconProps) => <PinOff size={size} strokeWidth={SW} />;
-export const SidebarIcon = ({ size = 15 }: IconProps) => <PanelLeft size={size} strokeWidth={SW} />;
-export const FolderPlusIcon = ({ size = 15 }: IconProps) => <FolderPlus size={size} strokeWidth={SW} />;
-export const GroupIcon = ({ size = 15 }: IconProps) => <Folder size={size} strokeWidth={SW} />;
-export const UpdateIcon = ({ size = 15, motion }: IconProps) => <Sparkles className={motionClass(motion)} size={size} strokeWidth={SW} />;
-export const PreviewIcon = ({ size = 15 }: IconProps) => <Monitor size={size} strokeWidth={SW} />;
-export const PackageIcon = ({ size = 15 }: IconProps) => <Package size={size} strokeWidth={SW} />;
-export const AppearanceIcon = ({ size = 15 }: IconProps) => <Palette size={size} strokeWidth={SW} />;
-export const TabletIcon = ({ size = 15 }: IconProps) => <Tablet size={size} strokeWidth={SW} />;
-export const MobileIcon = ({ size = 15 }: IconProps) => <Smartphone size={size} strokeWidth={SW} />;
+export const InfoIcon = ({ size = 15 }: IconProps) => <Info {...iconProps(size)} />;
+export const SuccessIcon = ({ size = 15 }: IconProps) => <CheckCircle2 {...iconProps(size)} />;
+export const WarnIcon = ({ size = 15 }: IconProps) => <AlertTriangle {...iconProps(size)} />;
+export const ErrorIcon = ({ size = 15 }: IconProps) => <AlertCircle {...iconProps(size)} />;
+export const ShieldIcon = ({ size = 15 }: IconProps) => <ShieldQuestion {...iconProps(size)} />;
+export const MinusIcon = ({ size = 15 }: IconProps) => <Minus {...iconProps(size)} />;
+export const CommitIcon = ({ size = 15 }: IconProps) => <GitCommitHorizontal {...iconProps(size)} />;
+export const BranchIcon = ({ size = 15 }: IconProps) => <GitBranch {...iconProps(size)} />;
+export const TrashIcon = ({ size = 15 }: IconProps) => <Trash2 {...iconProps(size)} />;
+export const PullIcon = ({ size = 15 }: IconProps) => <ArrowDown {...iconProps(size)} />;
+export const PushIcon = ({ size = 15 }: IconProps) => <ArrowUp {...iconProps(size)} />;
+export const FetchIcon = ({ size = 15 }: IconProps) => <CloudDownload {...iconProps(size)} />;
+export const ForkIcon = ({ size = 15 }: IconProps) => <GitFork {...iconProps(size)} />;
+export const RewindIcon = ({ size = 15 }: IconProps) => <RotateCcw {...iconProps(size)} />;
+export const PinIcon = ({ size = 15 }: IconProps) => <Pin {...iconProps(size)} />;
+export const PinOffIcon = ({ size = 15 }: IconProps) => <PinOff {...iconProps(size)} />;
+export const SidebarIcon = ({ size = 15 }: IconProps) => <PanelLeft {...iconProps(size)} />;
+export const FolderPlusIcon = ({ size = 15 }: IconProps) => <FolderPlus {...iconProps(size)} />;
+export const GroupIcon = ({ size = 15 }: IconProps) => <Folder {...iconProps(size)} />;
+export const UpdateIcon = ({ size = 15, motion }: IconProps) => <Sparkles {...iconProps(size, motion)} />;
+export const PreviewIcon = ({ size = 15 }: IconProps) => <Monitor {...iconProps(size)} />;
+export const PackageIcon = ({ size = 15 }: IconProps) => <Package {...iconProps(size)} />;
+export const AppearanceIcon = ({ size = 15 }: IconProps) => <Palette {...iconProps(size)} />;
+export const TabletIcon = ({ size = 15 }: IconProps) => <Tablet {...iconProps(size)} />;
+export const MobileIcon = ({ size = 15 }: IconProps) => <Smartphone {...iconProps(size)} />;
 
 export const ChevronIcon = ({ size = 13, open }: IconProps & { open?: boolean }) => (
   <ChevronRight
+    className="ui-icon"
     size={size}
     strokeWidth={SW}
     style={{ flexShrink: 0, transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s ease" }}

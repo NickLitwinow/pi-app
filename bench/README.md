@@ -66,7 +66,7 @@ node bench/run.mjs                        # все задачи, thinking=minima
 node bench/run.mjs --only bugfix-off-by-one,refactor-rename
 node bench/run.mjs --thinking high --label thinking-high
 node bench/run.mjs --timeout 300 --label temp-0.6
-node bench/run.mjs --suite long --model ollama/ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision --timeout 1200 --label long-baseline
+node bench/run.mjs --suite long --model ollama/ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision --timeout 1200 --label long-baseline
 node bench/run.mjs --suite long --only ledger-spec-twins --skill /path/to/skill --label with-skill
 node bench/run.mjs --suite long --only config-migration --arms baseline,full --repeats 5 --timeout 1200 --judge all --judge-timeout 600 --label interleaved-ab
 node bench/run.mjs --suite advanced --arms full,no-classifier,no-repair-loop,no-semantic-gates,no-ponytail --repeats 5 --timeout 1200 --label ablations

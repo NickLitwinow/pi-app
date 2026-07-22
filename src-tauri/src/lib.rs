@@ -1,3 +1,4 @@
+pub mod app_icon;
 pub mod app_update;
 pub mod avatars;
 pub mod config;
@@ -126,6 +127,7 @@ pub fn run() {
             supervisor::agent_send,
             supervisor::kill_agent,
             supervisor::list_agents,
+            supervisor::confirm_app_exit,
             supervisor::process_stats,
             sessions::list_projects,
             sessions::list_sessions,
@@ -146,6 +148,7 @@ pub fn run() {
             config::write_pi_config,
             config::read_app_config,
             config::write_app_config,
+            app_icon::set_app_icon,
             config::write_permission_preset,
             config::read_permission_mode,
             config::migrate_permission_configs,
@@ -169,6 +172,7 @@ pub fn run() {
             gitops::git_review_diff,
             gitops::git_checkout_file,
             gitops::git_restore_run_files,
+            gitops::git_restore_checkpoint,
             gitops::git_summary,
             gitops::git_open_pr,
             gitops::git_branches,
@@ -201,6 +205,25 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|app_handle, event| {
+            // A background task is a live workload even when the foreground
+            // model turn has settled. Keep the app/process group alive until
+            // the frontend obtains an explicit quit confirmation.
+            if let tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } = &event
+            {
+                let sup = app_handle.state::<supervisor::Supervisor<tauri::Wry>>();
+                let task_count =
+                    tauri::async_runtime::block_on(supervisor::active_background_task_count(&sup));
+                if task_count > 0 {
+                    api.prevent_exit();
+                    let _ = app_handle.emit(
+                        "background-exit-requested",
+                        supervisor::BackgroundExitRequestedPayload { task_count },
+                    );
+                    return;
+                }
+            }
             // Выход приложения: гасим все process group'ы (агенты pi + dev-серверы),
             // иначе их дети (MCP-серверы, vite) переживают выход и копят память.
             if let tauri::RunEvent::Exit = event {

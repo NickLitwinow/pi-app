@@ -426,7 +426,7 @@ function runTask(task, arm, trial, onCheckpoint = () => {}) {
 	}
 	writeFileSync(join(agentRoot, "settings.json"), JSON.stringify({
 		defaultProvider: "ollama",
-		defaultModel: "ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision",
+		defaultModel: "ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision",
 		defaultThinkingLevel: thinking,
 		packages: [],
 		compaction: { reserveTokens: 32768, keepRecentTokens: 24000 },

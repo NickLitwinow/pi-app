@@ -267,6 +267,10 @@ struct Agent {
     stdin: Arc<Mutex<ChildStdin>>,
     child: Arc<Mutex<Child>>,
     streaming: Arc<AtomicBool>,
+    /// Number of queued/running harness background tasks hosted by this pi
+    /// process. Background work can outlive the foreground model turn, so it
+    /// must protect the process from idle cleanup and process-limit eviction.
+    background_tasks: Arc<AtomicU64>,
     last_activity: Arc<AtomicI64>,
     started_at_ms: i64,
 }
@@ -306,7 +310,71 @@ pub struct AgentInfo {
     pub cwd: String,
     pub session_path: Option<String>,
     pub streaming: bool,
+    pub background_tasks: u64,
     pub last_activity_ms: i64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundExitRequestedPayload {
+    pub task_count: u64,
+}
+
+fn background_task_count(event: &serde_json::Value) -> Option<u64> {
+    if event.get("type").and_then(|value| value.as_str()) != Some("extension_ui_request")
+        || event.get("method").and_then(|value| value.as_str()) != Some("setWidget")
+        || event.get("widgetKey").and_then(|value| value.as_str())
+            != Some("pi-app-background-state")
+    {
+        return None;
+    }
+    let text = event
+        .get("widgetLines")
+        .and_then(|value| value.as_array())
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(|line| line.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .or_else(|| {
+            event
+                .get("widgetText")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        return Some(0);
+    }
+    let tasks = serde_json::from_str::<Vec<serde_json::Value>>(&text).ok()?;
+    Some(
+        tasks
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.get("status").and_then(|value| value.as_str()),
+                    Some("queued" | "running")
+                )
+            })
+            .count() as u64,
+    )
+}
+
+fn workload_is_active(streaming: bool, background_tasks: u64) -> bool {
+    streaming || background_tasks > 0
+}
+
+fn idle_reap_eligible(streaming: bool, background_tasks: u64, idle_ms: i64, ttl_ms: i64) -> bool {
+    !workload_is_active(streaming, background_tasks) && idle_ms > ttl_ms
+}
+
+fn agent_is_busy(agent: &Agent) -> bool {
+    workload_is_active(
+        agent.streaming.load(Ordering::Relaxed),
+        agent.background_tasks.load(Ordering::Relaxed),
+    )
 }
 
 #[derive(Deserialize)]
@@ -336,7 +404,8 @@ impl<R: Runtime> Supervisor<R> {
         sup
     }
 
-    /// Kill agents that have been idle (not streaming, no traffic) past the configured TTL.
+    /// Kill agents that have been idle (no foreground turn, background task,
+    /// or traffic) past the configured TTL.
     fn start_reaper(&self) {
         let agents = self.agents.clone();
         let app = self.app.clone();
@@ -350,7 +419,12 @@ impl<R: Runtime> Supervisor<R> {
                     let map = agents.lock().await;
                     for (id, agent) in map.iter() {
                         let idle = now - agent.last_activity.load(Ordering::Relaxed);
-                        if !agent.streaming.load(Ordering::Relaxed) && idle > ttl_ms {
+                        if idle_reap_eligible(
+                            agent.streaming.load(Ordering::Relaxed),
+                            agent.background_tasks.load(Ordering::Relaxed),
+                            idle,
+                            ttl_ms,
+                        ) {
                             to_kill.push(id.clone());
                         }
                     }
@@ -396,6 +470,23 @@ pub async fn kill_all_agents<R: Runtime>(sup: &Supervisor<R>) {
     }
 }
 
+pub async fn active_background_task_count<R: Runtime>(sup: &Supervisor<R>) -> u64 {
+    sup.agents
+        .lock()
+        .await
+        .values()
+        .map(|agent| agent.background_tasks.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// Called only after the user explicitly confirms quitting while long-running
+/// background work is active. Programmatic exit carries an exit code, so the
+/// RunEvent guard can distinguish it from a fresh user quit request.
+#[tauri::command]
+pub fn confirm_app_exit(app: AppHandle) {
+    app.exit(0);
+}
+
 async fn kill_by_id<R: Runtime>(
     agents: &Arc<Mutex<HashMap<String, Agent>>>,
     app: &AppHandle<R>,
@@ -433,7 +524,9 @@ pub async fn spawn_agent_impl<R: Runtime>(
     let pi = find_pi_binary()
         .ok_or("pi binary not found — install pi first (brew install pi or see pi.dev)")?;
 
-    // Enforce the process limit: evict the longest-idle non-streaming agent if needed.
+    // Enforce the process limit: evict only a genuinely idle process. A pi
+    // process hosting background work is busy even after its foreground turn
+    // has emitted agent_end.
     let app_config = load_app_config();
     let limit = if app_config.process_limit_auto && crate::config::local_provider_configured() {
         1
@@ -445,7 +538,7 @@ pub async fn spawn_agent_impl<R: Runtime>(
             let map = sup.agents.lock().await;
             let mut oldest: Option<(String, i64)> = None;
             for (id, a) in map.iter() {
-                if !a.streaming.load(Ordering::Relaxed) {
+                if !agent_is_busy(a) {
                     let ts = a.last_activity.load(Ordering::Relaxed);
                     if oldest.as_ref().map(|(_, t)| ts < *t).unwrap_or(true) {
                         oldest = Some((id.clone(), ts));
@@ -549,6 +642,7 @@ pub async fn spawn_agent_impl<R: Runtime>(
         stdin: Arc::new(Mutex::new(stdin)),
         child: Arc::new(Mutex::new(child)),
         streaming: Arc::new(AtomicBool::new(false)),
+        background_tasks: Arc::new(AtomicU64::new(0)),
         last_activity: Arc::new(AtomicI64::new(now_ms())),
         started_at_ms: now_ms(),
     };
@@ -558,6 +652,7 @@ pub async fn spawn_agent_impl<R: Runtime>(
         let app = app.clone();
         let id = agent_id.clone();
         let streaming = agent.streaming.clone();
+        let background_tasks = agent.background_tasks.clone();
         let last_activity = agent.last_activity.clone();
         let session_path = agent.session_path.clone();
         let mut reader = stdout;
@@ -572,6 +667,9 @@ pub async fn spawn_agent_impl<R: Runtime>(
                         for line in framer.push(&buf[..n]) {
                             match serde_json::from_str::<serde_json::Value>(&line) {
                                 Ok(event) => {
+                                    if let Some(count) = background_task_count(&event) {
+                                        background_tasks.store(count, Ordering::Relaxed);
+                                    }
                                     match event.get("type").and_then(|t| t.as_str()) {
                                         Some("agent_start") => {
                                             streaming.store(true, Ordering::Relaxed)
@@ -744,6 +842,7 @@ pub async fn list_agents_impl<R: Runtime>(sup: &Supervisor<R>) -> Result<Vec<Age
             cwd: a.cwd.clone(),
             session_path: a.session_path.lock().await.clone(),
             streaming: a.streaming.load(Ordering::Relaxed),
+            background_tasks: a.background_tasks.load(Ordering::Relaxed),
             last_activity_ms: a.last_activity.load(Ordering::Relaxed),
         });
     }
@@ -879,7 +978,9 @@ pub async fn process_stats_impl<R: Runtime>(sup: &Supervisor<R>) -> Result<Vec<P
 
 #[cfg(test)]
 mod tests {
-    use super::{kill_group, parse_ps};
+    use super::{
+        background_task_count, idle_reap_eligible, kill_group, parse_ps, workload_is_active,
+    };
     use std::process::Stdio;
     use std::sync::Arc;
     use tokio::process::Command;
@@ -895,6 +996,51 @@ mod tests {
         assert_eq!(groups.get(&300), None, "нечисловой rss пропущен");
         assert_eq!(pids.get(&101), Some(&2048));
         assert_eq!(pids.get(&100), Some(&1024));
+    }
+
+    #[test]
+    fn harness_background_widget_protects_only_active_tasks() {
+        let event = serde_json::json!({
+            "type": "extension_ui_request",
+            "method": "setWidget",
+            "widgetKey": "pi-app-background-state",
+            "widgetLines": [serde_json::to_string(&serde_json::json!([
+                { "id": "queued", "status": "queued" },
+                { "id": "running", "status": "running" },
+                { "id": "done", "status": "completed" },
+                { "id": "failed", "status": "failed" }
+            ])).unwrap()]
+        });
+        assert_eq!(background_task_count(&event), Some(2));
+        assert!(workload_is_active(false, 2));
+        assert!(workload_is_active(true, 0));
+        assert!(!workload_is_active(false, 0));
+    }
+
+    #[test]
+    fn background_widget_clear_releases_idle_protection_and_malformed_state_fails_closed() {
+        let cleared = serde_json::json!({
+            "type": "extension_ui_request",
+            "method": "setWidget",
+            "widgetKey": "pi-app-background-state"
+        });
+        let malformed = serde_json::json!({
+            "type": "extension_ui_request",
+            "method": "setWidget",
+            "widgetKey": "pi-app-background-state",
+            "widgetLines": ["not-json"]
+        });
+        assert_eq!(background_task_count(&cleared), Some(0));
+        assert_eq!(background_task_count(&malformed), None);
+    }
+
+    #[test]
+    fn silent_eight_hour_background_task_is_not_idle_reaped() {
+        let eight_hours_ms = 8 * 60 * 60 * 1_000;
+        let idle_ttl_ms = 15 * 60 * 1_000;
+
+        assert!(!idle_reap_eligible(false, 1, eight_hours_ms, idle_ttl_ms));
+        assert!(idle_reap_eligible(false, 0, eight_hours_ms, idle_ttl_ms));
     }
 
     #[cfg(target_os = "macos")]

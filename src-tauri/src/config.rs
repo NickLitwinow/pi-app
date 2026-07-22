@@ -6,6 +6,15 @@ use std::path::{Path, PathBuf};
 
 use crate::sessions::agent_dir;
 
+fn deserialize_agent_sandbox_mode<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .filter(|value| value == "workspace-write" || value == "unrestricted")
+        .unwrap_or_else(|| "workspace-write".into()))
+}
+
 // ---------- pi config files (settings.json / models.json / mcp.json) ----------
 
 fn pi_config_path(name: &str) -> Result<PathBuf, String> {
@@ -124,6 +133,7 @@ pub struct AppConfig {
     /// Filesystem write boundary for newly spawned agents. On macOS,
     /// "workspace-write" is enforced by sandbox-exec for the whole process
     /// tree; "unrestricted" preserves the legacy behavior.
+    #[serde(deserialize_with = "deserialize_agent_sandbox_mode")]
     pub agent_sandbox_mode: String,
     pub idle_kill_secs: u64,
     pub preview_idle_kill_secs: u64,
@@ -154,6 +164,8 @@ pub struct AppConfig {
     pub model_aliases: HashMap<String, String>,
     pub accent_color: String,
     pub icon_color: String,
+    /// Bundle/Dock icon family and the matching interface-glyph treatment.
+    pub app_icon_style: String,
     /// UI surface preset; independent from runtime model/provider selection.
     pub appearance_preset: String,
     pub visual_effects: bool,
@@ -202,6 +214,7 @@ impl Default for AppConfig {
             model_aliases: HashMap::new(),
             accent_color: "#8b5cf6".into(),
             icon_color: "#8b5cf6".into(),
+            app_icon_style: "auto".into(),
             appearance_preset: "chatgpt".into(),
             visual_effects: true,
             interface_density: "comfortable".into(),
@@ -773,6 +786,7 @@ mod tests {
         assert!(c.model_aliases.is_empty());
         assert!(c.model_avatars.is_empty());
         assert_eq!(c.accent_color, "#8b5cf6");
+        assert_eq!(c.app_icon_style, "auto");
         assert_eq!(c.appearance_preset, "chatgpt");
         assert!(c.visual_effects);
         assert_eq!(c.interface_density, "comfortable");
@@ -790,7 +804,20 @@ mod tests {
         assert!(c.model_aliases.is_empty());
         assert!(c.model_avatars.is_empty());
         assert_eq!(c.appearance_preset, "chatgpt");
+        assert_eq!(c.app_icon_style, "auto");
         assert_eq!(c.transcript_mode, "normal");
+    }
+
+    #[test]
+    fn app_config_tolerates_legacy_null_sandbox_mode_without_dropping_other_settings() {
+        let c: AppConfig = serde_json::from_str(
+            r#"{"editor":"zed","processLimit":3,"idleKillSecs":9000,"agentSandboxMode":null}"#,
+        )
+        .unwrap();
+        assert_eq!(c.agent_sandbox_mode, "workspace-write");
+        assert_eq!(c.idle_kill_secs, 9000);
+        assert_eq!(c.editor, "zed");
+        assert_eq!(c.process_limit, 3);
     }
 
     #[test]

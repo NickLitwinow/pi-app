@@ -19,7 +19,7 @@ const option = (name, fallback) => {
 	return index >= 0 ? argv[index + 1] : fallback;
 };
 const has = (name) => argv.includes(`--${name}`);
-const model = option("model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision");
+const model = option("model", "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision");
 const modelId = model.split("/").at(-1);
 const statePath = resolve(option("state", join(resultsDir, "final-verification-state.json")));
 const reportPath = resolve(option("report", join(resultsDir, "final-verification-report.json")));

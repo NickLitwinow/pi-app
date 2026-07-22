@@ -32,6 +32,7 @@ import {
 } from "./workflow.js";
 import { fingerprintWorkspace, isWorkspacePath, rebaseWorktreePrompt } from "./workspace.js";
 import { decorateTaskQueue, type TaskPriority } from "./tasks.js";
+import { registerSessionAutoName } from "./auto-name.js";
 
 type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 type BackgroundTask = {
@@ -104,6 +105,7 @@ Workflow contract:
 - The harness runs declared lint/typecheck/test/build gates itself after edits. Read failures, repair the cause, and never mask an exit code.
 - Green tests prove only what they assert. An independent evaluator reviews successful builds; completion requires deterministic gates and clause-by-clause evaluator acceptance.
 - Background workers are bounded, isolated workstreams. Preserve their transcript and reconcile their output before merge.
+- For a legitimately long-running command requested by the user, delegate it as a background task and omit the bash timeout (or set it above the declared runtime). Never poll it with sleep loops; rely on task lifecycle events, transcript output, and completion notification.
 - At high context usage, leave a structured checkpoint: objective, decisions, changed files, gate evidence, risks, and next ready step.`;
 
 const PONYTAIL_POLICY = `
@@ -190,6 +192,7 @@ function phaseText(state: WorkflowState): string {
 }
 
 export default function harness(pi: ExtensionAPI) {
+	registerSessionAutoName(pi);
 	if (process.env.PI_APP_HARNESS === "0") return;
 	const enabled = process.env.PI_APP_HARNESS_PROFILE !== "baseline";
 	const debugLog = process.env.PI_APP_HARNESS_LOG === "1";
@@ -208,6 +211,7 @@ export default function harness(pi: ExtensionAPI) {
 	let lastObservedFingerprint = "";
 	let continuationWaiter: ContinuationWaiter | undefined;
 	let taskUi: { setWidget(key: string, value: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void; setStatus(key: string, value: string | undefined): void } | undefined;
+	let backgroundHeartbeat: ReturnType<typeof setInterval> | undefined;
 	const toolArgs = new Map<string, unknown>();
 	const backgroundTasks = new Map<string, BackgroundTask>();
 
@@ -282,8 +286,20 @@ export default function harness(pi: ExtensionAPI) {
 	const publishTasks = () => {
 		if (!taskUi) return;
 		const maxConcurrent = Number(process.env.PI_APP_HARNESS_MAX_CONCURRENT ?? 2);
-		const tasks = decorateTaskQueue([...backgroundTasks.values()].slice(-50), maxConcurrent);
+		const now = Date.now();
+		const tasks = decorateTaskQueue([...backgroundTasks.values()].slice(-50), maxConcurrent).map((task) =>
+			task.status === "queued" || task.status === "running" ? { ...task, heartbeatAt: now } : task);
 		taskUi.setWidget("pi-app-background-state", tasks.length > 0 ? [JSON.stringify(tasks)] : undefined, { placement: "aboveEditor" });
+	};
+
+	const startBackgroundHeartbeat = () => {
+		if (backgroundHeartbeat) clearInterval(backgroundHeartbeat);
+		backgroundHeartbeat = setInterval(() => {
+			if ([...backgroundTasks.values()].some((task) => task.status === "queued" || task.status === "running")) {
+				publishTasks();
+			}
+		}, 30_000);
+		(backgroundHeartbeat as unknown as { unref?: () => void }).unref?.();
 	};
 
 	const rememberTask = (task: BackgroundTask, persist = true) => {
@@ -460,7 +476,7 @@ export default function harness(pi: ExtensionAPI) {
 	pi.registerCommand("pi-rewind", {
 		description: "Rewind inside the current session; cancel background work atomically",
 		handler: async (args, ctx) => {
-			const entryId = args.trim();
+			const [entryId, preStoppedCsv = ""] = args.trim().split(/\s+/, 2);
 			if (!entryId) return ctx.ui.notify("pi-rewind: missing entryId", "warning");
 			const target = ctx.sessionManager.getEntry(entryId)?.parentId ?? null;
 			if (!target) return ctx.ui.notify("pi-rewind: cannot navigate before the first entry", "warning");
@@ -475,7 +491,7 @@ export default function harness(pi: ExtensionAPI) {
 				.slice(0, 8);
 			let stopped: string[];
 			try {
-				stopped = await stopActiveTasks();
+				stopped = [...new Set([...preStoppedCsv.split(",").filter(Boolean), ...await stopActiveTasks()])];
 			} catch (error) {
 				ctx.ui.notify(`Rewind aborted: a background task could not be cancelled (${String(error)})`, "error");
 				return;
@@ -736,6 +752,7 @@ export default function harness(pi: ExtensionAPI) {
 			// A normal checkout has a .git directory; only linked worktrees need this boundary.
 		}
 		taskUi = ctx.ui;
+		startBackgroundHeartbeat();
 		const branch = ctx.sessionManager.getBranch();
 		const saved = [...branch].reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-app-workflow-state") as { data?: WorkflowState } | undefined;
 		if (saved?.data?.version === 3) state = normalizeWorkflowState(saved.data);
@@ -1211,6 +1228,8 @@ export default function harness(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		if (backgroundHeartbeat) clearInterval(backgroundHeartbeat);
+		backgroundHeartbeat = undefined;
 		ctx.ui.setStatus("pi-app-workflow", undefined);
 		for (const key of ["pi-app-workflow-state", "pi-app-background-state", "pi-app-checkpoint-state"]) ctx.ui.setWidget(key, undefined);
 		taskUi = undefined;

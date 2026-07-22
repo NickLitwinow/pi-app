@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { getBackend } from "../lib/backend";
-import type { AppThemePalette, ConfigFile, PiInfo, PiThemeInfo, SkillInfo } from "../lib/types";
+import type { AppIconStyle, AppThemePalette, ConfigFile, PiInfo, PiThemeInfo, SkillInfo } from "../lib/types";
 import { confirmDialog, messageDialog } from "../lib/dialog";
-import { applyAppThemePalette, applyAppearanceConfig, completePiThemeColors, paletteFromPiColors } from "../lib/theme";
+import { applyAppThemePalette, applyAppearanceConfig, completePiThemeColors, paletteFromPiColors, resolveAppIconStyle } from "../lib/theme";
 import { modelAliasKey } from "../lib/models";
 import { updateAppConfig, useStore } from "../state/store";
 import { ModelAvatarPicker } from "./AgentAvatar";
 import Marketplace, { type Recommended } from "./Marketplace";
 import { AppearanceIcon, CheckIcon, ErrorIcon, FolderIcon, RefreshIcon, SendIcon, UpdateIcon } from "./icons";
+import liquidGlassIcon from "../assets/app-icons/pi-liquid-glass.png";
+import auroraIcon from "../assets/app-icons/pi-aurora.png";
+import graphiteIcon from "../assets/app-icons/pi-graphite.png";
 
 type Tab = "general" | "extensions" | "skills" | "themes" | "prompts" | "mcp" | "models" | "proc" | "app";
 
@@ -1120,6 +1123,24 @@ const APPEARANCE_PRESETS: { id: AppearancePreset; label: string; color: string; 
   { id: "custom", label: "Custom color", color: "var(--brand)" },
 ];
 
+const APP_ICON_STYLE_OPTIONS: {
+  id: AppIconStyle;
+  label: string;
+  description: string;
+  image?: string;
+}[] = [
+  { id: "auto", label: "По теме", description: "Меняется вместе с основным пресетом" },
+  { id: "liquid-glass", label: "Liquid Glass", description: "Глубина и мягкая рефракция", image: liquidGlassIcon },
+  { id: "aurora", label: "Aurora", description: "Цветной системный акцент", image: auroraIcon },
+  { id: "graphite", label: "Graphite", description: "Спокойный монохром", image: graphiteIcon },
+];
+
+const APP_ICON_IMAGES = {
+  "liquid-glass": liquidGlassIcon,
+  aurora: auroraIcon,
+  graphite: graphiteIcon,
+} as const;
+
 function SegmentedControl<T extends string>({
   value,
   options,
@@ -1169,6 +1190,8 @@ function AppTab() {
   const appearancePreset = appConfig.appearancePreset ?? "chatgpt";
   const accentColor = appConfig.accentColor ?? "#8b5cf6";
   const iconColor = appConfig.iconColor ?? accentColor;
+  const appIconStyle = appConfig.appIconStyle ?? "auto";
+  const resolvedAutoIconStyle = resolveAppIconStyle({ ...appConfig, appIconStyle: "auto" });
   const setCustomAccent = (color: string) => void updateAppConfig({
     accentColor: color,
     appearancePreset: "custom",
@@ -1343,6 +1366,42 @@ function AppTab() {
               />
             </span>
             <code>{iconColor.toUpperCase()}</code>
+          </div>
+        </div>
+
+        <div className="app-icon-style-section">
+          <div className="app-icon-style-heading">
+            <div>
+              <strong>Стиль иконок</strong>
+              <span>Dock-иконка и glyphs интерфейса используют одну визуальную семью</span>
+            </div>
+            <span className="app-icon-style-badge">macOS 26/27</span>
+          </div>
+          <div className="app-icon-style-grid" role="group" aria-label="Стиль иконок приложения">
+            {APP_ICON_STYLE_OPTIONS.map((option) => {
+              const preview = option.image ?? APP_ICON_IMAGES[resolvedAutoIconStyle];
+              const active = appIconStyle === option.id;
+              return (
+                <button
+                  type="button"
+                  key={option.id}
+                  className={`app-icon-style-card ${active ? "active" : ""}`}
+                  aria-label={`Стиль иконок: ${option.label}`}
+                  aria-pressed={active}
+                  onClick={() => void updateAppConfig({ appIconStyle: option.id })}
+                >
+                  <span className="app-icon-preview-shell">
+                    <img src={preview} alt="" draggable={false} />
+                    {option.id === "auto" && <span className="app-icon-auto-mark">AUTO</span>}
+                  </span>
+                  <span className="app-icon-style-copy">
+                    <strong>{option.label}</strong>
+                    <small>{option.description}</small>
+                  </span>
+                  {active && <CheckIcon size={13} />}
+                </button>
+              );
+            })}
           </div>
         </div>
 

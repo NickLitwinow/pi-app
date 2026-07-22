@@ -25,6 +25,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fingerprintWorkspace, isWorkspacePath, parsePorcelainZ, rebaseWorktreePrompt } from "../../harness-extension/workspace";
 import { decorateTaskQueue } from "../../harness-extension/tasks";
+import { isSubagentSessionFile, normalizeGeneratedSessionName } from "../../harness-extension/session-name-utils";
 
 describe("harness verification policy", () => {
   it.each([
@@ -561,5 +562,18 @@ describe("verification result policy", () => {
 		expect(prompt).toContain("require-main guard");
 		expect(prompt).toContain("must not read process.argv or call process.exit");
 		expect(prompt).toContain("Never relabel a known violation");
+	});
+
+	it("normalizes generated session titles without leaking reasoning or wrappers", () => {
+		expect(normalizeGeneratedSessionName('<think>draft</think>\nНазвание сессии: "Исправить OAuth refresh."')).toBe("Исправить OAuth refresh");
+		expect(normalizeGeneratedSessionName("Title: Refactor authentication middleware\nExplanation: ignored")).toBe("Refactor authentication middleware");
+		expect(normalizeGeneratedSessionName("   ")).toBe("");
+		expect(normalizeGeneratedSessionName("Очень длинное название сессии для переработки механизма автоматического именования и нескольких лишних подробностей").length).toBeLessThanOrEqual(64);
+	});
+
+	it("never auto-names subagent session files", () => {
+		expect(isSubagentSessionFile("/Users/dev/.pi/agent/sessions/subagents/child/session.jsonl")).toBe(true);
+		expect(isSubagentSessionFile("C:\\Users\\dev\\.pi\\agent\\sessions\\subagents\\child.jsonl")).toBe(true);
+		expect(isSubagentSessionFile("/Users/dev/.pi/agent/sessions/project/session.jsonl")).toBe(false);
 	});
 });

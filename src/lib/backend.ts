@@ -395,8 +395,10 @@ class MockBackend implements Backend {
       case "resolve_pi":
         return { path: "/opt/homebrew/bin/pi", version: "0.80.3 (mock)", agentDir: "~/.pi/agent" } satisfies PiInfo as T;
       case "read_app_config":
-        return { editor: "code", processLimit: 2, processLimitAuto: true, agentSandboxMode: "workspace-write", idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, displayName: "Nikita", piRetryStallTimeoutMs: 0, modelAliases: { "ollama/qwen-local": "ThinkingCap 27B" }, modelAvatars: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: true } satisfies AppConfig as T;
+        return { editor: "code", processLimit: 2, processLimitAuto: true, agentSandboxMode: "workspace-write", idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, displayName: "Nikita", piRetryStallTimeoutMs: 0, modelAliases: { "ollama/qwen-local": "ThinkingCap 27B" }, modelAvatars: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appIconStyle: "auto", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: true } satisfies AppConfig as T;
       case "write_app_config":
+        return undefined as T;
+      case "set_app_icon":
         return undefined as T;
       case "read_avatar_data": {
         // Реальный бэкенд читает файл и отдаёт data-URL. В моке файловой системы
@@ -493,7 +495,7 @@ class MockBackend implements Backend {
               { type: "text", text: "Второй запрос с изображением" },
               { type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nUwAAAAASUVORK5CYII=", mimeType: "image/png" },
             ] } },
-            { type: "message", id: "rewind-a2", parentId: "rewind-u2", timestamp: now - 25_000, message: { role: "assistant", content: [{ type: "text", text: "Второй ответ будет оставлен в abandoned branch." }], model: "qwen-local", provider: "ollama" } },
+            { type: "message", id: "rewind-a2", parentId: "rewind-u2", timestamp: now - 25_000, message: { role: "assistant", content: [{ type: "text", text: "Второй ответ будет оставлен в abandoned branch." }], model: "qwen-local", provider: "ollama", run: { id: "rewind-run-2", durationMs: 5_000, toolCallIds: [], checkpoint: "abc1234" } } },
           ] as T;
         }
         // как реальный pi 0.80.x: assistant несёт provider/model, у финального
@@ -915,6 +917,8 @@ class MockBackend implements Backend {
         ].join("\n") as T;
       case "git_checkout_file":
       case "git_restore_run_files":
+      case "git_restore_checkpoint":
+      case "confirm_app_exit":
       case "open_in_editor":
       case "reveal_in_finder":
       case "open_external":

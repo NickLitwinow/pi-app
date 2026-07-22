@@ -5,6 +5,7 @@ import { pluralRu } from "../lib/i18n";
 import { stripAnsi } from "../lib/markdown";
 import { modelAliasKey, modelIdDisplayName } from "../lib/models";
 import { contentText } from "../lib/reducer";
+import { checkpointForUserTurn } from "../lib/rewind";
 import { parseSequentialThought, type SequentialThought } from "../lib/sequential-thinking";
 import {
   formatRunDuration,
@@ -471,6 +472,13 @@ function UserMessageActions({
           const laterUserTurns = userTurns.slice(userIndex + 1);
           const laterTurns = laterUserTurns.length;
           const currentItemIndex = allItems.findIndex((item) => item.msg === msg);
+          const fileCheckpoint = checkpointForUserTurn(allItems, currentItemIndex);
+          let fileDiff = "";
+          if (fileCheckpoint) {
+            const backend = await getBackend();
+            fileDiff = await backend.invoke<string>("git_review_diff", { cwd, base: fileCheckpoint });
+          }
+          const hasFileChanges = fileDiff.trim().length > 0;
           const abandonedItems = currentItemIndex >= 0 ? allItems.slice(currentItemIndex + 1) : [];
           const assistantTurns = abandonedItems.filter((item) => item.msg.role === "assistant").length;
           const toolCalls = abandonedItems.reduce((count, item) => count + (
@@ -490,17 +498,21 @@ function UserMessageActions({
             `Текст и вложения (${imageCount}) вернутся в composer.`,
             activeTasks > 0 ? `Фоновые задачи будут транзакционно остановлены: ${activeTasks}.` : "Активных фоновых задач нет.",
             busy ? "Текущий ход модели будет остановлен перед rewind." : "Текущий ход модели уже завершён.",
-            "Изменения файлов в workspace сохранятся; изменится только активная ветка этой сессии.",
+            hasFileChanges
+              ? "У вас остались незакоммиченные изменения относительно выбранного сообщения. Они будут потеряны. Продолжить?"
+              : fileCheckpoint
+                ? "Файлы уже совпадают с checkpoint выбранного сообщения."
+                : "Для этого старого сообщения файловый checkpoint недоступен; изменится только conversation branch.",
             "",
             `Запрос: ${text.slice(0, 500)}`,
           ].join("\n");
           const confirmed = await confirmDialog(preview, {
             title: "Rewind preview",
             kind: "warning",
-            okLabel: "Отменить и изменить",
-            cancelLabel: "Оставить как есть",
+            okLabel: hasFileChanges ? "Да" : "Отменить и изменить",
+            cancelLabel: hasFileChanges ? "Нет" : "Оставить как есть",
           });
-          if (confirmed) await rewindToMessage(cwd, userIndex, msg);
+          if (confirmed) await rewindToMessage(cwd, userIndex, msg, { fileCheckpoint, confirmedFileChanges: hasFileChanges });
         })}
       >
         <RewindIcon size={12} />
