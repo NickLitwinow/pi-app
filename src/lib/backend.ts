@@ -395,7 +395,7 @@ class MockBackend implements Backend {
       case "resolve_pi":
         return { path: "/opt/homebrew/bin/pi", version: "0.80.3 (mock)", agentDir: "~/.pi/agent" } satisfies PiInfo as T;
       case "read_app_config":
-        return { editor: "code", processLimit: 2, processLimitAuto: true, agentSandboxMode: "workspace-write", idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, displayName: "Nikita", piRetryStallTimeoutMs: 0, modelAliases: { "ollama/qwen-local": "ThinkingCap 27B" }, modelAvatars: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appIconStyle: "auto", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: true } satisfies AppConfig as T;
+        return { editor: "code", processLimit: 2, processLimitAuto: true, agentSandboxMode: "workspace-write", idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, displayName: "Nikita", piRetryStallTimeoutMs: 0, modelAliases: { "ollama/qwen-local": "ThinkingCap 27B" }, modelAvatars: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appIconBackground: "#171A24", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: true } satisfies AppConfig as T;
       case "write_app_config":
         return undefined as T;
       case "set_app_icon":

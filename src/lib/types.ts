@@ -410,8 +410,8 @@ export interface AppConfig {
   accentColor?: string;
   /** Optional icon accent for the Custom appearance preset. */
   iconColor?: string;
-  /** App/Dock icon plus the matching global interface-glyph treatment. */
-  appIconStyle?: AppIconStyle;
+  /** Background color of the minimalist App/Dock icon. */
+  appIconBackground?: string;
   /** Visual surface preset. Does not affect the runtime model/provider. */
   appearancePreset?: "chatgpt" | "claude" | "gemini" | "custom";
   visualEffects?: boolean;
@@ -425,8 +425,6 @@ export interface AppConfig {
   /** Visual identity keyed by the stable provider/model-id pair. */
   modelAvatars?: Record<string, ModelAvatarConfig>;
 }
-
-export type AppIconStyle = "auto" | "liquid-glass" | "aurora" | "graphite";
 
 export interface ModelAvatarConfig {
   kind?: "preset" | "path";

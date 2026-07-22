@@ -15,6 +15,32 @@ where
         .unwrap_or_else(|| "workspace-write".into()))
 }
 
+const DEFAULT_APP_ICON_BACKGROUND: &str = "#171A24";
+
+fn normalize_app_icon_background(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" | "liquid-glass" => DEFAULT_APP_ICON_BACKGROUND.into(),
+        "aurora" => "#4057E8".into(),
+        "graphite" => "#34363D".into(),
+        _ if raw.len() == 7
+            && raw.starts_with('#')
+            && raw.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit) =>
+        {
+            raw.to_ascii_uppercase()
+        }
+        _ => DEFAULT_APP_ICON_BACKGROUND.into(),
+    }
+}
+
+fn deserialize_app_icon_background<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(normalize_app_icon_background(&String::deserialize(
+        deserializer,
+    )?))
+}
+
 // ---------- pi config files (settings.json / models.json / mcp.json) ----------
 
 fn pi_config_path(name: &str) -> Result<PathBuf, String> {
@@ -164,8 +190,12 @@ pub struct AppConfig {
     pub model_aliases: HashMap<String, String>,
     pub accent_color: String,
     pub icon_color: String,
-    /// Bundle/Dock icon family and the matching interface-glyph treatment.
-    pub app_icon_style: String,
+    /// Background color of the minimalist Bundle/Dock icon.
+    #[serde(
+        alias = "appIconStyle",
+        deserialize_with = "deserialize_app_icon_background"
+    )]
+    pub app_icon_background: String,
     /// UI surface preset; independent from runtime model/provider selection.
     pub appearance_preset: String,
     pub visual_effects: bool,
@@ -214,7 +244,7 @@ impl Default for AppConfig {
             model_aliases: HashMap::new(),
             accent_color: "#8b5cf6".into(),
             icon_color: "#8b5cf6".into(),
-            app_icon_style: "auto".into(),
+            app_icon_background: DEFAULT_APP_ICON_BACKGROUND.into(),
             appearance_preset: "chatgpt".into(),
             visual_effects: true,
             interface_density: "comfortable".into(),
@@ -786,7 +816,7 @@ mod tests {
         assert!(c.model_aliases.is_empty());
         assert!(c.model_avatars.is_empty());
         assert_eq!(c.accent_color, "#8b5cf6");
-        assert_eq!(c.app_icon_style, "auto");
+        assert_eq!(c.app_icon_background, DEFAULT_APP_ICON_BACKGROUND);
         assert_eq!(c.appearance_preset, "chatgpt");
         assert!(c.visual_effects);
         assert_eq!(c.interface_density, "comfortable");
@@ -804,8 +834,19 @@ mod tests {
         assert!(c.model_aliases.is_empty());
         assert!(c.model_avatars.is_empty());
         assert_eq!(c.appearance_preset, "chatgpt");
-        assert_eq!(c.app_icon_style, "auto");
+        assert_eq!(c.app_icon_background, DEFAULT_APP_ICON_BACKGROUND);
         assert_eq!(c.transcript_mode, "normal");
+    }
+
+    #[test]
+    fn app_config_migrates_legacy_icon_families_to_background_colors() {
+        let aurora: AppConfig = serde_json::from_str(r#"{"appIconStyle":"aurora"}"#).unwrap();
+        let graphite: AppConfig = serde_json::from_str(r#"{"appIconStyle":"graphite"}"#).unwrap();
+        let custom: AppConfig =
+            serde_json::from_str(r##"{"appIconBackground":"#4a62ff"}"##).unwrap();
+        assert_eq!(aurora.app_icon_background, "#4057E8");
+        assert_eq!(graphite.app_icon_background, "#34363D");
+        assert_eq!(custom.app_icon_background, "#4A62FF");
     }
 
     #[test]

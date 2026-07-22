@@ -1,17 +1,27 @@
-import type { AppConfig, AppIconStyle, AppThemePalette } from "./types";
+import type { AppConfig, AppThemePalette } from "./types";
 
-export type ResolvedAppIconStyle = Exclude<AppIconStyle, "auto">;
+export const DEFAULT_APP_ICON_BACKGROUND = "#171A24";
 
-/**
- * "Auto" keeps the app icon and interface glyphs in the same visual family as
- * the selected main appearance. Explicit choices remain stable across themes.
- */
-export function resolveAppIconStyle(config: Pick<AppConfig, "appIconStyle" | "appearancePreset">): ResolvedAppIconStyle {
-  const selected = config.appIconStyle ?? "auto";
-  if (["liquid-glass", "aurora", "graphite"].includes(selected)) return selected as ResolvedAppIconStyle;
-  if (config.appearancePreset === "gemini") return "aurora";
-  if (config.appearancePreset === "claude") return "graphite";
-  return "liquid-glass";
+const LEGACY_APP_ICON_BACKGROUNDS: Record<string, string> = {
+  auto: DEFAULT_APP_ICON_BACKGROUND,
+  "liquid-glass": DEFAULT_APP_ICON_BACKGROUND,
+  aurora: "#4057E8",
+  graphite: "#34363D",
+};
+
+/** Normalizes persisted and legacy values to the only format sent to native code. */
+export function resolveAppIconBackground(config: Pick<AppConfig, "appIconBackground"> & { appIconStyle?: string }): string {
+  const raw = String(config.appIconBackground ?? config.appIconStyle ?? DEFAULT_APP_ICON_BACKGROUND).trim();
+  const migrated = LEGACY_APP_ICON_BACKGROUNDS[raw.toLowerCase()] ?? raw;
+  return /^#[0-9a-f]{6}$/i.test(migrated) ? migrated.toUpperCase() : DEFAULT_APP_ICON_BACKGROUND;
+}
+
+export function appIconForeground(background: string): "#FFFFFF" | "#17191F" {
+  const value = resolveAppIconBackground({ appIconBackground: background }).slice(1);
+  const [red, green, blue] = [0, 2, 4].map((offset) => Number.parseInt(value.slice(offset, offset + 2), 16) / 255);
+  const linear = (channel: number) => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+  const luminance = 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue);
+  return luminance > 0.48 ? "#17191F" : "#FFFFFF";
 }
 
 export const PI_THEME_TOKENS = [
@@ -101,5 +111,5 @@ export function applyAppearanceConfig(config: AppConfig): void {
   }
   const effectiveAccent = preset === "custom" && config.customTheme ? config.customTheme.accent : accent;
   root.style.setProperty("--icon-accent", preset === "custom" ? config.iconColor || effectiveAccent : effectiveAccent);
-  root.dataset.iconStyle = resolveAppIconStyle(config);
+  root.dataset.appIconBackground = resolveAppIconBackground(config);
 }

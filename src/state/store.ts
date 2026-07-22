@@ -187,7 +187,7 @@ export const useStore = create<Store>((set) => ({
   ready: false,
   isMock: false,
   piInfo: null,
-  appConfig: { editor: "code", processLimit: 2, processLimitAuto: true, agentSandboxMode: "workspace-write", idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, modelAliases: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appIconStyle: "auto", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: false, modelAvatars: {} },
+  appConfig: { editor: "code", processLimit: 2, processLimitAuto: true, agentSandboxMode: "workspace-write", idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, modelAliases: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appIconBackground: "#171A24", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: false, modelAvatars: {} },
   projects: [],
   extraWorkspaces: [],
   currentCwd: null,

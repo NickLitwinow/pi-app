@@ -1,16 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { getBackend } from "../lib/backend";
-import type { AppIconStyle, AppThemePalette, ConfigFile, PiInfo, PiThemeInfo, SkillInfo } from "../lib/types";
+import type { AppThemePalette, ConfigFile, PiInfo, PiThemeInfo, SkillInfo } from "../lib/types";
 import { confirmDialog, messageDialog } from "../lib/dialog";
-import { applyAppThemePalette, applyAppearanceConfig, completePiThemeColors, paletteFromPiColors, resolveAppIconStyle } from "../lib/theme";
+import { appIconForeground, applyAppThemePalette, applyAppearanceConfig, completePiThemeColors, paletteFromPiColors, resolveAppIconBackground } from "../lib/theme";
 import { modelAliasKey } from "../lib/models";
 import { updateAppConfig, useStore } from "../state/store";
 import { ModelAvatarPicker } from "./AgentAvatar";
 import Marketplace, { type Recommended } from "./Marketplace";
 import { AppearanceIcon, CheckIcon, ErrorIcon, FolderIcon, RefreshIcon, SendIcon, UpdateIcon } from "./icons";
-import liquidGlassIcon from "../assets/app-icons/pi-liquid-glass.png";
-import auroraIcon from "../assets/app-icons/pi-aurora.png";
-import graphiteIcon from "../assets/app-icons/pi-graphite.png";
 
 type Tab = "general" | "extensions" | "skills" | "themes" | "prompts" | "mcp" | "models" | "proc" | "app";
 
@@ -1123,25 +1120,30 @@ const APPEARANCE_PRESETS: { id: AppearancePreset; label: string; color: string; 
   { id: "custom", label: "Custom color", color: "var(--brand)" },
 ];
 
-const APP_ICON_STYLE_OPTIONS: {
-  id: AppIconStyle;
+const APP_ICON_BACKGROUND_OPTIONS: {
+  id: string;
   label: string;
-  description: string;
-  image?: string;
+  color: string;
 }[] = [
-  { id: "auto", label: "По теме", description: "Автоматически подбирается под пресет интерфейса" },
-  { id: "liquid-glass", label: "Liquid Glass", description: "Тёмное стекло и мягкая рефракция", image: liquidGlassIcon },
-  { id: "aurora", label: "Aurora", description: "Чистый сине-пурпурный градиент", image: auroraIcon },
-  { id: "graphite", label: "Graphite", description: "Матовый нейтральный графит", image: graphiteIcon },
+  { id: "midnight", label: "Midnight", color: "#171A24" },
+  { id: "violet", label: "Violet", color: "#654FE8" },
+  { id: "cobalt", label: "Cobalt", color: "#2563D9" },
+  { id: "paper", label: "Paper", color: "#EEEAE0" },
 ];
 
-type AppIconApplyStatus = { state: "applying" | "applied" | "error"; style: string; message?: string };
+type AppIconApplyStatus = { state: "applying" | "applied" | "error"; background: string; message?: string };
 
-const APP_ICON_IMAGES = {
-  "liquid-glass": liquidGlassIcon,
-  aurora: auroraIcon,
-  graphite: graphiteIcon,
-} as const;
+function MinimalAppIcon({ background }: { background: string }) {
+  const foreground = appIconForeground(background);
+  return (
+    <svg viewBox="0 0 64 64" aria-hidden="true">
+      <rect x="5" y="5" width="54" height="54" rx="13" fill={background} />
+      <path d="M5 5h54v15C47 12 32 9 18 11 12 12 8 14 5 16V5Z" fill="#fff" opacity=".075" />
+      <rect x="18" y="22" width="28" height="6" rx="3" fill={foreground} />
+      <path d="M22 27h5v15c0 2-1 3.5-2.5 3.5S22 44 22 42V27Zm15 0h5v15c0 2-1 3.5-2.5 3.5S37 44 37 42V27Z" fill={foreground} />
+    </svg>
+  );
+}
 
 function SegmentedControl<T extends string>({
   value,
@@ -1192,8 +1194,7 @@ function AppTab() {
   const appearancePreset = appConfig.appearancePreset ?? "chatgpt";
   const accentColor = appConfig.accentColor ?? "#8b5cf6";
   const iconColor = appConfig.iconColor ?? accentColor;
-  const appIconStyle = appConfig.appIconStyle ?? "auto";
-  const resolvedAutoIconStyle = resolveAppIconStyle({ ...appConfig, appIconStyle: "auto" });
+  const appIconBackground = resolveAppIconBackground(appConfig);
   const [appIconApplyStatus, setAppIconApplyStatus] = useState<AppIconApplyStatus | null>(null);
   useEffect(() => {
     const onStatus = (event: Event) => setAppIconApplyStatus((event as CustomEvent<AppIconApplyStatus>).detail);
@@ -1380,36 +1381,50 @@ function AppTab() {
         <div className="app-icon-style-section">
           <div className="app-icon-style-heading">
             <div>
-              <strong>Стиль иконок</strong>
-              <span>Dock-иконка и glyphs интерфейса используют одну визуальную семью</span>
+              <strong>Фон иконки приложения</strong>
+              <span>Минималистичный знак остаётся неизменным — выберите только фон</span>
             </div>
             <span className="app-icon-style-badge">Системный размер</span>
           </div>
-          <div className="app-icon-style-grid" role="group" aria-label="Стиль иконок приложения">
-            {APP_ICON_STYLE_OPTIONS.map((option) => {
-              const preview = option.image ?? APP_ICON_IMAGES[resolvedAutoIconStyle];
-              const active = appIconStyle === option.id;
+          <div className="app-icon-style-grid" role="group" aria-label="Фон иконки приложения">
+            {APP_ICON_BACKGROUND_OPTIONS.map((option) => {
+              const active = appIconBackground === option.color;
               return (
                 <button
                   type="button"
                   key={option.id}
                   className={`app-icon-style-card ${active ? "active" : ""}`}
-                  aria-label={`Стиль иконок: ${option.label}`}
+                  aria-label={`Фон иконки: ${option.label}`}
                   aria-pressed={active}
-                  onClick={() => void updateAppConfig({ appIconStyle: option.id })}
+                  onClick={() => void updateAppConfig({ appIconBackground: option.color })}
                 >
                   <span className="app-icon-preview-shell">
-                    <img src={preview} alt="" draggable={false} />
-                    {option.id === "auto" && <span className="app-icon-auto-mark">AUTO</span>}
+                    <MinimalAppIcon background={option.color} />
                   </span>
                   <span className="app-icon-style-copy">
                     <strong>{option.label}</strong>
-                    <small>{option.description}</small>
+                    <small>{option.color}</small>
                   </span>
                   {active && <CheckIcon size={13} />}
                 </button>
               );
             })}
+          </div>
+          <div className="app-icon-custom-row">
+            <div>
+              <strong>Свой цвет</strong>
+              <span>Поддерживается любой фон; цвет знака подбирается по контрасту</span>
+            </div>
+            <label className="app-icon-color-picker" style={{ "--picker-color": appIconBackground } as CSSProperties}>
+              <input
+                type="color"
+                value={appIconBackground}
+                aria-label="Выбрать фон иконки приложения"
+                onChange={(event) => void updateAppConfig({ appIconBackground: event.target.value.toUpperCase() })}
+              />
+              <span aria-hidden="true" />
+              <code>{appIconBackground}</code>
+            </label>
           </div>
           <div className={`app-icon-apply-status ${appIconApplyStatus?.state ?? "idle"}`} role="status" aria-live="polite">
             <span aria-hidden="true" />

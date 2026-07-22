@@ -58,25 +58,24 @@ test("Settings / Interface — Custom keeps button and icon colors independent",
   await expectNoHorizontalOverflow(page);
 });
 
-test("Settings / Interface — app icon family follows the main theme or stays explicit", async ({ page }) => {
+test("Settings / Interface — minimalist app icon background is independent and customizable", async ({ page }) => {
   await boot(page);
   await page.getByRole("button", { name: "Настройки" }).click();
   await page.getByRole("button", { name: /^Интерфейс/ }).click();
-  const iconStyles = page.getByRole("group", { name: "Стиль иконок приложения" });
-  await iconStyles.scrollIntoViewIfNeeded();
-  await expect(iconStyles).toBeVisible();
-  await expect(page.locator("html")).toHaveAttribute("data-icon-style", "liquid-glass");
+  const iconBackgrounds = page.getByRole("group", { name: "Фон иконки приложения" });
+  await iconBackgrounds.scrollIntoViewIfNeeded();
+  await expect(iconBackgrounds).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-app-icon-background", "#171A24");
 
+  await page.getByRole("button", { name: "Фон иконки: Cobalt" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-app-icon-background", "#2563D9");
   await page.getByRole("button", { name: "Gemini" }).click();
-  await expect(page.locator("html")).toHaveAttribute("data-icon-style", "aurora");
-  await page.getByRole("button", { name: "Стиль иконок: Graphite" }).click();
-  await expect(page.locator("html")).toHaveAttribute("data-icon-style", "graphite");
-  await page.getByRole("button", { name: "ChatGPT" }).click();
-  await expect(page.locator("html")).toHaveAttribute("data-icon-style", "graphite");
-  await page.getByRole("button", { name: "Стиль иконок: По теме" }).click();
-  await expect(page.locator("html")).toHaveAttribute("data-icon-style", "liquid-glass");
+  await expect(page.locator("html")).toHaveAttribute("data-app-icon-background", "#2563D9");
+
+  await page.getByLabel("Выбрать фон иконки приложения").fill("#f3f1ea");
+  await expect(page.locator("html")).toHaveAttribute("data-app-icon-background", "#F3F1EA");
   await expectNoHorizontalOverflow(page);
-  await expect(iconStyles).toHaveScreenshot("settings-icon-styles.png");
+  await expect(page.locator(".app-icon-style-section")).toHaveScreenshot("settings-icon-styles.png");
 });
 
 test("Library / Extensions — long scoped package and responsive actions", async ({ page }) => {
@@ -251,12 +250,16 @@ test("Workflow control center — plan, tasks, timeline and gates", async ({ pag
   await expect(dock.getByText("Live context", { exact: true })).toBeVisible();
   await expect(dock.getByText("Checkpoint", { exact: false }).first()).toBeVisible();
   await expect(dock.getByText("Compaction", { exact: false }).first()).toBeVisible();
+  // Context and task snapshots intentionally exercise the permission gate.
+  // Wait here so earlier snapshots retain their expected stream position.
+  const blockPermission = page.getByRole("button", { name: "Заблокировать" });
+  await expect(blockPermission).toBeVisible();
   await expect(page).toHaveScreenshot("workflow-context-control-center.png", { fullPage: true });
   await dock.getByRole("button", { name: /Tasks/ }).click();
   await expect(dock.getByText("Review rewind transaction", { exact: true })).toBeVisible();
   await expectNoHorizontalOverflow(page);
   await expect(page).toHaveScreenshot("workflow-control-center.png", { fullPage: true });
-  await page.getByRole("button", { name: "Заблокировать" }).click();
+  await blockPermission.click();
 });
 
 test("Same-session rewind restores text and image, then resends without creating a session", async ({ page }) => {

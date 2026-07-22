@@ -1,19 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { resolveAppIconStyle } from "./theme";
+import { appIconForeground, DEFAULT_APP_ICON_BACKGROUND, resolveAppIconBackground } from "./theme";
 
-describe("resolveAppIconStyle", () => {
-  it("maps the main appearance to a matching icon family in auto mode", () => {
-    expect(resolveAppIconStyle({ appIconStyle: "auto", appearancePreset: "chatgpt" })).toBe("liquid-glass");
-    expect(resolveAppIconStyle({ appIconStyle: "auto", appearancePreset: "gemini" })).toBe("aurora");
-    expect(resolveAppIconStyle({ appIconStyle: "auto", appearancePreset: "claude" })).toBe("graphite");
+describe("app icon colors", () => {
+  it("normalizes custom colors independently from the interface theme", () => {
+    expect(resolveAppIconBackground({ appIconBackground: "#4a62ff" })).toBe("#4A62FF");
+    expect(resolveAppIconBackground({ appIconBackground: "invalid" })).toBe(DEFAULT_APP_ICON_BACKGROUND);
   });
 
-  it("keeps an explicit icon family independent from the main appearance", () => {
-    expect(resolveAppIconStyle({ appIconStyle: "graphite", appearancePreset: "gemini" })).toBe("graphite");
-    expect(resolveAppIconStyle({ appIconStyle: "aurora", appearancePreset: "claude" })).toBe("aurora");
+  it("migrates every legacy icon family", () => {
+    expect(resolveAppIconBackground({ appIconStyle: "auto" })).toBe(DEFAULT_APP_ICON_BACKGROUND);
+    expect(resolveAppIconBackground({ appIconStyle: "liquid-glass" })).toBe(DEFAULT_APP_ICON_BACKGROUND);
+    expect(resolveAppIconBackground({ appIconStyle: "aurora" })).toBe("#4057E8");
+    expect(resolveAppIconBackground({ appIconStyle: "graphite" })).toBe("#34363D");
   });
 
-  it("falls back safely when an old or hand-edited config contains an unknown value", () => {
-    expect(resolveAppIconStyle({ appIconStyle: "future" as never, appearancePreset: "gemini" })).toBe("aurora");
+  it("uses a contrasting glyph on both dark and light backgrounds", () => {
+    expect(appIconForeground("#171A24")).toBe("#FFFFFF");
+    expect(appIconForeground("#F3F1EA")).toBe("#17191F");
   });
 });

@@ -1,22 +1,13 @@
-# Pi App icon families
+# Pi App icon
 
-Production masters are 1024×1024 PNGs with transparent corners:
+`pi-minimal.svg` is the editable 1024×1024 master. The generated bundle raster
+lives at `src-tauri/icons/icon.png`. The visible squircle is 860 px wide,
+matching the optical footprint of current macOS application icons.
 
-- `pi-liquid-glass.svg` / `.png` — bundle default; dark glass with restrained violet/cyan refraction.
-- `pi-aurora.svg` / `.png` — high-color blue, cyan and magenta alternate appearance.
-- `pi-graphite.svg` / `.png` — matte monochrome alternate appearance.
+The icon has one stable, deliberately minimal π mark. Settings → Interface
+persists any `#RRGGBB` value as `appIconBackground`; the native macOS command
+rebuilds the SVG with that background and picks a contrasting light or dark
+glyph before calling `NSApplication.setApplicationIconImage`.
 
-The SVG files are the editable masters. PNG files are rendered at 1024×1024 for
-the runtime switcher. The visible squircle is 860 px wide inside the canvas,
-matching the optical footprint of current macOS application icons instead of
-filling the entire bitmap.
-
-The Settings → Interface selector persists `appIconStyle`. On macOS it updates
-the live Dock icon through `NSApplication.setApplicationIconImage`; the same
-resolved family is exposed as `html[data-icon-style]` for interface glyphs.
-`auto` maps the main appearance preset to a family.
-
-The flattened images were generated from the previous π-shaped identity with
-the built-in image generation workflow, normalized to 1024×1024, and checked
-at 32px. `src-tauri/icons/icon.svg` is the scalable Liquid Glass companion;
-`src-tauri/icons/icon.icns` and `icon.png` are the current bundle artifacts.
+Legacy `appIconStyle` values are migrated to equivalent background colors.
+The Dock background is independent from the application theme and UI glyphs.

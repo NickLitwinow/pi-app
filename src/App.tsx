@@ -5,7 +5,7 @@ import { useT } from "./lib/i18n";
 import { notifyOS } from "./lib/notify";
 import { stripAnsi } from "./lib/markdown";
 import type { AppUpdateInfo } from "./lib/types";
-import { applyAppearanceConfig, resolveAppIconStyle } from "./lib/theme";
+import { applyAppearanceConfig, resolveAppIconBackground } from "./lib/theme";
 import { contentText } from "./lib/reducer";
 import { splitTrailingTurnTiming } from "./lib/turn-timing";
 import { closeCurrentSession, initApp, newSession, selectWorkspace, updateAppConfig, useStore } from "./state/store";
@@ -29,7 +29,7 @@ export default function App() {
   const uiScale = useStore((s) => s.appConfig.uiScale);
   const accentColor = useStore((s) => s.appConfig.accentColor ?? "#8b5cf6");
   const iconColor = useStore((s) => s.appConfig.iconColor ?? s.appConfig.accentColor ?? "#8b5cf6");
-  const appIconStyle = useStore((s) => s.appConfig.appIconStyle ?? "auto");
+  const appIconBackground = useStore((s) => resolveAppIconBackground(s.appConfig));
   const appearancePreset = useStore((s) => s.appConfig.appearancePreset ?? "chatgpt");
   const visualEffects = useStore((s) => s.appConfig.visualEffects !== false);
   const interfaceDensity = useStore((s) => s.appConfig.interfaceDensity ?? "comfortable");
@@ -196,27 +196,27 @@ export default function App() {
     el.dataset.preset = appearancePreset;
     el.dataset.effects = visualEffects ? "on" : "off";
     el.dataset.density = interfaceDensity;
-    applyAppearanceConfig({ ...useStore.getState().appConfig, appearancePreset, accentColor, iconColor, appIconStyle, customTheme });
-  }, [accentColor, iconColor, appIconStyle, appearancePreset, visualEffects, interfaceDensity, customTheme]);
+    applyAppearanceConfig({ ...useStore.getState().appConfig, appearancePreset, accentColor, iconColor, appIconBackground, customTheme });
+  }, [accentColor, iconColor, appIconBackground, appearancePreset, visualEffects, interfaceDensity, customTheme]);
 
   useEffect(() => {
     if (!ready) return;
-    const style = resolveAppIconStyle({ appIconStyle, appearancePreset });
+    const background = resolveAppIconBackground({ appIconBackground });
     let cancelled = false;
-    const publish = (detail: { state: "applying" | "applied" | "error"; style: string; message?: string }) => {
+    const publish = (detail: { state: "applying" | "applied" | "error"; background: string; message?: string }) => {
       if (!cancelled) window.dispatchEvent(new CustomEvent("pi:app-icon-status", { detail }));
     };
-    publish({ state: "applying", style });
+    publish({ state: "applying", background });
     void getBackend()
-      .then((be) => be.invoke("set_app_icon", { style }))
-      .then(() => publish({ state: "applied", style }))
+      .then((be) => be.invoke("set_app_icon", { background }))
+      .then(() => publish({ state: "applied", background }))
       .catch((error: unknown) => publish({
         state: "error",
-        style,
+        background,
         message: error instanceof Error ? error.message : "Не удалось обновить иконку Dock",
       }));
     return () => { cancelled = true; };
-  }, [ready, appIconStyle, appearancePreset]);
+  }, [ready, appIconBackground]);
 
   useEffect(() => {
     if (!visualEffects || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;

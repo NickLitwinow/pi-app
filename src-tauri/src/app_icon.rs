@@ -1,18 +1,49 @@
-const LIQUID_GLASS: &[u8] = include_bytes!("../../src/assets/app-icons/pi-liquid-glass.png");
-const AURORA: &[u8] = include_bytes!("../../src/assets/app-icons/pi-aurora.png");
-const GRAPHITE: &[u8] = include_bytes!("../../src/assets/app-icons/pi-graphite.png");
+const ICON_SVG_TEMPLATE: &str = include_str!("../../src/assets/app-icons/pi-minimal.svg");
 
-fn icon_bytes(style: &str) -> Result<&'static [u8], String> {
-    match style {
-        "liquid-glass" => Ok(LIQUID_GLASS),
-        "aurora" => Ok(AURORA),
-        "graphite" => Ok(GRAPHITE),
-        _ => Err(format!("неизвестный стиль иконки: {style}")),
+fn normalize_background(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.len() == 7
+        && value.starts_with('#')
+        && value.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+    {
+        Ok(value.to_ascii_uppercase())
+    } else {
+        Err("фон иконки должен быть цветом в формате #RRGGBB".into())
     }
 }
 
+fn foreground_for(background: &str) -> &'static str {
+    let channel = |offset: usize| {
+        let value =
+            u8::from_str_radix(&background[offset..offset + 2], 16).unwrap_or(0) as f64 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
+    if luminance > 0.48 {
+        "#17191F"
+    } else {
+        "#FFFFFF"
+    }
+}
+
+fn icon_svg(background: &str) -> Result<Vec<u8>, String> {
+    let background = normalize_background(background)?;
+    Ok(ICON_SVG_TEMPLATE
+        .replacen("fill=\"#171A24\"", &format!("fill=\"{background}\""), 1)
+        .replacen(
+            "<g fill=\"#FFF\">",
+            &format!("<g fill=\"{}\">", foreground_for(&background)),
+            1,
+        )
+        .into_bytes())
+}
+
 #[cfg(target_os = "macos")]
-fn apply_macos_icon(bytes: &'static [u8]) -> Result<(), String> {
+fn apply_macos_icon(bytes: &[u8]) -> Result<(), String> {
     use objc2::{AllocAnyThread, MainThreadMarker};
     use objc2_app_kit::{NSApplication, NSImage};
     use objc2_foundation::NSData;
@@ -22,22 +53,22 @@ fn apply_macos_icon(bytes: &'static [u8]) -> Result<(), String> {
     let app = NSApplication::sharedApplication(marker);
     let data = NSData::with_bytes(bytes);
     let image = NSImage::initWithData(NSImage::alloc(), &data)
-        .ok_or_else(|| "macOS не смогла декодировать PNG иконки".to_string())?;
+        .ok_or_else(|| "macOS не смогла декодировать SVG иконки".to_string())?;
     unsafe { app.setApplicationIconImage(Some(&image)) };
     Ok(())
 }
 
-/// Applies an alternate Dock icon immediately on macOS. The persisted config
-/// invokes this again at startup, while the bundle default stays Liquid Glass.
+/// Rebuilds the minimalist Dock icon with a user-selected background. The
+/// persisted color is applied again at startup; the bundle uses the default.
 #[tauri::command]
-pub async fn set_app_icon(app: tauri::AppHandle, style: String) -> Result<(), String> {
-    let bytes = icon_bytes(&style)?;
+pub async fn set_app_icon(app: tauri::AppHandle, background: String) -> Result<(), String> {
+    let bytes = icon_svg(&background)?;
 
     #[cfg(target_os = "macos")]
     {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         app.run_on_main_thread(move || {
-            let _ = sender.send(apply_macos_icon(bytes));
+            let _ = sender.send(apply_macos_icon(&bytes));
         })
         .map_err(|error| error.to_string())?;
         return receiver
@@ -58,21 +89,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embeds_every_supported_icon_style() {
-        let styles = ["liquid-glass", "aurora", "graphite"];
-        for style in styles {
-            let bytes = icon_bytes(style).unwrap();
-            assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
-            assert!(bytes.len() > 100_000);
-        }
-        assert_ne!(
-            icon_bytes(styles[0]).unwrap(),
-            icon_bytes(styles[1]).unwrap()
-        );
-        assert_ne!(
-            icon_bytes(styles[1]).unwrap(),
-            icon_bytes(styles[2]).unwrap()
-        );
-        assert!(icon_bytes("unknown").is_err());
+    fn renders_arbitrary_safe_backgrounds() {
+        let dark = String::from_utf8(icon_svg("#171A24").unwrap()).unwrap();
+        let custom = String::from_utf8(icon_svg("#4a62ff").unwrap()).unwrap();
+        assert!(dark.contains("fill=\"#171A24\""));
+        assert!(dark.contains("fill=\"#FFFFFF\""));
+        assert!(custom.contains("fill=\"#4A62FF\""));
+        assert_ne!(dark, custom);
+    }
+
+    #[test]
+    fn uses_dark_glyph_on_light_background_and_rejects_injection() {
+        let light = String::from_utf8(icon_svg("#F3F1EA").unwrap()).unwrap();
+        assert!(light.contains("fill=\"#17191F\""));
+        assert!(icon_svg("red").is_err());
+        assert!(icon_svg("#fff\"/><script>").is_err());
     }
 }
