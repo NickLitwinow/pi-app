@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "build:icon": "node scripts/generate-app-icons.mjs",
     "build": "tsc --noEmit && vite build",
     "perf:smoke": "node scripts/perf-smoke.mjs",
     "preview": "vite preview",

@@ -66,6 +66,10 @@ test("Settings / Interface — minimalist app icon background is independent and
   await iconBackgrounds.scrollIntoViewIfNeeded();
   await expect(iconBackgrounds).toBeVisible();
   await expect(page.locator("html")).toHaveAttribute("data-app-icon-background", "#171A24");
+  const previewTile = iconBackgrounds.locator("[data-app-icon-tile]").first();
+  await expect(previewTile).toHaveAttribute("x", "6.25");
+  await expect(previewTile).toHaveAttribute("width", "51.5");
+  await expect(previewTile).toHaveAttribute("rx", "11.56");
 
   await page.getByRole("button", { name: "Фон иконки: Cobalt" }).click();
   await expect(page.locator("html")).toHaveAttribute("data-app-icon-background", "#2563D9");

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { getBackend } from "../lib/backend";
 import type { AppThemePalette, ConfigFile, PiInfo, PiThemeInfo } from "../lib/types";
 import { confirmDialog, messageDialog } from "../lib/dialog";
@@ -1140,10 +1140,20 @@ type AppIconApplyStatus = { state: "applying" | "applied" | "error"; background:
 
 function MinimalAppIcon({ background }: { background: string }) {
   const foreground = appIconForeground(background);
+  const clipId = `app-icon-${useId().replaceAll(":", "")}`;
   return (
-    <svg viewBox="0 0 64 64" aria-hidden="true">
-      <rect x="5" y="5" width="54" height="54" rx="13" fill={background} />
-      <path d="M5 5h54v15C47 12 32 9 18 11 12 12 8 14 5 16V5Z" fill="#fff" opacity=".075" />
+    <svg viewBox="0 0 64 64" aria-hidden="true" data-app-icon-preview>
+      <defs>
+        <clipPath id={clipId}>
+          <rect x="6.25" y="6.25" width="51.5" height="51.5" rx="11.56" />
+        </clipPath>
+      </defs>
+      <rect data-app-icon-tile x="6.25" y="6.25" width="51.5" height="51.5" rx="11.56" fill={background} />
+      <g clipPath={`url(#${clipId})`}>
+        <path d="M6.25 6.25h51.5v13.63C46.75 12.31 32.63 9.13 18.19 10.44c-4.94.44-8.88 1.75-11.94 3.43V6.25Z" fill="#fff" opacity=".075" />
+        <path d="M6.25 46.56c10.63 5.88 22.5 7.75 34.56 5.5 7.13-1.31 12.69-3.75 16.94-7v12.69H6.25V46.56Z" fill="#000" opacity=".12" />
+      </g>
+      <rect x="6.34" y="6.34" width="51.32" height="51.32" rx="11.47" fill="none" stroke="#fff" strokeWidth=".19" opacity=".18" />
       <rect x="18" y="22" width="28" height="6" rx="3" fill={foreground} />
       <path d="M22 27h5v15c0 2-1 3.5-2.5 3.5S22 44 22 42V27Zm15 0h5v15c0 2-1 3.5-2.5 3.5S37 44 37 42V27Z" fill={foreground} />
     </svg>

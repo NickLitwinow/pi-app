@@ -156,6 +156,7 @@ export function effectiveThinking(ws: WorkspaceChat, defaults: PiDefaults): stri
 
 interface Store {
   ready: boolean;
+  appConfigLoaded: boolean;
   isMock: boolean;
   piInfo: PiInfo | null;
   appConfig: AppConfig;
@@ -185,6 +186,7 @@ interface Store {
 
 export const useStore = create<Store>((set) => ({
   ready: false,
+  appConfigLoaded: false,
   isMock: false,
   piInfo: null,
   appConfig: { editor: "code", processLimit: 2, processLimitAuto: true, agentSandboxMode: "workspace-write", idleKillSecs: 900, previewIdleKillSecs: 600, theme: "system", uiScale: 1, modelAliases: {}, accentColor: "#8b5cf6", iconColor: "#8b5cf6", appIconBackground: "#171A24", appearancePreset: "chatgpt", visualEffects: true, interfaceDensity: "comfortable", transcriptMode: "normal", sendKeyBehavior: "enter", libraryOnboardingSeen: false, modelAvatars: {} },
@@ -551,6 +553,7 @@ export async function initApp(): Promise<void> {
   const currentCwd = projects[0]?.cwd ?? null;
   useStore.setState({
     appConfig: appConfig ?? useStore.getState().appConfig,
+    appConfigLoaded: true,
     projects,
     currentCwd,
     sessionFlags: normalizeFlags(rawFlags),

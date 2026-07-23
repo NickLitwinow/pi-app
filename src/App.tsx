@@ -24,6 +24,7 @@ function toggleSidebar() {
 
 export default function App() {
   const ready = useStore((s) => s.ready);
+  const appConfigLoaded = useStore((s) => s.appConfigLoaded);
   const view = useStore((s) => s.view);
   const theme = useStore((s) => s.appConfig.theme);
   const uiScale = useStore((s) => s.appConfig.uiScale);
@@ -200,7 +201,7 @@ export default function App() {
   }, [accentColor, iconColor, appIconBackground, appearancePreset, visualEffects, interfaceDensity, customTheme]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || !appConfigLoaded) return;
     const background = resolveAppIconBackground({ appIconBackground });
     let cancelled = false;
     const publish = (detail: { state: "applying" | "applied" | "error"; background: string; message?: string }) => {
@@ -216,7 +217,7 @@ export default function App() {
         message: error instanceof Error ? error.message : "Не удалось обновить иконку Dock",
       }));
     return () => { cancelled = true; };
-  }, [ready, appIconBackground]);
+  }, [ready, appConfigLoaded, appIconBackground]);
 
   useEffect(() => {
     if (!visualEffects || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
