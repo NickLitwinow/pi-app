@@ -19,6 +19,7 @@ import {
   createWorkflowState,
   loadVerifierManifest,
   normalizeWorkflowState,
+  reconcileWorkflowIntent,
   readySteps,
   resetWorkflowStep,
   startForegroundWorkflowStep,
@@ -197,6 +198,27 @@ describe("workflow classification", () => {
     expect(migration.profile).toBe("bug");
   });
 
+  it("does not mistake a debugging-oriented feature or an explicit no-preview contract for a bug", () => {
+    const prompt = [
+      "Build a complete self-contained procedural dungeon game in one HTML file.",
+      "Include a God Mode for debugging and demonstration.",
+      "The UI uses a visual cyber-grid theme and a canvas.",
+      "You may not have access to a browser, dev server, or vision tools — do not rely on running or visually inspecting the game.",
+    ].join("\n");
+    const intent = inferTaskIntent(prompt);
+    expect(intent.primary).toBe("build");
+    expect(intent.profile).toBe("feature");
+    expect(intent.needsPreview).toBe(false);
+    expect(intent.signals).toContain("preview-denied");
+    expect(createWorkflowState(prompt, 100).steps.map((step) => step.id)).toEqual([
+      "plan",
+      "build",
+      "verify",
+      "evaluate",
+      "review",
+    ]);
+  });
+
   it("does not treat production-ready quality as a live production hotfix", () => {
     const intent = inferTaskIntent(
       "Доведи до production-ready мигратор конфигурации v1→v2. Исправь найденный дефект и проверь проект.",
@@ -287,6 +309,50 @@ describe("persisted workflow contract", () => {
     const restored = normalizeWorkflowState(legacy);
     expect(restored.status).toBe("active");
     expect(restored.steps.every((step) => step.owner && step.maxAttempts > 0)).toBe(true);
+  });
+
+  it("migrates an already persisted misclassified bug workflow using the full original prompt", () => {
+    const truncated = "Build a visual dungeon UI with a God Mode for debugging and demonstration.";
+    let legacy = createWorkflowState(truncated, 400, "bug");
+    legacy = updateWorkflowStep(legacy, "reproduce", "passed", "scope understood", 410);
+    legacy = updateWorkflowStep(legacy, "build", "passed", "single HTML built", 420);
+    const original = `${truncated}\nYou may not have access to a browser or vision tools. Do not rely on visually inspecting the game.`;
+    const restored = reconcileWorkflowIntent(legacy, original, 430);
+    expect(restored.profile).toBe("feature");
+    expect(restored.intent.needsPreview).toBe(false);
+    expect(restored.steps.map((step) => step.id)).toEqual(["plan", "build", "verify", "evaluate", "review"]);
+    expect(restored.steps.find((step) => step.id === "plan")).toMatchObject({ status: "passed", attempts: 0 });
+    expect(restored.steps.find((step) => step.id === "build")).toMatchObject({ status: "passed", attempts: 0 });
+    expect(restored.events.at(-1)?.message).toContain("bug → feature");
+  });
+
+  it("reconciles a manual profile override without losing semantic intent axes", () => {
+    const initial = createWorkflowState("The settings panel needs a timezone selector.", 500);
+    const semanticIntent = {
+      ...initial.intent,
+      primary: "build" as const,
+      profile: "feature" as const,
+      allowsMutation: true,
+      needsPreview: true,
+      requiresPlan: true,
+      requiresEvaluator: true,
+      signals: [...initial.intent.signals, "manual-reclassification"],
+    };
+    const restored = reconcileWorkflowIntent(initial, initial.objective, 510, "feature", semanticIntent);
+    expect(restored).toMatchObject({
+      profile: "feature",
+      intent: { profile: "feature", allowsMutation: true, needsPreview: true },
+    });
+    expect(restored.steps.map((step) => step.id)).toEqual(["plan", "build", "preview", "verify", "evaluate", "review"]);
+
+    const hotfix = reconcileWorkflowIntent(restored, restored.objective, 520, "hotfix", {
+      ...semanticIntent,
+      profile: "hotfix",
+      risk: "high",
+      requiresHumanApproval: true,
+    });
+    expect(hotfix).toMatchObject({ profile: "hotfix", approved: false, status: "active" });
+    expect(hotfix.steps.find((step) => step.id === "approve")?.status).toBe("waiting");
   });
 
   it("loads an explicit verifier manifest and expands the gate", () => {
@@ -428,7 +494,7 @@ describe("persisted workflow contract", () => {
       status: "skipped",
       required: true,
     });
-    expect(state.steps.find((step) => step.id === "evaluate")?.deps).toEqual(["build"]);
+    expect(state.steps.find((step) => step.id === "evaluate")?.deps).toEqual(["preview"]);
     expect(readySteps(state).map((step) => step.id)).toEqual(["plan"]);
   });
 });

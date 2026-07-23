@@ -65,6 +65,10 @@ function run(id, command, args) {
 if (!evidenceOnly) {
 	run("unit", "npm", ["test"]);
 	run("web-build", "npm", ["run", "build"]);
+	run("workflow-router-contract", process.execPath, [join(benchDir, "workflow-router-bench.mjs")]);
+	if (process.env.PI_APP_VERIFY_ROUTER_RUNTIME === "1") {
+		run("workflow-router-runtime", process.execPath, [join(benchDir, "workflow-router-runtime-smoke.mjs")]);
+	}
 	run("visual", "npm", ["run", "test:visual"]);
 	if (!skipRust) {
 		run("rust-format", "cargo", ["fmt", "--manifest-path", "src-tauri/Cargo.toml", "--check"]);

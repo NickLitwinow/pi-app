@@ -58,7 +58,15 @@ function gitHead(directory) {
 	try { return execFileSync("git", ["-C", directory, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(); } catch { return null; }
 }
 
-const harnessFiles = ["index.ts", "policy.ts", "workflow.ts", "workspace.ts", "tasks.ts"];
+const harnessFiles = [
+	"index.ts",
+	"policy.ts",
+	"semantic-router.ts",
+	"semantic-router-policy.ts",
+	"workflow.ts",
+	"workspace.ts",
+	"tasks.ts",
+];
 function currentHarnessHash(joined) {
 	const values = harnessFiles.map((file) => readOptional(join(repoRoot, "harness-extension", file)));
 	return hashText(joined ? values.join("\n---\n") : values.join(""));
@@ -178,6 +186,7 @@ function workflowBenchmarkStage(id, args, options) {
 const quickStages = [
 	{ id: "unit", command: "npm", args: ["test"], cwd: repoRoot },
 	{ id: "web-build", command: "npm", args: ["run", "build"], cwd: repoRoot },
+	nodeStage("workflow-router-contract", "workflow-router-bench.mjs"),
 	{ id: "visual", command: "npm", args: ["run", "test:visual"], cwd: repoRoot },
 	{ id: "rust-format", command: "cargo", args: ["fmt", "--manifest-path", "src-tauri/Cargo.toml", "--check"], cwd: repoRoot },
 	{ id: "rust-tests", command: "cargo", args: ["test", "--manifest-path", "src-tauri/Cargo.toml"], cwd: repoRoot },
@@ -192,6 +201,9 @@ const quickStages = [
 	nodeStage("workflow-resume", "workflow-resume-smoke.mjs"),
 	nodeStage("workflow-workspace-scope", "workflow-workspace-scope-smoke.mjs"),
 ];
+if (process.env.PI_APP_VERIFY_ROUTER_RUNTIME === "1") {
+	quickStages.splice(3, 0, nodeStage("workflow-router-runtime", "workflow-router-runtime-smoke.mjs"));
+}
 const rewindSource = newestUsableSession(join(sourceAgentRoot, "sessions"));
 quickStages.push(rewindSource
 	? nodeStage("same-session-rewind", "rewind-smoke.mjs", [rewindSource])

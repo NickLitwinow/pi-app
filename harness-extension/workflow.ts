@@ -79,6 +79,7 @@ export type VerifierManifest = {
 };
 
 type StepTemplate = Omit<WorkflowStep, "status" | "attempts">;
+const MAX_OBJECTIVE_CHARS = 20_000;
 
 const STEP_RUNTIME: Record<WorkflowStepKind, Pick<WorkflowStep, "owner" | "maxAttempts">> = {
 	plan: { owner: "orchestrator", maxAttempts: 2 },
@@ -162,12 +163,81 @@ export function normalizeWorkflowState(state: WorkflowState): WorkflowState {
 	};
 }
 
+/**
+ * Re-evaluate legacy workflow routing against the complete originating prompt.
+ * This repairs already-persisted runs after classifier fixes without losing
+ * completed build/gate evidence or creating a second session.
+ */
+export function reconcileWorkflowIntent(
+	state: WorkflowState,
+	prompt = state.objective,
+	now = Date.now(),
+	profileOverride?: WorkflowProfile,
+	intentOverride?: TaskIntent,
+): WorkflowState {
+	const current = normalizeWorkflowState(state);
+	const baseIntent = intentOverride ?? inferTaskIntent(prompt);
+	const inferred = profileOverride ? { ...baseIntent, profile: profileOverride } : baseIntent;
+	const target = createWorkflowState(prompt, current.createdAt, profileOverride, inferred);
+	const graphChanged = current.profile !== inferred.profile
+		|| current.intent.needsPreview !== inferred.needsPreview;
+	if (!graphChanged) {
+		return normalizeWorkflowState({
+			...current,
+			objective: target.objective,
+			intent: inferred,
+		});
+	}
+
+	const sourceFor = (step: WorkflowStep): WorkflowStep | undefined =>
+		current.steps.find((candidate) => candidate.id === step.id)
+		?? (step.kind === "plan" ? current.steps.find((candidate) => candidate.kind === "plan") : undefined);
+	const steps = target.steps.map((step) => {
+		const source = sourceFor(step);
+		if (!source) return step;
+		return {
+			...step,
+			status: source.status,
+			attempts: source.attempts,
+			detail: source.detail,
+			failureReason: source.failureReason,
+			startedAt: source.startedAt,
+			completedAt: source.completedAt,
+		};
+	});
+	const migrated: WorkflowState = {
+		...current,
+		objective: target.objective,
+		intent: inferred,
+		profile: inferred.profile,
+		approved: inferred.requiresHumanApproval
+			? current.intent.requiresHumanApproval
+				? current.approved
+				: false
+			: true,
+		updatedAt: now,
+		steps,
+		events: [...current.events, {
+			id: eventId(),
+			type: "note" as const,
+			at: now,
+			message: `Workflow routing corrected: ${current.profile} → ${inferred.profile}; preview ${inferred.needsPreview ? "required" : "not required"}.`,
+		}].slice(-160),
+	};
+	return normalizeWorkflowState(migrated);
+}
+
 function eventId(): string {
 	return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export function createWorkflowState(prompt: string, now = Date.now(), profileOverride?: WorkflowProfile): WorkflowState {
-	const inferred = inferTaskIntent(prompt);
+export function createWorkflowState(
+	prompt: string,
+	now = Date.now(),
+	profileOverride?: WorkflowProfile,
+	intentOverride?: TaskIntent,
+): WorkflowState {
+	const inferred = intentOverride ?? inferTaskIntent(prompt);
 	const intent = profileOverride ? { ...inferred, profile: profileOverride } : inferred;
 	const approved = !intent.requiresHumanApproval;
 	let steps: WorkflowStep[] = PROFILE_STEPS[intent.profile].map((step) => ({
@@ -204,7 +274,7 @@ export function createWorkflowState(prompt: string, now = Date.now(), profileOve
 		runId: `wf-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
 		createdAt: now,
 		updatedAt: now,
-		objective: prompt.trim().slice(0, 2_000),
+		objective: prompt.trim().slice(0, MAX_OBJECTIVE_CHARS),
 		intent,
 		profile: intent.profile,
 		...lifecycle(steps),

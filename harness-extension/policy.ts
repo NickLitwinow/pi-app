@@ -135,32 +135,65 @@ export type TaskIntent = {
 	signals: string[];
 };
 
-const RESEARCH = /(найди в (?:интернете|сети)|погугли|доресерч|актуальн\w*\s+(?:данн|верси)|latest|search the web|research\b|best[- ]practice)/i;
+const RESEARCH = /(найди в (?:интернете|сети)|погугли|доресерч|актуальн\w*\s+(?:данн|верси)|latest|current[^.\n]{0,100}(?:documentation|docs|guidance|standards?|spec(?:ification)?|version|limits)|compare[^.\n]{0,100}(?:official\s+)?(?:documentation|docs|guidance|standards?|spec(?:ification)?)|search the web|research\b|best[- ]practice)/i;
+const EXTERNAL_SOURCE_CUE = /(?:\b(?:online|internet|web sources?|official\s+(?:rfc|spec(?:ification)?|standard|source|documentation|docs)|current\s+rfc|latest\s+rfc|up[- ]to[- ]date)\b|официальн\w*\s+(?:rfc|спецификац|стандарт|источник)|в\s+интернете|в\s+сети)/i;
 const ASSESS = /(ознакомься|проанализир|аудит|ревью|объясни|почему|диагностир|inspect|audit|review|explain|diagnos|верифицир)/i;
-const MUTATE = /(исправ|реализуй|реализовать|реализир|внеси|измени|переработ|почин|рефактор|мигрир|передел|добавь|создай|переимен|удал|замени|настрой|обнови|fix|implement|change|build|refactor|redesign|migrate|add\b|create\b|update\b|rename\b|remove\b|delete\b)/i;
-const DEBUG = /(баг|ошибк|краш|падает|не\s+работает|слома|дефект|регресс|почин|исправ|bug|crash|broken|debug|regression|fix\b)/i;
+const IMPLICIT_REQUEST = /(?:\b(?:please|needs?|should|must|required?|would\s+be\s+useful|can\s+we\s+have|could\s+you|can\s+you)\b|(?:нужен|нужна|нужно|должен|должна|должно|стоит\s+сделать)(?=\s|[.,!?]|$))/i;
+const MUTATE_ACTION = /(?:^|[\n.;!?]\s*|\b(?:please|then|and|also|now)\s+)(?:fix|implement|change|build|refactor|redesign|migrate|add|create|update|rename|remove|delete|drop|repair|write|edit|modify|upgrade|format|revert|rollback|commit|push|merge|ship|deploy|rotate|make)\b|\b(?:task|goal|request)\s+(?:is\s+)?(?:for\s+you\s+)?(?:to\s+)?(?:fix|implement|change|build|refactor|redesign|migrate|add|create|update|rename|remove|delete|drop|repair|write|edit|modify|upgrade|format)\b|\bcontinue\s+(?:implementing|building|editing|fixing|working)\b|исправ|реализуй|реализовать|реализир|внеси|измени|переработ|почин|рефактор|мигрир|передел|добавь|создай|переимен|удал|замени|настрой|обнови|сделай|задеплой/i;
+const REPAIR_ACTION = /(?:^|[\n.;!?]\s*|\b(?:please|then|and|also|now)\s+)(?:fix|repair|correct|debug|resolve)\b|\b(?:find|diagnose|identify)[^.\n]{0,100}\b(?:and\s+)?(?:fix|repair|correct|resolve)\b|исправ|почин|устрани\s+(?:ошиб|баг|дефект)/i;
+const NEW_CAPABILITY = /(?:^|[\n.;!?]\s*|\b(?:please|then|and|also|now)\s+)(?:create|build|implement|add)\s+(?:(?:a|an|the)\s+)?(?:new\s+)?(?:capability|feature|application|app|game|dashboard|panel|screen|component|command|cli|api|endpoint|service|module|format|export|integration|authentication|login|website|site|tool)\b|создай|реализуй\s+нов|добавь\s+нов/i;
+const DEBUG = /(баг|ошибк|краш|падает|не\s+работает|слома|дефект|регресс|почин|исправ|\b(?:bug|crash|broken|debug|regression|fix)\b)/i;
 const BUILD_SCOPE = /(миграц|миграт|переработ|рефактор|redesign|migrat|refactor|архитектур|workflow|воркфлоу)/i;
-const HOTFIX = /(hotfix|аварийн|инцидент|production|продакшн|security incident|уязвим)/i;
-const HIGH_RISK = /(production|продакшн|deploy|релиз|миграц\w*\s+(?:данн|баз)|drop\s+(?:table|database)|delete\s+(?:data|database|account)|удал\w*\s+(?:данн|баз|аккаунт)|платеж|billing|секрет|credential|security incident|уязвим|destructive)/i;
-const APPROVAL_REQUIRED = /(production|продакшн|deploy|релиз|drop\s+(?:table|database)|delete\s+(?:data|database|account)|удал\w*\s+(?:данн|баз|аккаунт)|rotate\s+(?:secret|credential)|ротац\w*\s+(?:секрет|ключ)|платеж|billing|security incident)/i;
+const HOTFIX = /(?:\b(?:production|live)\b[^.\n]{0,100}\b(?:down|outage|failing|corrupt|incident|breach)\b|\b(?:urgent|emergency|contain(?:ment)?)\b[^.\n]{0,100}\b(?:hotfix|rollback|fix)\b|\b(?:apply|ship|deploy)\b[^.\n]{0,80}\bhotfix\b|security incident|активн\w*\s+уязвим|авар(?:ия|ийн)\w*|инцидент\w*\s+(?:в\s+)?продакшн)/i;
+const HIGH_RISK = /(production|продакшн|deploy|релиз|\blive\s+(?:release|service|system|site)\b|миграц\w*\s+(?:данн|баз)|drop[^.\n]{0,40}\b(?:table|database)|delete\s+(?:data|database|account)|удал\w*\s+(?:данн|баз|аккаунт)|платеж|billing|секрет|credential|security incident|уязвим|destructive)/i;
+const APPROVAL_REQUIRED = /(deploy|задеплой|drop[^.\n]{0,40}\b(?:table|database)|delete\s+(?:data|database|account)|удал\w*\s+(?:данн|баз|аккаунт)|rotate\s+(?:secret|credential)|ротац\w*\s+(?:секрет|ключ)|платеж|billing|security incident)/i;
+const EXTERNAL_ACTION_DENIAL = /(?:\b(?:do not|don't|must not|nothing\s+should|without)\s+(?:be\s+)?(?:deploy|publish|push|drop|delete|rotate)|не\s+(?:деплой|публикуй|пуш|удаляй|ротируй))/i;
+const DELIVERY_CONTEXT = /\bshould\s+be\s+(?:deployed|published|pushed|merged)\b/i;
 const CHORE = /(chore|dependency|dependencies|зависимост|конфиг|config|format|lint|rename|переимен)/i;
-const DELETE_EXPLICIT = /\b(?:delete|remove)\b|удал\w*|убер(?:и|ите)\b/i;
+const MAINTENANCE = /(?:^|[\n.;!?]\s*|\b(?:please|then|and|also|now)\s+)(?:upgrade\s+(?:the\s+)?(?:dependency|dependencies|package)|rename\b|refactor\b|format\b|update\s+(?:the\s+)?(?:lockfile|readme|documentation|docs|config(?:uration)?|snapshots?)|add\s+(?:contract|regression|unit|integration|snapshot)\s+tests?\b|delete\s+(?:the\s+)?obsolete\b|drop[^.\n]{0,40}\b(?:table|database)\b|revert\b|rollback\b|commit\b|push\b|merge\b|deploy\b|ship\b|publish\b|create\s+(?:a\s+)?pull request\b)|\bupdate\b[^.\n]{0,70}\b(?:lockfile|readme|documentation|docs|config(?:uration)?|snapshots?)\b|\bwithout\s+changing\s+(?:its\s+)?behavio(?:u)?r\b|обнови\s+(?:зависимост|конфиг|документац)|переимен|рефактор|отформат|сделай\s+коммит|запуш/i;
+const MAINTENANCE_CONTEXT = /(?:\b(?:package-lock|lockfile|readme|snapshot files?|lint warnings?|repository formatter|internal helper name|pull request|test registry|dependency update|review findings?)\b|(?:typescript|eslint|vite|build)\s+config(?:uration)?\b|\bwithout\s+changing\s+(?:the\s+)?public\s+api\b|обновлени\w*\s+зависимост|линт(?:ер)?\w*\s+предупрежден)/i;
+const BUG_REPORT = /(?:\b(?:throws?\s+(?:an?\s+)?(?:type)?error|crashes?|fails?|hangs?|drops?|loses?|duplicates?|corrupts?|leaks?)\b|\b(?:is|are)\s+(?:broken|invisible|missing|stale|wrong|incorrect|unresponsive)\b|падает|выбрасывает\s+ошибк|теряет|дублирует|повреждает|не\s+виден|устарел)/i;
+const INFORMATIONAL_QUESTION = /^(?!(?:can\s+we\s+have|can\s+you|could\s+you|would\s+you)\b)(?:what|why|how|where|which|who|is|are|does|do|did|can|could|would|should|may|might|was|were)\b|^(?:почему|как|что|где|какие?|может\s+ли|можно\s+ли|является\s+ли)(?=\s|[.,!?]|$)/i;
+const HISTORICAL_CONTEXT = /^(?:yesterday|last\s+(?:week|month|year)|previously|earlier|we\s+already|вчера|раньше|на\s+прошлой\s+неделе|мы\s+уже)\b/i;
+const DELETE_EXPLICIT = /\b(?:delete|remove|drop)\b|удал\w*|убер(?:и|ите)\b/i;
 const DELETE_DENIAL = /\b(?:do not|don't|without)\s+(?:delete|remove)\b|не\s+(?:удал\w*|убира\w*)/i;
-const VISUAL_PREVIEW = /(?:\bui\b|\bux\b|frontend|front-end|live[- ]?preview|screenshot|responsive|visual regression|интерфейс|визуаль|в[её]рстк|превью|скриншот|адаптив|иконк|кнопк|топ[- ]?бар|панел)/i;
+const MUTATION_DENIAL = /(?:\bread[- ]only\b|(?:do not|don't|must not)[^.\n]{0,80}\b(?:modify|change|edit|write(?:\s+to)?|touch)\b[^.\n]{0,50}\b(?:files?|repository|repo|workspace|codebase)\b|\bwithout\s+(?:modifying|changing|editing|writing\s+to|touching)\s+(?:any\s+|the\s+)?(?:files?|repository|repo|workspace|codebase)|(?:explain|review|analy[sz]e|diagnose)\s+only\b|без\s+изменени\w*|ничего\s+не\s+меня[яй]|только\s+(?:объясни|проанализируй|проверь|диагностируй)|не\s+(?:изменяй|редактируй|трогай|записывай)[^.\n]{0,60}(?:файл|репозитор|код))/i;
+const VISUAL_PREVIEW = /(?:\bui\b|\bux\b|\bcanvas\b|\bhtml\b|\bvisual\b|\bwebsite\b|\b(?:documentation|docs|interactive)\s+site\b|\bweb\s+app\b|\bdashboard\b|\bpanel\b|\bscreen\b|\bbutton\b|\bbadge\b|\bcss\b|\bstyles?\b|browser[- ]?(?:game|app)|frontend|front-end|live[- ]?preview|screenshot|responsive|visual regression|интерфейс|визуаль|в[её]рстк|превью|скриншот|адаптив|иконк|кнопк|топ[- ]?бар|панел|браузерн\w*\s+(?:игр|прилож))/i;
+const PREVIEW_DENIAL = /(?:(?:may|might|will)\s+not\s+have\s+access\s+to[^.\n]{0,160}\b(?:browser|dev(?:elopment)?\s+server|vision tools?)\b|(?:do not|don't|must not|cannot|can't)\s+(?:rely\s+on\s+)?[^.\n]{0,140}\b(?:browser|dev(?:elopment)?\s+server|vision tools?|visually inspect(?:ing|ion)?)\b|(?:browser|dev(?:elopment)?\s+server|vision tools?|visual tools?)[^.\n]{0,60}\b(?:unavailable|not available|cannot be used)\b|(?:не\s+(?:используй|запускай|открывай|полагайся)|без)[^.\n]{0,140}(?:браузер|dev[- ]?server|vision|визуальн\w*\s+проверк))/i;
 
 export function inferTaskIntent(prompt: string): TaskIntent {
 	const text = prompt.trim();
+	// Quoted UI text, logs, examples, and code spans are data rather than
+	// authority to mutate or delete repository state.
+	const actionText = text
+		.replace(/`[^`]*`/gs, " ")
+		.replace(/“[^”]*”|«[^»]*»|"[^"]*"/gs, " ");
 	// Desired quality is not evidence of a live incident or deployment request.
-	const riskText = text.replace(/\bproduction[-\s]ready\b/gi, "");
-	const needsResearch = RESEARCH.test(text);
-	const asksAssessment = ASSESS.test(text);
-	const allowsMutation = MUTATE.test(text);
-	const allowsDeletion = allowsMutation && DELETE_EXPLICIT.test(text) && !DELETE_DENIAL.test(text);
-	const needsPreview = allowsMutation && VISUAL_PREVIEW.test(text);
-	const debugSignal = DEBUG.test(text);
+	const riskText = actionText.replace(/\bproduction[-\s]ready\b/gi, "");
+	const externalSourceCue = EXTERNAL_SOURCE_CUE.test(actionText);
+	const needsResearch = RESEARCH.test(actionText) || externalSourceCue;
+	const asksAssessment = ASSESS.test(actionText);
+	const implicitRequest = IMPLICIT_REQUEST.test(actionText);
+	const informationalQuestion = INFORMATIONAL_QUESTION.test(actionText.trim());
+	const historicalContext = HISTORICAL_CONTEXT.test(actionText.trim());
+	const approvalTrigger = APPROVAL_REQUIRED.test(riskText) && !EXTERNAL_ACTION_DENIAL.test(riskText);
+	const mutationDenied = MUTATION_DENIAL.test(actionText);
+	const mutationExplicit = MUTATE_ACTION.test(actionText);
+	const allowsMutation = mutationExplicit && !mutationDenied;
+	const allowsDeletion = allowsMutation && DELETE_EXPLICIT.test(actionText) && !DELETE_DENIAL.test(actionText);
+	const previewDenied = PREVIEW_DENIAL.test(text);
+	const visualContext = VISUAL_PREVIEW.test(text);
+	const needsPreview = allowsMutation && visualContext && !previewDenied;
+	const debugSignal = DEBUG.test(actionText);
+	const bugReportSignal = BUG_REPORT.test(actionText);
 	const hotfixSignal = HOTFIX.test(riskText);
 	const highRiskSignal = HIGH_RISK.test(riskText);
-	const buildScopeSignal = BUILD_SCOPE.test(text);
+	const buildScopeSignal = BUILD_SCOPE.test(actionText);
+	const maintenanceSignal = MAINTENANCE.test(actionText)
+		|| MAINTENANCE_CONTEXT.test(actionText)
+		|| (DELIVERY_CONTEXT.test(actionText) && !EXTERNAL_ACTION_DENIAL.test(actionText));
+	const repairSignal = allowsMutation && REPAIR_ACTION.test(actionText);
+	const newCapabilitySignal = allowsMutation && NEW_CAPABILITY.test(actionText);
 	const listItems = (text.match(/(^|\n)\s*(\d+[.)]|[-*•])\s+/g) ?? []).length;
 	const coupled = text.length >= 220 || listItems >= 2;
 
@@ -171,8 +204,10 @@ export function inferTaskIntent(prompt: string): TaskIntent {
 
 	let profile: WorkflowProfile;
 	if (hotfixSignal && allowsMutation) profile = "hotfix";
-	else if (debugSignal && allowsMutation) profile = "bug";
-	else if (allowsMutation && CHORE.test(text) && !coupled) profile = "chore";
+	else if (allowsMutation && maintenanceSignal) profile = "chore";
+	else if (newCapabilitySignal) profile = "feature";
+	else if (repairSignal) profile = "bug";
+	else if (allowsMutation && CHORE.test(actionText) && !coupled) profile = "chore";
 	else if (allowsMutation) profile = "feature";
 	else if (needsResearch) profile = "research";
 	else profile = "assessment";
@@ -180,15 +215,28 @@ export function inferTaskIntent(prompt: string): TaskIntent {
 	const risk: TaskRisk = highRiskSignal ? "high" : coupled || allowsMutation ? "medium" : "low";
 	const signals = [
 		needsResearch && "research",
+		externalSourceCue && "external-source-cue",
 		asksAssessment && "assessment",
+		implicitRequest && "implicit-request",
+		informationalQuestion && "informational-question",
+		historicalContext && "historical-context",
 		allowsMutation && "mutation",
+		mutationExplicit && "mutation-explicit",
+		mutationDenied && "mutation-denied",
 		allowsDeletion && "deletion-authorized",
 		debugSignal && "debug",
+		bugReportSignal && "bug-report",
+		repairSignal && "repair",
+		newCapabilitySignal && "new-capability",
 		hotfixSignal && "hotfix",
 		highRiskSignal && "high-risk",
+		approvalTrigger && "approval-trigger",
 		coupled && "coupled",
 		buildScopeSignal && "architectural",
+		maintenanceSignal && "maintenance",
+		visualContext && "visual-context",
 		needsPreview && "visual-preview",
+		previewDenied && "preview-denied",
 	].filter((value): value is string => Boolean(value));
 
 	return {
@@ -202,7 +250,7 @@ export function inferTaskIntent(prompt: string): TaskIntent {
 		requiresPlan: allowsMutation && (coupled || risk !== "low"),
 		requiresSandbox: allowsMutation && (coupled || risk === "high"),
 		requiresEvaluator: allowsMutation,
-		requiresHumanApproval: allowsMutation && (profile === "hotfix" || APPROVAL_REQUIRED.test(riskText)),
+		requiresHumanApproval: allowsMutation && (profile === "hotfix" || approvalTrigger),
 		signals,
 	};
 }

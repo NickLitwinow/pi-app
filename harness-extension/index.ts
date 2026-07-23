@@ -11,6 +11,9 @@
  *   PI_APP_HARNESS_MAX_LOOPS=4             bounded repair continuations (0..4)
  *   PI_APP_HARNESS_EVALUATOR_TIMEOUT_MS=1800000 local high-reasoning evaluator timeout
  *   PI_APP_HARNESS_WAIT_FOR_BACKGROUND=1 keep headless print-mode alive for workers
+ *   PI_APP_HARNESS_ROUTER=hybrid           hybrid | semantic | deterministic
+ *   PI_APP_HARNESS_ROUTER_MODEL=provider/model optional dedicated semantic model
+ *   PI_APP_HARNESS_ROUTER_TIMEOUT_MS=60000 semantic cold-start budget (5s..120s)
  *   PI_APP_HARNESS_ABLATIONS=a,b           classifier,repair-loop,semantic-gates,ponytail
  *   PI_APP_HARNESS_LOG=1                   append .pi/harness.log
  */
@@ -20,13 +23,14 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { buildIndependentEvaluatorPrompt, buildIndependentFalsifierPrompt, classifyPreviewBrowserEvidence, executionFailed, independentEvaluationAccepted, independentEvaluationRepairPrompt, parseBackgroundAgentId } from "./policy.js";
+import { buildIndependentEvaluatorPrompt, buildIndependentFalsifierPrompt, classifyPreviewBrowserEvidence, executionFailed, independentEvaluationAccepted, independentEvaluationRepairPrompt, inferTaskIntent, parseBackgroundAgentId } from "./policy.js";
 import {
 	attachVerifierSteps,
 	completeReadOnlyWorkflow,
 	createWorkflowState,
 	loadVerifierManifest,
 	normalizeWorkflowState,
+	reconcileWorkflowIntent,
 	readySteps,
 	resetWorkflowStep,
 	startForegroundWorkflowStep,
@@ -37,6 +41,7 @@ import {
 import { fingerprintWorkspace, isWorkspacePath, rebaseWorktreePrompt, stripGitPrefix, workspaceRelativePath } from "./workspace.js";
 import { decorateTaskQueue, type TaskPriority } from "./tasks.js";
 import { registerSessionAutoName } from "./auto-name.js";
+import { routeTaskIntent } from "./semantic-router.js";
 
 type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 type BackgroundTask = {
@@ -197,6 +202,21 @@ function sessionEntryPreview(entry: unknown): string | undefined {
 		? (block as Record<string, string>).text
 		: "").join(" ").replace(/\s+/g, " ").trim();
 	return text.slice(0, 240) || undefined;
+}
+
+function sessionEntryText(entry: unknown, maxLength = 20_000): string | undefined {
+	if (!entry || typeof entry !== "object") return undefined;
+	const message = (entry as Record<string, unknown>).message;
+	if (!message || typeof message !== "object") return undefined;
+	const content = (message as Record<string, unknown>).content;
+	const text = typeof content === "string"
+		? content
+		: Array.isArray(content)
+			? content.map((block) => block && typeof block === "object" && typeof (block as Record<string, unknown>).text === "string"
+				? (block as Record<string, string>).text
+				: "").join("\n")
+			: "";
+	return text.trim().slice(0, maxLength) || undefined;
 }
 
 function evaluatorPassed(result: string): boolean {
@@ -739,7 +759,7 @@ export default function harness(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("pi-workflow", {
-		description: "Workflow control: approve-plan | retry-gates",
+		description: "Workflow control: approve-plan | retry-gates | reclassify <profile>",
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase();
 			if (action === "approve-plan") {
@@ -785,7 +805,44 @@ export default function harness(pi: ExtensionAPI) {
 				await runDeterministicGates();
 				return;
 			}
-			ctx.ui.notify("Usage: /pi-workflow approve-plan | retry-gates", "warning");
+			const reclassify = /^reclassify\s+(feature|bug|chore|hotfix|research|assessment)$/.exec(action);
+			if (reclassify) {
+				if (!hasWorkflow) {
+					ctx.ui.notify("There is no active workflow to reclassify", "warning");
+					return;
+				}
+				const profile = reclassify[1] as WorkflowState["profile"];
+				const allowsMutation = ["feature", "bug", "chore", "hotfix"].includes(profile);
+				const intent = {
+					...state.intent,
+					primary: profile === "bug"
+						? "debug" as const
+						: allowsMutation
+							? "build" as const
+							: profile === "research"
+								? "research" as const
+								: "assessment" as const,
+					profile,
+					risk: profile === "hotfix" ? "high" as const : state.intent.risk,
+					needsResearch: profile === "research" || state.intent.needsResearch,
+					needsPreview: allowsMutation
+						&& state.intent.signals.includes("visual-context")
+						&& !state.intent.signals.includes("preview-denied"),
+					allowsMutation,
+					allowsDeletion: allowsMutation && state.intent.allowsDeletion,
+					requiresPlan: allowsMutation,
+					requiresSandbox: allowsMutation && (profile === "hotfix" || state.intent.requiresSandbox),
+					requiresEvaluator: allowsMutation,
+					requiresHumanApproval: profile === "hotfix" || (allowsMutation && state.intent.requiresHumanApproval),
+					signals: [...new Set([...state.intent.signals, "manual-reclassification", `manual:${profile}`])],
+				};
+				state = reconcileWorkflowIntent(state, state.objective, Date.now(), profile, intent);
+				if (state.intent.allowsMutation) state = attachVerifierSteps(state, loadVerifierManifest(activeCwd));
+				publishState();
+				ctx.ui.notify(`Workflow reclassified as ${profile}`, "info");
+				return;
+			}
+			ctx.ui.notify("Usage: /pi-workflow approve-plan | retry-gates | reclassify <feature|bug|chore|hotfix|research|assessment>", "warning");
 		},
 	});
 
@@ -984,7 +1041,14 @@ export default function harness(pi: ExtensionAPI) {
 			&& (entry.customType === "pi-app-workflow-state" || entry.customType === "pi-app-workflow-cleared")) as { customType?: string; data?: WorkflowState } | undefined;
 		if (saved?.customType === "pi-app-workflow-state" && saved.data?.version === 3) {
 			state = normalizeWorkflowState(saved.data);
-			if (state.intent.allowsMutation) state = attachVerifierSteps(state, loadVerifierManifest(activeCwd));
+			const manifest = loadVerifierManifest(activeCwd);
+			const objectivePrefix = state.objective.trim();
+			const originalPrompt = [...branch].reverse()
+				.filter((entry) => entry.type === "message" && (entry as { message?: { role?: string } }).message?.role === "user")
+				.map((entry) => sessionEntryText(entry))
+				.find((text): text is string => Boolean(text && objectivePrefix && text.startsWith(objectivePrefix)));
+			state = reconcileWorkflowIntent(state, originalPrompt ?? state.objective, Date.now(), manifest.profile);
+			if (state.intent.allowsMutation) state = attachVerifierSteps(state, manifest);
 			hasWorkflow = true;
 		} else {
 			hasWorkflow = false;
@@ -1069,14 +1133,11 @@ export default function harness(pi: ExtensionAPI) {
 		if (!resumes) {
 			const classifierAblated = ABLATIONS.has("classifier");
 			const routingPrompt = classifierAblated ? "Implement the requested repository change with verification." : prompt;
-			state = createWorkflowState(routingPrompt);
-			if (classifierAblated) state.objective = prompt.slice(0, 2_000);
-			if (state.intent.allowsMutation) {
-				const manifest = loadVerifierManifest(ctx.cwd);
-				state = createWorkflowState(routingPrompt, Date.now(), manifest.profile);
-				if (classifierAblated) state.objective = prompt.slice(0, 2_000);
-				state = attachVerifierSteps(state, manifest);
-			}
+			const intent = classifierAblated ? inferTaskIntent(routingPrompt) : await routeTaskIntent(prompt, ctx);
+			const manifest = loadVerifierManifest(ctx.cwd);
+			state = createWorkflowState(routingPrompt, Date.now(), manifest.profile, intent);
+			if (classifierAblated) state.objective = prompt.slice(0, 20_000);
+			if (state.intent.allowsMutation) state = attachVerifierSteps(state, manifest);
 			const baseline = await workspaceSnapshot();
 			state.baseRevision = baseline.head || undefined;
 			workspaceBaselineFingerprint = baseline.fingerprint;
