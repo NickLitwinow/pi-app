@@ -4,6 +4,7 @@ import { activeBackgroundTaskCount, emptyWorkspaceChat, workspaceHasActiveWork }
 describe("background work lifecycle", () => {
   it("keeps the workspace busy after the foreground turn ends", () => {
     const ws = emptyWorkspaceChat();
+    ws.alive = true;
     ws.chat.backgroundTasks = [
       { id: "long-build", type: "builder", description: "Eight-hour build", status: "running" },
       { id: "finished", type: "reviewer", description: "Finished review", status: "completed" },
@@ -16,12 +17,22 @@ describe("background work lifecycle", () => {
 
   it("releases session protection only after every task is terminal", () => {
     const ws = emptyWorkspaceChat();
+    ws.alive = true;
     ws.chat.backgroundTasks = [
       { id: "queued", type: "builder", description: "Queued build", status: "queued" },
     ];
     expect(workspaceHasActiveWork(ws)).toBe(true);
 
     ws.chat.backgroundTasks[0].status = "cancelled";
+    expect(activeBackgroundTaskCount(ws)).toBe(0);
+    expect(workspaceHasActiveWork(ws)).toBe(false);
+  });
+
+  it("does not treat persisted running records from a dead process as live work", () => {
+    const ws = emptyWorkspaceChat();
+    ws.chat.backgroundTasks = [
+      { id: "historical", type: "builder", description: "Interrupted build", status: "running" },
+    ];
     expect(activeBackgroundTaskCount(ws)).toBe(0);
     expect(workspaceHasActiveWork(ws)).toBe(false);
   });

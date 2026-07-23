@@ -57,6 +57,19 @@ function stringList(value: unknown, maxItems = 100, maxLength = 1_000): string[]
   return value.slice(0, maxItems).map((item) => boundedString(item, maxLength)).filter(Boolean);
 }
 
+/** Preserve large single-line JSON widgets while bounding aggregate allocation. */
+function boundedLinesText(value: unknown, maxLength = 1_000_000, maxItems = 500): string {
+  if (!Array.isArray(value)) return "";
+  let text = "";
+  for (const item of value.slice(0, maxItems)) {
+    const separator = text ? "\n" : "";
+    const remaining = maxLength - text.length - separator.length;
+    if (remaining <= 0) break;
+    text += separator + asString(item).slice(0, remaining);
+  }
+  return text;
+}
+
 function objectValue(value: unknown): Record<string, unknown> | null {
   return value != null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -149,6 +162,20 @@ function normalizeWorkflowPayload(value: unknown): WorkflowViewState | null {
   };
 }
 
+function newerWorkflow(
+  current: WorkflowViewState | null,
+  incoming: WorkflowViewState,
+): WorkflowViewState {
+  if (!current) return incoming;
+  if (incoming.runId === current.runId) {
+    return incoming.updatedAt >= current.updatedAt ? incoming : current;
+  }
+  if (incoming.createdAt !== current.createdAt) {
+    return incoming.createdAt > current.createdAt ? incoming : current;
+  }
+  return incoming.updatedAt >= current.updatedAt ? incoming : current;
+}
+
 function normalizePreviewRuntime(value: unknown): PreviewRuntimeView | null {
   const item = objectValue(value);
   if (!item) return null;
@@ -176,6 +203,14 @@ function normalizePreviewRuntime(value: unknown): PreviewRuntimeView | null {
     updatedAt: finiteNumber(item.updatedAt) ?? 0,
     source: "agent",
   };
+}
+
+function newerPreview(
+  current: PreviewRuntimeView | null,
+  incoming: PreviewRuntimeView,
+): PreviewRuntimeView {
+  if (!current) return incoming;
+  return incoming.updatedAt >= current.updatedAt ? incoming : current;
 }
 
 function normalizeBackgroundTasks(value: unknown): BackgroundTaskView[] | null {
@@ -604,12 +639,13 @@ export function applyAgentEvent(chat: ChatState, ev: Record<string, unknown>): C
         if (!key) break;
         const wireLines = (ev as Record<string, unknown>).widgetLines;
         const text = Array.isArray(wireLines)
-          ? stringList(wireLines, 500, 4_000).join("\n").slice(0, 1_000_000)
+          ? boundedLinesText(wireLines)
           : boundedString(ev.widgetText ?? ev.text ?? ev.lines ?? ev.content ?? ev.widget ?? "", 1_000_000);
         if (key === "pi-app-workflow-state") {
           try {
             const normalized = text ? normalizeWorkflowPayload(JSON.parse(text)) : null;
-            if (!text || normalized) chat.workflow = normalized;
+            if (!text) chat.workflow = null;
+            else if (normalized) chat.workflow = newerWorkflow(chat.workflow, normalized);
           } catch { /* keep last valid state */ }
         } else if (key === "pi-app-background-state") {
           try {
@@ -626,7 +662,8 @@ export function applyAgentEvent(chat: ChatState, ev: Record<string, unknown>): C
         } else if (key === "pi-app-preview-state") {
           try {
             const preview = text ? normalizePreviewRuntime(JSON.parse(text)) : null;
-            if (!text || preview) chat.previewRuntime = preview;
+            if (!text) chat.previewRuntime = null;
+            else if (preview) chat.previewRuntime = newerPreview(chat.previewRuntime, preview);
           } catch { /* keep last valid state */ }
         } else {
           const widgets = { ...chat.widgets };
@@ -708,8 +745,12 @@ export function entriesToChatState(entries: Record<string, unknown>[]): ChatStat
     if (e.type === "custom") {
       const customType = asString(e.customType);
       const data = e.data as Record<string, unknown> | undefined;
-      if (customType === "pi-app-workflow-state" && data?.version === 3) chat.workflow = data as unknown as WorkflowViewState;
-      else if (["subagents:record", "pi-app-background-record", "pi-app-evaluator-record"].includes(customType) && data?.id) {
+      if (customType === "pi-app-workflow-state" && data?.version === 3) {
+        const normalized = normalizeWorkflowPayload(data);
+        if (normalized) chat.workflow = newerWorkflow(chat.workflow, normalized);
+      } else if (customType === "pi-app-workflow-cleared") {
+        chat.workflow = null;
+      } else if (["subagents:record", "pi-app-background-record", "pi-app-evaluator-record"].includes(customType) && data?.id) {
         const task = data as unknown as BackgroundTaskView;
         const index = chat.backgroundTasks.findIndex((item) => item.id === task.id);
         if (index >= 0) chat.backgroundTasks[index] = task;

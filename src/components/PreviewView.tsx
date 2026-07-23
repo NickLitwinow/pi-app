@@ -188,12 +188,20 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     if (harnessPreview?.status === "failed") {
+      applyServer(null);
       setReady(false);
+      setUrl("");
       setShowLogs(true);
       if (harnessPreview.error) setLogs((current) => [...current.slice(-319), `— ${harnessPreview.error}`]);
       return;
     }
-    if (!harnessPreview?.serverId || !harnessPreview.url || harnessPreview.running === false) return;
+    if (harnessPreview?.status === "stopped" || harnessPreview?.status === "idle" || harnessPreview?.running === false) {
+      applyServer(null);
+      setReady(false);
+      setUrl("");
+      return;
+    }
+    if (!harnessPreview?.serverId || !harnessPreview.url) return;
     if (serverRef.current !== harnessPreview.serverId) {
       applyServer({ serverId: harnessPreview.serverId, url: harnessPreview.url, port: harnessPreview.port ?? 0 });
       setUrl(harnessPreview.url);
@@ -242,6 +250,7 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
         {cwd && <span className="pv-sub">{cwd.split("/").pop()}</span>}
         {server && <span className={`pv-runtime ${ready ? "ready" : "starting"}`}>{ready ? "ready" : "starting"}</span>}
         {!server && harnessPreview?.status === "failed" && <span className="pv-runtime failed">failed</span>}
+        {!server && harnessPreview?.status === "stopped" && <span className="pv-runtime stopped">stopped</span>}
         {harnessPreview?.browserInspected && <span className="pv-runtime inspected">agent checked</span>}
         <div className="grow" />
         <button title="Закрыть превью" onClick={onClose}>

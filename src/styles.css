@@ -1639,6 +1639,7 @@ html[data-effects="on"] .ss-card { backdrop-filter: blur(24px); -webkit-backdrop
 .pv-runtime.ready { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); color: var(--success); background: color-mix(in srgb, var(--success) 8%, transparent); }
 .pv-runtime.starting { color: var(--warning); }
 .pv-runtime.failed { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
+.pv-runtime.stopped { color: var(--text-dim); background: var(--bg-hover); }
 .pv-runtime.inspected { border-color: color-mix(in srgb, var(--brand) 45%, var(--border)); color: var(--brand); }
 .pv-header .grow { flex: 1; }
 

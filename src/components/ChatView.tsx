@@ -545,14 +545,14 @@ type Attachment = ComposerAttachment;
 
 type WorkflowTab = "tasks" | "plan" | "workflow" | "context" | "branches";
 
-type LocatedBackgroundTask = { cwd: string; task: BackgroundTaskView };
+type LocatedBackgroundTask = { cwd: string; task: BackgroundTaskView; alive: boolean };
 
 function BackgroundTasksTopbar({ currentCwd, tasks }: { currentCwd: string; tasks: LocatedBackgroundTask[] }) {
   const [open, setOpen] = useState(false);
   const [clock, setClock] = useState(() => Date.now());
   const [cancelling, setCancelling] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
-  const active = tasks.filter(({ task }) => task.status === "queued" || task.status === "running");
+  const active = tasks.filter(({ task, alive }) => alive && (task.status === "queued" || task.status === "running"));
   const running = active.filter(({ task }) => task.status === "running").length;
 
   useEffect(() => {
@@ -662,7 +662,9 @@ function WorkflowDock({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const checkpoints = ws.chat.structuredCheckpoints;
   const branches = ws.chat.branches;
   const liveContext = ws.stats?.contextUsage;
-  const activeTasks = tasks.filter((task) => task.status === "queued" || task.status === "running").length;
+  const activeTasks = activeBackgroundTaskCount(ws);
+  const workflowRunning = workflow?.steps.some((step) => step.status === "running") ?? false;
+  const workflowLive = ws.liveStreaming || activeTasks > 0 || (ws.alive && workflowRunning);
   useEffect(() => {
     if (activeTasks === 0) return;
     const timer = window.setInterval(() => setClock(Date.now()), 1_000);
@@ -678,6 +680,13 @@ function WorkflowDock({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   }, []);
   if (!workflow && plannedTasks.length === 0 && tasks.length === 0 && compactions.length === 0 && checkpoints.length === 0 && branches.length === 0) return null;
   const failedSteps = workflow?.steps.filter((step) => step.status === "failed").length ?? 0;
+  const workflowLabel = workflow?.status === "completed"
+    ? "completed"
+    : workflow?.status === "blocked" || workflow?.status === "needs-human"
+      ? workflow.status
+      : workflowLive
+        ? "active"
+        : "paused";
   const tabs: Array<{ id: WorkflowTab; label: string; count?: number }> = [
     { id: "tasks", label: "Tasks", count: activeTasks || tasks.length },
     { id: "plan", label: "Plan", count: plannedTasks.length || workflow?.steps.filter((step) => step.kind === "plan" || step.id === "approve").length },
@@ -690,8 +699,8 @@ function WorkflowDock({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   return (
     <section className={`workflow-dock ${open ? "open" : ""}`} aria-label="Workflow control center">
       <button className="workflow-summary" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
-        <span className={`workflow-pulse ${failedSteps ? "failed" : activeTasks ? "running" : ""}`} />
-        <strong>{workflow ? `${workflow.profile} · ${workflow.status ?? "active"} · ${workflow.steps.filter((step) => step.status === "passed" || step.status === "skipped").length}/${workflow.steps.length}` : "Session workflow"}</strong>
+        <span className={`workflow-pulse ${failedSteps ? "failed" : workflowLive ? "running" : ""}`} />
+        <strong>{workflow ? `${workflow.profile} · ${workflowLabel} · ${workflow.steps.filter((step) => step.status === "passed" || step.status === "skipped").length}/${workflow.steps.length}` : "Session workflow"}</strong>
         {activeTasks > 0 && <span>{activeTasks} active</span>}
         {failedSteps > 0 && <span className="workflow-error">{failedSteps} failed</span>}
         <ChevronIcon size={12} open={open} />
@@ -727,8 +736,8 @@ function WorkflowDock({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
                   </div>
 				  {task.blockedReason && <small className="workflow-error">{task.blockedReason}</small>}
                   <div className="task-actions">
-					{task.type !== "independent-evaluator" && (task.status === "queued" || task.status === "running") && <button onClick={() => invoke(() => controlBackgroundTask(cwd, "cancel", task.id))}>Cancel</button>}
-					{task.type !== "independent-evaluator" && (task.status === "queued" || task.status === "running") && <button onClick={() => setSteerId(steerId === task.id ? null : task.id)}>Steer</button>}
+					{ws.alive && task.type !== "independent-evaluator" && (task.status === "queued" || task.status === "running") && <button onClick={() => invoke(() => controlBackgroundTask(cwd, "cancel", task.id))}>Cancel</button>}
+					{ws.alive && task.type !== "independent-evaluator" && (task.status === "queued" || task.status === "running") && <button onClick={() => setSteerId(steerId === task.id ? null : task.id)}>Steer</button>}
                     <button onClick={() => {
                       setExpandedTask(expandedTask === task.id ? null : task.id);
                       setTaskEvidence("transcript");
@@ -1885,7 +1894,7 @@ export default function ChatView() {
   const [previewWidth, setPreviewWidth] = useState(560);
   const backgroundTasks = useMemo(
     () => Object.entries(chats).flatMap(([taskCwd, workspace]) =>
-      workspace.chat.backgroundTasks.map((task) => ({ cwd: taskCwd, task }))),
+      workspace.chat.backgroundTasks.map((task) => ({ cwd: taskCwd, task, alive: workspace.alive }))),
     [chats],
   );
   const nativePreview = ws.chat.previewRuntime;
@@ -1972,7 +1981,7 @@ export default function ChatView() {
           onClick={() => set({ previewOpen: !previewOpen })}
           title="Live-превью рядом с чатом (сплит-скрин)"
         >
-          <PreviewIcon size={13} /> Превью{nativePreview?.ready ? " · ready" : nativePreview?.status === "starting" || nativePreview?.status === "running" ? " · starting" : nativePreview?.status === "failed" ? " · failed" : ""}
+          <PreviewIcon size={13} /> Превью{nativePreview?.ready ? " · ready" : nativePreview?.status === "starting" || nativePreview?.status === "running" ? " · starting" : nativePreview?.status === "failed" ? " · failed" : nativePreview?.status === "stopped" ? " · stopped" : ""}
         </button>
         <button className="chip" onClick={() => void newSession(cwd)} title="Новая сессия">
           <PlusIcon size={13} /> Новая сессия

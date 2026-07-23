@@ -250,6 +250,65 @@ export function updateWorkflowStep(
 	};
 }
 
+/** Return a persisted/in-flight step to a retryable state without consuming a
+ * new attempt. Used when a process was interrupted or legacy repository-wide
+ * evidence is proven unrelated to the active workspace. */
+export function resetWorkflowStep(
+	state: WorkflowState,
+	stepId: string,
+	detail: string,
+	now = Date.now(),
+): WorkflowState {
+	const steps = state.steps.map((rawStep) => {
+		const step = { ...STEP_RUNTIME[rawStep.kind], ...rawStep };
+		return step.id !== stepId ? step : {
+			...step,
+			status: "pending" as const,
+			attempts: 0,
+			detail,
+			failureReason: undefined,
+			startedAt: undefined,
+			completedAt: undefined,
+		};
+	});
+	return {
+		...state,
+		...lifecycle(steps),
+		updatedAt: now,
+		steps,
+		events: [...state.events, {
+			id: eventId(),
+			stepId,
+			type: "note" as const,
+			at: now,
+			message: detail,
+		}].slice(-160),
+	};
+}
+
+/** Make foreground model activity visible as soon as a workflow turn starts. */
+export function startForegroundWorkflowStep(state: WorkflowState, now = Date.now()): WorkflowState {
+	if (state.steps.some((step) => step.status === "running")) return state;
+	const next = readySteps(state).find((step) => step.kind === "plan" || step.kind === "research");
+	if (!next) return state;
+	return updateWorkflowStep(state, next.id, "running", "Foreground agent is working on this step.", now);
+}
+
+/** Settle dependency-ordered read-only workflows without inventing mutation gates. */
+export function completeReadOnlyWorkflow(state: WorkflowState, now = Date.now()): WorkflowState {
+	let next = state;
+	while (true) {
+		const satisfied = new Set(next.steps
+			.filter((step) => step.status === "passed" || step.status === "skipped")
+			.map((step) => step.id));
+		const candidate = next.steps.find((step) =>
+			(step.status === "pending" || step.status === "running")
+			&& step.deps.every((dep) => satisfied.has(dep)));
+		if (!candidate) return next;
+		next = updateWorkflowStep(next, candidate.id, "passed", "Read-only workflow completed by the foreground agent.", now);
+	}
+}
+
 function parseProjectManifest(path: string): VerifierManifest | undefined {
 	try {
 		const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<VerifierManifest>;
@@ -313,7 +372,19 @@ export function attachVerifierSteps(state: WorkflowState, manifest: VerifierMani
 	}).filter((step): step is WorkflowStep => Boolean(step));
 	let steps = verifierSteps.length > 0
 		? [...downstream.slice(0, gateIndex), ...verifierSteps, ...downstream.slice(gateIndex)]
-		: state.steps.map((step) => step.id === "verify" ? { ...step, status: "waiting" as const, detail: "No verifier manifest or conventional scripts found." } : step);
+		: state.steps.map((step) => {
+			if (step.id === "verify") return {
+				...step,
+				status: "skipped" as const,
+				detail: "No project verifier manifest or conventional scripts were found; preview and independent evaluation remain required.",
+				completedAt: Date.now(),
+			};
+			if (!step.deps.includes("verify")) return step;
+			return {
+				...step,
+				deps: [...new Set(step.deps.flatMap((dep) => dep === "verify" ? gate.deps : [dep]))],
+			};
+		});
 	const requiresHumanApproval = manifest.humanApproval ?? state.intent.requiresHumanApproval;
 	if (requiresHumanApproval && !steps.some((step) => step.id === "approve")) {
 		const buildIndex = steps.findIndex((step) => step.kind === "build");

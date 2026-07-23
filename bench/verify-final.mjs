@@ -190,6 +190,7 @@ const quickStages = [
 	nodeStage("fixture-git", "fixture-git-smoke.mjs"),
 	nodeStage("schedule", "schedule-smoke.mjs"),
 	nodeStage("workflow-resume", "workflow-resume-smoke.mjs"),
+	nodeStage("workflow-workspace-scope", "workflow-workspace-scope-smoke.mjs"),
 ];
 const rewindSource = newestUsableSession(join(sourceAgentRoot, "sessions"));
 quickStages.push(rewindSource

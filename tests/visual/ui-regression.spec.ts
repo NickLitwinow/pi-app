@@ -636,4 +636,9 @@ test("Live preview — harness event opens the split and exposes agent inspectio
   await expect(preview.locator(".pv-runtime.inspected")).toHaveText("agent checked");
   await expect(page.locator(".topbar").getByRole("button", { name: /Превью · ready/ })).toBeVisible();
   await expect(preview.locator("iframe[title=preview]")).toHaveAttribute("src", "http://localhost:1420");
+
+  await preview.getByRole("button", { name: /Стоп/ }).click();
+  await expect(preview.locator(".pv-runtime.stopped")).toHaveText("stopped");
+  await expect(preview.locator("iframe[title=preview]")).toHaveCount(0);
+  await expect(page.locator(".topbar").getByRole("button", { name: /Превью · stopped/ })).toBeVisible();
 });

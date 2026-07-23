@@ -363,9 +363,37 @@ describe("applyAgentEvent — auxiliary events", () => {
       type: "extension_ui_request",
       method: "setWidget",
       widgetKey: "pi-app-preview-state",
+      widgetText: JSON.stringify({
+        status: "stopped",
+        serverId: "prev-1",
+        running: false,
+        ready: false,
+        updatedAt: 200,
+      }),
+    });
+    expect(chat.previewRuntime).toMatchObject({ status: "stopped", running: false, updatedAt: 200 });
+
+    chat = applyAgentEvent({ ...chat }, {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "pi-app-preview-state",
+      widgetText: JSON.stringify({
+        status: "ready",
+        serverId: "prev-1",
+        running: true,
+        ready: true,
+        updatedAt: 150,
+      }),
+    });
+    expect(chat.previewRuntime).toMatchObject({ status: "stopped", running: false, updatedAt: 200 });
+
+    chat = applyAgentEvent({ ...chat }, {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "pi-app-preview-state",
       widgetText: JSON.stringify({ status: "unknown", serverId: "spoof" }),
     });
-    expect(chat.previewRuntime?.serverId).toBe("prev-1");
+    expect(chat.previewRuntime?.status).toBe("stopped");
   });
 
   it("strips leading emoji from toasts and dedupes repeats", () => {
@@ -454,6 +482,63 @@ describe("applyAgentEvent — auxiliary events", () => {
       expect.objectContaining({ id: 2, activeForm: "implementing migration", blockedBy: [1] }),
     ]);
   });
+
+  it("accepts large workflow JSON widgets without truncating their single wire line", () => {
+    const workflow = {
+      version: 3,
+      runId: "run-large",
+      createdAt: 100,
+      updatedAt: 101,
+      objective: "x".repeat(8_000),
+      profile: "feature",
+      status: "active",
+      approved: true,
+      editsPending: false,
+      changedFiles: [],
+      intent: { primary: "build", profile: "feature", risk: "medium", allowsMutation: true, signals: [] },
+      steps: [{ id: "plan", label: "Plan", kind: "plan", deps: [], status: "running", acceptance: "ready", required: true, owner: "orchestrator", maxAttempts: 2, attempts: 1 }],
+      events: [],
+    };
+    const chat = applyAgentEvent(emptyChatState(), {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "pi-app-workflow-state",
+      widgetLines: [JSON.stringify(workflow)],
+    });
+    expect(chat.workflow?.runId).toBe("run-large");
+    expect(chat.workflow?.objective).toHaveLength(8_000);
+    expect(chat.workflow?.steps[0].status).toBe("running");
+  });
+
+  it("keeps workflow updates monotonic across runs and within one run", () => {
+    const payload = (runId: string, createdAt: number, updatedAt: number, profile: "feature" | "assessment") => ({
+      version: 3,
+      runId,
+      createdAt,
+      updatedAt,
+      objective: runId,
+      profile,
+      status: "active",
+      approved: true,
+      editsPending: false,
+      changedFiles: [],
+      intent: { primary: profile === "feature" ? "build" : "assessment", profile, risk: "medium", signals: [] },
+      steps: [{ id: "step", label: "Step", kind: profile === "feature" ? "build" : "research", deps: [], status: "running", acceptance: "done", required: true, owner: "orchestrator", maxAttempts: 2, attempts: 1 }],
+      events: [],
+    });
+    const widget = (workflow: ReturnType<typeof payload>) => ({
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "pi-app-workflow-state",
+      widgetLines: [JSON.stringify(workflow)],
+    });
+    let chat = applyAgentEvent(emptyChatState(), widget(payload("old", 100, 500, "assessment")));
+    chat = applyAgentEvent({ ...chat }, widget(payload("new", 200, 210, "feature")));
+    chat = applyAgentEvent({ ...chat }, widget(payload("old", 100, 999, "assessment")));
+    expect(chat.workflow?.runId).toBe("new");
+    chat = applyAgentEvent({ ...chat }, widget(payload("new", 200, 205, "feature")));
+    expect(chat.workflow?.updatedAt).toBe(210);
+  });
 });
 
 describe("entriesToChatState", () => {
@@ -481,6 +566,34 @@ describe("entriesToChatState", () => {
     expect(chat.structuredCheckpoints[0].nextReadySteps).toEqual(["verify"]);
     expect(chat.branches[0]).toMatchObject({ abandonedLeafId: "leaf-old", stoppedTaskIds: ["a1"] });
     expect(chat.plannedTasks[0]).toMatchObject({ id: 1, subject: "Verify UI", owner: "main" });
+  });
+
+  it("restores only the newest workflow run and honors a persisted clear marker", () => {
+    const workflow = (runId: string, createdAt: number, updatedAt: number) => ({
+      version: 3,
+      runId,
+      createdAt,
+      updatedAt,
+      objective: runId,
+      profile: "feature",
+      status: "active",
+      approved: true,
+      editsPending: false,
+      changedFiles: [],
+      intent: { primary: "build", profile: "feature", risk: "medium", signals: [] },
+      steps: [],
+      events: [],
+    });
+    const restored = entriesToChatState([
+      { type: "custom", customType: "pi-app-workflow-state", data: workflow("new", 200, 210) },
+      { type: "custom", customType: "pi-app-workflow-state", data: workflow("old", 100, 999) },
+    ]);
+    expect(restored.workflow?.runId).toBe("new");
+    const cleared = entriesToChatState([
+      { type: "custom", customType: "pi-app-workflow-state", data: workflow("new", 200, 210) },
+      { type: "custom", customType: "pi-app-workflow-cleared", data: { version: 1, at: 300 } },
+    ]);
+    expect(cleared.workflow).toBeNull();
   });
 
   it("builds a read-only timeline from session JSONL entries", () => {

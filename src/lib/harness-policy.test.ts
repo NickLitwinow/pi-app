@@ -15,16 +15,19 @@ import {
 } from "../../harness-extension/policy";
 import {
   attachVerifierSteps,
+  completeReadOnlyWorkflow,
   createWorkflowState,
   loadVerifierManifest,
   normalizeWorkflowState,
   readySteps,
+  resetWorkflowStep,
+  startForegroundWorkflowStep,
   updateWorkflowStep,
 } from "../../harness-extension/workflow";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fingerprintWorkspace, isWorkspacePath, parsePorcelainZ, rebaseWorktreePrompt } from "../../harness-extension/workspace";
+import { fingerprintWorkspace, isWorkspacePath, parsePorcelainZ, rebaseWorktreePrompt, stripGitPrefix, workspaceRelativePath } from "../../harness-extension/workspace";
 import { decorateTaskQueue } from "../../harness-extension/tasks";
 import { isSubagentSessionFile, normalizeGeneratedSessionName } from "../../harness-extension/session-name-utils";
 
@@ -127,6 +130,19 @@ describe("workspace evidence", () => {
     expect(first.fingerprint).not.toBe(second.fingerprint);
   });
 
+  it("normalizes repository-root porcelain paths to a nested active workspace", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-harness-nested-"));
+    writeFileSync(join(cwd, "inside.js"), "one");
+    const status = "?? sandbox/inside.js\0?? sibling/private.txt\0";
+    expect(parsePorcelainZ(status, "sandbox/")).toEqual({
+      files: ["inside.js"],
+      untracked: ["inside.js"],
+    });
+    expect(fingerprintWorkspace(cwd, "", status, "commit-a", "sandbox/").files).toEqual(["inside.js"]);
+    expect(stripGitPrefix("sandbox/src/index.ts", "sandbox/")).toBe("src/index.ts");
+    expect(stripGitPrefix("sibling/private.txt", "sandbox/")).toBeUndefined();
+  });
+
   it("changes the fingerprint when a clean checkout advances to a new revision", () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-harness-revision-"));
     const first = fingerprintWorkspace(cwd, "", "", "commit-a");
@@ -141,6 +157,8 @@ describe("workspace evidence", () => {
     expect(isWorkspacePath(cwd, `${cwd}/src/index.ts`)).toBe(true);
     expect(isWorkspacePath(cwd, "/repo/src/index.ts")).toBe(false);
     expect(isWorkspacePath(cwd, "../../src/index.ts")).toBe(false);
+    expect(workspaceRelativePath(cwd, `${cwd}/src/index.ts`)).toBe("src/index.ts");
+    expect(workspaceRelativePath(cwd, "/repo/src/index.ts")).toBeUndefined();
   });
 
   it("rebases inherited parent paths without duplicating an existing child path", () => {
@@ -357,6 +375,61 @@ describe("persisted workflow contract", () => {
         { id: "test", command: "npm run test" },
       ],
     });
+  });
+
+  it("starts an honest foreground step for every workflow profile", () => {
+    const prompts = [
+      ["feature", "Implement a new dashboard feature"],
+      ["bug", "Fix this reproducible crash"],
+      ["chore", "Refactor this internal helper"],
+      ["hotfix", "Deploy an urgent production hotfix"],
+      ["research", "Research current primary sources without changing files"],
+      ["assessment", "Review and assess the current implementation without changes"],
+    ] as const;
+    for (const [profile, prompt] of prompts) {
+      const initial = createWorkflowState(prompt, 100, profile);
+      const started = startForegroundWorkflowStep(initial, 200);
+      const running = started.steps.filter((step) => step.status === "running");
+      expect(running, profile).toHaveLength(1);
+      expect(["plan", "research"]).toContain(running[0].kind);
+      expect(running[0].attempts).toBe(1);
+      expect(startForegroundWorkflowStep(started, 300)).toBe(started);
+    }
+  });
+
+  it("completes read-only workflows in dependency order", () => {
+    for (const profile of ["research", "assessment"] as const) {
+      const started = startForegroundWorkflowStep(createWorkflowState("Inspect only", 100, profile), 200);
+      const completed = completeReadOnlyWorkflow(started, 300);
+      expect(completed.status, profile).toBe("completed");
+      expect(completed.steps.every((step) => step.status === "passed")).toBe(true);
+    }
+  });
+
+  it("restores an interrupted step as retryable without spending another attempt", () => {
+    const started = startForegroundWorkflowStep(createWorkflowState("Implement a feature", 100, "feature"), 200);
+    const reset = resetWorkflowStep(started, "plan", "Paused after process restart.", 300);
+    expect(reset.steps.find((step) => step.id === "plan")).toMatchObject({
+      status: "pending",
+      attempts: 0,
+      detail: "Paused after process restart.",
+      startedAt: undefined,
+      completedAt: undefined,
+    });
+    expect(reset.status).toBe("active");
+  });
+
+  it("skips an unavailable project gate but retains semantic evidence gates", () => {
+    const state = attachVerifierSteps(
+      createWorkflowState("Implement a standalone HTML visualization", 100, "feature"),
+      { version: 1, source: "empty", commands: [] },
+    );
+    expect(state.steps.find((step) => step.id === "verify")).toMatchObject({
+      status: "skipped",
+      required: true,
+    });
+    expect(state.steps.find((step) => step.id === "evaluate")?.deps).toEqual(["build"]);
+    expect(readySteps(state).map((step) => step.id)).toEqual(["plan"]);
   });
 });
 

@@ -80,6 +80,7 @@ if (!evidenceOnly) {
 		["fixture-git", "fixture-git-smoke.mjs"],
 		["schedule", "schedule-smoke.mjs"],
 		["workflow-resume", "workflow-resume-smoke.mjs"],
+		["workflow-workspace-scope", "workflow-workspace-scope-smoke.mjs"],
 	]) run(id, process.execPath, [join(benchDir, script)]);
 	const session = newestMultiTurnSession(join(agentRoot, "sessions"));
 	if (session) run("same-session-rewind", process.execPath, [join(benchDir, "rewind-smoke.mjs"), session]);

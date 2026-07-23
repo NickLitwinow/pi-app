@@ -93,6 +93,7 @@ const entries = [
 	},
 ];
 writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+const initialSessionText = readFileSync(sessionFile, "utf8");
 
 const child = spawn("pi", [
 	"--mode", "rpc", "--offline", "--no-approve", "--no-extensions",
@@ -104,10 +105,59 @@ const child = spawn("pi", [
 	env: { ...process.env, PI_CODING_AGENT_DIR: agentRoot, PI_APP_HARNESS_PROFILE: "workflow", PONYTAIL_DEFAULT_MODE: "off" },
 });
 
+async function freshSessionWorkflowWidgetCount() {
+	const fresh = spawn("pi", [
+		"--mode", "rpc", "--offline", "--no-approve", "--no-extensions",
+		"--extension", join(repoRoot, "harness-extension", "index.ts"),
+		"--no-skills", "--no-session",
+	], {
+		cwd: root,
+		stdio: ["pipe", "pipe", "pipe"],
+		env: { ...process.env, PI_CODING_AGENT_DIR: agentRoot, PI_APP_HARNESS_PROFILE: "workflow", PONYTAIL_DEFAULT_MODE: "off" },
+	});
+	let freshBuffer = "";
+	let freshStderr = "";
+	let widgets = 0;
+	const complete = new Promise((resolveComplete, reject) => {
+		const timer = setTimeout(() => reject(new Error(`fresh workflow RPC timeout: ${freshStderr.slice(-2_000)}`)), 60_000);
+		fresh.stderr.on("data", (chunk) => { freshStderr += String(chunk); });
+		fresh.stdout.on("data", (chunk) => {
+			freshBuffer += String(chunk);
+			let newline;
+			while ((newline = freshBuffer.indexOf("\n")) >= 0) {
+				const line = freshBuffer.slice(0, newline);
+				freshBuffer = freshBuffer.slice(newline + 1);
+				let event;
+				try { event = JSON.parse(line); } catch { continue; }
+				if (event.type === "extension_ui_request" && event.method === "setWidget"
+					&& event.widgetKey === "pi-app-workflow-state" && Array.isArray(event.widgetLines)) widgets++;
+				if (event.type !== "response" || event.id !== "fresh-state") continue;
+				clearTimeout(timer);
+				resolveComplete();
+			}
+		});
+	});
+	try {
+		fresh.stdin.write(`${JSON.stringify({ id: "fresh-state", type: "get_state" })}\n`);
+		await complete;
+		return widgets;
+	} finally {
+		fresh.kill("SIGTERM");
+	}
+}
+
 let buffer = "";
 let stderr = "";
+const workflowWidgets = [];
+let resolveStartup;
+let rejectStartup;
+const startupResponse = new Promise((resolve, reject) => {
+	resolveStartup = resolve;
+	rejectStartup = reject;
+});
 const response = new Promise((resolveResponse, reject) => {
 	const timer = setTimeout(() => reject(new Error(`workflow resume RPC timeout: ${stderr.slice(-2_000)}`)), 60_000);
+	const startupTimer = setTimeout(() => rejectStartup(new Error(`workflow startup RPC timeout: ${stderr.slice(-2_000)}`)), 60_000);
 	child.stderr.on("data", (chunk) => { stderr += String(chunk); });
 	child.stdout.on("data", (chunk) => {
 		buffer += String(chunk);
@@ -117,8 +167,19 @@ const response = new Promise((resolveResponse, reject) => {
 			buffer = buffer.slice(newline + 1);
 			let event;
 			try { event = JSON.parse(line); } catch { continue; }
+			if (event.type === "extension_ui_request" && event.method === "setWidget" && event.widgetKey === "pi-app-workflow-state") {
+				const text = Array.isArray(event.widgetLines) ? event.widgetLines.join("\n") : "";
+				if (text) workflowWidgets.push(JSON.parse(text));
+			}
+			if (event.type === "response" && event.id === "startup-state") {
+				clearTimeout(startupTimer);
+				if (!event.success) rejectStartup(new Error(event.error ?? "startup get_state failed"));
+				else resolveStartup(event);
+				continue;
+			}
 			if (event.type !== "response" || event.id !== "resume-smoke") continue;
 			clearTimeout(timer);
+			clearTimeout(startupTimer);
 			if (!event.success) reject(new Error(event.error ?? "retry-gates failed"));
 			else resolveResponse(event);
 		}
@@ -126,6 +187,14 @@ const response = new Promise((resolveResponse, reject) => {
 });
 
 try {
+	child.stdin.write(`${JSON.stringify({ id: "startup-state", type: "get_state" })}\n`);
+	await startupResponse;
+	const startupEntries = readFileSync(sessionFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+	const initialEntryCount = initialSessionText.split("\n").filter(Boolean).length;
+	assert.ok(
+		startupEntries.slice(initialEntryCount).every((entry) => entry.type === "thinking_level_change"),
+		"opening a saved session must not append workflow/evaluator state or start recovery",
+	);
 	child.stdin.write(`${JSON.stringify({ id: "resume-smoke", type: "prompt", message: "/pi-workflow retry-gates" })}\n`);
 	await response;
 	child.stdin.end();
@@ -144,7 +213,10 @@ try {
 	assert.match(latest.terminationReason, /Every required workflow step/);
 	assert.equal(latest.editsPending, false);
 	assert.equal(replay?.evaluatorTaskId, "eval-replayable");
-	console.log(JSON.stringify({ passed: true, sameSession: true, status: latest.status, lifecycleUpgraded: true, evaluatorTaskId: replay.evaluatorTaskId }));
+	assert.ok(workflowWidgets.length > 0, "restored workflow must be published to the RPC UI");
+	assert.ok(workflowWidgets.every((item) => item.runId === workflow.runId && item.objective === workflow.objective), "RPC UI must never receive a synthetic empty workflow");
+	assert.equal(await freshSessionWorkflowWidgetCount(), 0, "a fresh session must not publish an empty assessment workflow before the first prompt");
+	console.log(JSON.stringify({ passed: true, sameSession: true, startupReadOnly: true, status: latest.status, lifecycleUpgraded: true, rpcWorkflowSynchronized: true, freshSessionEmpty: true, evaluatorTaskId: replay.evaluatorTaskId }));
 } finally {
 	if (child.exitCode == null) child.kill("SIGTERM");
 	rmSync(root, { recursive: true, force: true });

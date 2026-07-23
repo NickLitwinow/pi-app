@@ -23,15 +23,18 @@ import { Type } from "typebox";
 import { buildIndependentEvaluatorPrompt, buildIndependentFalsifierPrompt, classifyPreviewBrowserEvidence, executionFailed, independentEvaluationAccepted, independentEvaluationRepairPrompt, parseBackgroundAgentId } from "./policy.js";
 import {
 	attachVerifierSteps,
+	completeReadOnlyWorkflow,
 	createWorkflowState,
 	loadVerifierManifest,
 	normalizeWorkflowState,
 	readySteps,
+	resetWorkflowStep,
+	startForegroundWorkflowStep,
 	updateWorkflowStep,
 	type WorkflowState,
 	type WorkflowStep,
 } from "./workflow.js";
-import { fingerprintWorkspace, isWorkspacePath, rebaseWorktreePrompt } from "./workspace.js";
+import { fingerprintWorkspace, isWorkspacePath, rebaseWorktreePrompt, stripGitPrefix, workspaceRelativePath } from "./workspace.js";
 import { decorateTaskQueue, type TaskPriority } from "./tasks.js";
 import { registerSessionAutoName } from "./auto-name.js";
 
@@ -121,6 +124,14 @@ const CHECKPOINT_PERCENT = 75;
 const ABLATIONS = new Set((process.env.PI_APP_HARNESS_ABLATIONS ?? "").split(",").map((value) => value.trim()).filter(Boolean));
 const WRITE_TOOLS = new Set(["edit", "write", "apply_patch", "multi_edit"]);
 const PREVIEW_BRIDGE_PREFIX = "__PI_APP_NATIVE_PREVIEW_V1__:";
+const WORKFLOW_GIT_PATHS = [
+	".",
+	":(exclude).DS_Store",
+	":(exclude)**/.DS_Store",
+	":(exclude).pi/extensions/**",
+	":(exclude).pi/harness.log",
+	":(exclude).pi/tmp/**",
+];
 
 const WORKFLOW_GUIDANCE = `
 Workflow contract:
@@ -224,12 +235,14 @@ export default function harness(pi: ExtensionAPI) {
 	const enabled = process.env.PI_APP_HARNESS_PROFILE !== "baseline";
 	const debugLog = process.env.PI_APP_HARNESS_LOG === "1";
 	let state = createWorkflowState("");
+	let hasWorkflow = false;
 	let pendingNotes: string[] = [];
 	let lastCallSignature = "";
 	let repeatStreak = 0;
 	let malformedStreak = 0;
 	let continuationQueued = false;
 	let verifierRunning = false;
+	let foregroundSettlements = 0;
 	let activeCwd = process.cwd();
 	let isolatedWorktree = false;
 	let parentWorkspaceRoot = "";
@@ -280,17 +293,24 @@ export default function harness(pi: ExtensionAPI) {
 
 	const workspaceSnapshot = async (): Promise<{ fingerprint: string; files: string[]; head: string }> => {
 		try {
-			const [diff, status, head] = await Promise.all([
-				pi.exec("git", ["diff", "--binary", "HEAD", "--"], { cwd: activeCwd, timeout: 30_000 }),
-				pi.exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: activeCwd, timeout: 30_000 }),
+			const [diff, status, head, prefixResult] = await Promise.all([
+				pi.exec("git", ["diff", "--binary", "HEAD", "--", ...WORKFLOW_GIT_PATHS], { cwd: activeCwd, timeout: 30_000 }),
+				pi.exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...WORKFLOW_GIT_PATHS], { cwd: activeCwd, timeout: 30_000 }),
 				pi.exec("git", ["rev-parse", "HEAD"], { cwd: activeCwd, timeout: 30_000 }),
+				pi.exec("git", ["rev-parse", "--show-prefix"], { cwd: activeCwd, timeout: 30_000 }),
 			]);
 			const revision = head.code === 0 ? head.stdout.trim() : "";
-			const snapshot = fingerprintWorkspace(activeCwd, diff.stdout, status.stdout, revision);
+			const prefix = prefixResult.code === 0 ? prefixResult.stdout.trim() : "";
+			const snapshot = fingerprintWorkspace(activeCwd, diff.stdout, status.stdout, revision, prefix);
 			let committedFiles: string[] = [];
 			if (state.baseRevision && revision && state.baseRevision !== revision) {
-				const names = await pi.exec("git", ["diff", "--name-only", state.baseRevision, revision, "--"], { cwd: activeCwd, timeout: 30_000 });
-				if (names.code === 0) committedFiles = names.stdout.split("\n").map((value) => value.trim()).filter(Boolean);
+				const names = await pi.exec("git", ["diff", "--name-only", state.baseRevision, revision, "--", ...WORKFLOW_GIT_PATHS], { cwd: activeCwd, timeout: 30_000 });
+				if (names.code === 0) {
+					committedFiles = names.stdout
+						.split("\n")
+						.map((value) => stripGitPrefix(value.trim(), prefix))
+						.filter((value): value is string => Boolean(value));
+				}
 			}
 			return { ...snapshot, head: revision, files: [...new Set([...snapshot.files, ...committedFiles])] };
 		} catch {
@@ -298,17 +318,31 @@ export default function harness(pi: ExtensionAPI) {
 		}
 	};
 
-	const publishState = () => {
+	const publishState = (persist = true) => {
+		hasWorkflow = true;
 		state.updatedAt = Date.now();
-		try {
-			pi.appendEntry("pi-app-workflow-state", state);
-		} catch {
-			// In-memory state remains authoritative until the next successful checkpoint.
+		if (persist) {
+			try {
+				pi.appendEntry("pi-app-workflow-state", state);
+			} catch {
+				// In-memory state remains authoritative until the next successful checkpoint.
+			}
 		}
 		if (taskUi) {
 			taskUi.setStatus("pi-app-workflow", `workflow: ${phaseText(state)}`);
 			taskUi.setWidget("pi-app-workflow-state", [JSON.stringify(state)], { placement: "aboveEditor" });
 		}
+	};
+
+	const clearWorkflow = () => {
+		hasWorkflow = false;
+		try {
+			pi.appendEntry("pi-app-workflow-cleared", { version: 1, at: Date.now() });
+		} catch {
+			// The live UI is still cleared even if the persistence checkpoint fails.
+		}
+		taskUi?.setStatus("pi-app-workflow", undefined);
+		taskUi?.setWidget("pi-app-workflow-state", undefined, { placement: "aboveEditor" });
 	};
 
 	const publishTasks = () => {
@@ -689,7 +723,7 @@ export default function harness(pi: ExtensionAPI) {
 			state = createWorkflowState("");
 			pendingNotes = [];
 			toolArgs.clear();
-			publishState();
+			clearWorkflow();
 		},
 	});
 
@@ -796,8 +830,8 @@ export default function harness(pi: ExtensionAPI) {
 			base = mergeBase.stdout.trim();
 		}
 		const [stat, diff] = await Promise.all([
-			pi.exec("git", ["diff", "--stat", `${base}...${current.branch}`, "--"], { cwd: activeCwd, timeout: 30_000 }),
-			pi.exec("git", ["diff", "--no-ext-diff", `${base}...${current.branch}`, "--"], { cwd: activeCwd, timeout: 30_000 }),
+			pi.exec("git", ["diff", "--stat", `${base}...${current.branch}`, "--", ...WORKFLOW_GIT_PATHS], { cwd: activeCwd, timeout: 30_000 }),
+			pi.exec("git", ["diff", "--no-ext-diff", `${base}...${current.branch}`, "--", ...WORKFLOW_GIT_PATHS], { cwd: activeCwd, timeout: 30_000 }),
 		]);
 		if (stat.code !== 0 || diff.code !== 0) throw new Error((stat.stderr || diff.stderr || "Task diff failed").trim());
 		const evidence = `${current.branch} from ${base}\n\n${stat.stdout.trim() || "No changed files."}\n\n${diff.stdout.trim() || "No diff."}`;
@@ -822,7 +856,21 @@ export default function harness(pi: ExtensionAPI) {
 		const current = refreshTaskEvidence(task);
 		if (current.status !== "completed") throw new Error(`Merge refused: task status is ${current.status}.`);
 		if (!current.branch) throw new Error("Merge refused: the task did not produce an isolated branch.");
-		const parentStatus = await pi.exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: activeCwd, timeout: 30_000 });
+		const [prefixResult, mergeBaseResult] = await Promise.all([
+			pi.exec("git", ["rev-parse", "--show-prefix"], { cwd: activeCwd, timeout: 30_000 }),
+			current.baseSha
+				? Promise.resolve({ code: 0, stdout: current.baseSha, stderr: "" })
+				: pi.exec("git", ["merge-base", "HEAD", current.branch], { cwd: activeCwd, timeout: 30_000 }),
+		]);
+		if (prefixResult.code !== 0 || mergeBaseResult.code !== 0) throw new Error("Merge refused: the active project boundary or task merge base is unavailable.");
+		const prefix = prefixResult.stdout.trim();
+		const taskBase = mergeBaseResult.stdout.trim();
+		const branchNames = await pi.exec("git", ["diff", "--name-only", `${taskBase}...${current.branch}`, "--"], { cwd: activeCwd, timeout: 30_000 });
+		if (branchNames.code !== 0) throw new Error(`Merge refused: cannot inspect candidate scope (${branchNames.stderr}).`);
+		const escaped = branchNames.stdout.split("\n").map((value) => value.trim()).filter(Boolean)
+			.find((path) => stripGitPrefix(path, prefix) === undefined);
+		if (escaped) throw new Error(`Merge refused: candidate changes ${escaped}, which is outside the active project ${activeCwd}.`);
+		const parentStatus = await pi.exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...WORKFLOW_GIT_PATHS], { cwd: activeCwd, timeout: 30_000 });
 		if (parentStatus.code !== 0) throw new Error(parentStatus.stderr || "Cannot inspect parent worktree.");
 		if (parentStatus.stdout.length > 0) throw new Error("Merge refused: the parent worktree is dirty. Commit or stash its changes first.");
 		const branchRef = `refs/heads/${current.branch}`;
@@ -842,12 +890,13 @@ export default function harness(pi: ExtensionAPI) {
 			const staged = await pi.exec("git", ["diff", "--cached", "--quiet", "--exit-code"], { cwd: integrationWorktree, timeout: 30_000 });
 			if (staged.code === 0) return `Branch ${current.branch} is already integrated at ${headBefore.stdout.trim()}.`;
 			if (staged.code !== 1) throw new Error(`Cannot inspect staged merge result: ${staged.stderr}`);
-			const verifierEvidence = await runVerifierManifestAt(integrationWorktree);
+			const integrationProject = prefix ? join(integrationWorktree, prefix) : integrationWorktree;
+			const verifierEvidence = await runVerifierManifestAt(integrationProject);
 			const commit = await pi.exec("git", ["-c", "user.name=pi-app", "-c", "user.email=pi-app@local", "commit", "-m", `Merge background task ${task.id}: ${task.description}`], { cwd: integrationWorktree, timeout: 60_000 });
 			if (commit.code !== 0) throw new Error(`Cannot commit verified candidate: ${commit.stderr}`);
 			const merged = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: integrationWorktree, timeout: 30_000 });
 			const mergedCommit = merged.stdout.trim();
-			const parentStatusAgain = await pi.exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: activeCwd, timeout: 30_000 });
+			const parentStatusAgain = await pi.exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...WORKFLOW_GIT_PATHS], { cwd: activeCwd, timeout: 30_000 });
 			if (parentStatusAgain.code !== 0 || parentStatusAgain.stdout.length > 0) throw new Error("Parent worktree changed during verification; merge was not applied.");
 			const fastForward = await pi.exec("git", ["merge", "--ff-only", mergedCommit], { cwd: activeCwd, timeout: 60_000 });
 			if (fastForward.code !== 0) throw new Error(`Verified merge could not fast-forward the parent: ${fastForward.stderr}`);
@@ -927,10 +976,19 @@ export default function harness(pi: ExtensionAPI) {
 			// A normal checkout has a .git directory; only linked worktrees need this boundary.
 		}
 		taskUi = ctx.ui;
+		foregroundSettlements = 0;
 		startBackgroundHeartbeat();
 		const branch = ctx.sessionManager.getBranch();
-		const saved = [...branch].reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-app-workflow-state") as { data?: WorkflowState } | undefined;
-		if (saved?.data?.version === 3) state = normalizeWorkflowState(saved.data);
+		const saved = [...branch].reverse().find((entry) =>
+			entry.type === "custom"
+			&& (entry.customType === "pi-app-workflow-state" || entry.customType === "pi-app-workflow-cleared")) as { customType?: string; data?: WorkflowState } | undefined;
+		if (saved?.customType === "pi-app-workflow-state" && saved.data?.version === 3) {
+			state = normalizeWorkflowState(saved.data);
+			if (state.intent.allowsMutation) state = attachVerifierSteps(state, loadVerifierManifest(activeCwd));
+			hasWorkflow = true;
+		} else {
+			hasWorkflow = false;
+		}
 		for (const entry of branch) {
 			if (entry.type !== "custom" || !["subagents:record", "pi-app-background-record", "pi-app-evaluator-record"].includes(entry.customType)) continue;
 			const task = taskData(entry.data);
@@ -952,11 +1010,53 @@ export default function harness(pi: ExtensionAPI) {
 		}
 		const restoredSnapshot = await workspaceSnapshot();
 		if (!state.baseRevision) state.baseRevision = restoredSnapshot.head || undefined;
-		// A resumed workflow can contain an unverified diff whose original baseline is
-		// no longer in memory. Preserve that persisted pending state and run its gates.
-		workspaceBaselineFingerprint = state.editsPending && state.changedFiles.length > 0 ? "" : restoredSnapshot.fingerprint;
+		if (hasWorkflow) {
+			// Never present work from a previous process as actively running.
+			for (const step of state.steps.filter((item) => item.status === "running")) {
+				state = resetWorkflowStep(state, step.id, "Interrupted step restored as paused; retry requires a foreground turn.");
+			}
+			// Older builds collected repository-wide paths from a nested project.
+			// The fresh scoped snapshot is authoritative for this run.
+			state.changedFiles = restoredSnapshot.files.slice(-200);
+			const legacyEvaluator = state.steps.find((step) =>
+				step.id === "evaluate"
+				&& step.status === "failed"
+				&& (step.detail ?? "").includes("Tracked pre-existing files were deleted without explicit deletion authorization:"));
+			if (legacyEvaluator) {
+				const scopedDeletion = await pi.exec(
+					"git",
+					["diff", "--name-status", "--diff-filter=D", state.baseRevision || "HEAD", "--", ...WORKFLOW_GIT_PATHS],
+					{ cwd: activeCwd, timeout: 30_000 },
+				);
+				if (scopedDeletion.code === 0 && !scopedDeletion.stdout.trim()) {
+					state = resetWorkflowStep(state, "evaluate", "Legacy repository-wide evaluator failure cleared; retry requires a foreground turn.");
+					if (state.steps.some((step) => step.id === "review" && step.status !== "pending")) {
+						state = resetWorkflowStep(state, "review", "Waiting for a scoped evaluator retry.");
+					}
+					state.autoLoops = 0;
+					state.evaluatorTaskId = undefined;
+					state.steps = state.steps.map((step) => step.id === "build" && step.status === "passed"
+						? { ...step, attempts: Math.min(step.attempts, 1) }
+						: step);
+					for (const [taskId, task] of backgroundTasks) {
+						if (task.type !== "independent-evaluator"
+							|| !task.result?.includes("Tracked pre-existing files were deleted without explicit deletion authorization:")) continue;
+						backgroundTasks.set(taskId, {
+							...task,
+							status: "cancelled",
+							error: "Legacy repository-wide evaluator result ignored after workspace scoping.",
+						});
+					}
+				}
+			}
+		}
+		// A resumed workflow may retain an unverified diff, but opening its history
+		// must never masquerade as a new workspace change.
+		workspaceBaselineFingerprint = restoredSnapshot.fingerprint;
 		lastObservedFingerprint = restoredSnapshot.fingerprint;
-		if (enabled) publishState();
+		// Restoring/browsing a session is read-only. Migrations are shown live and
+		// become durable only when the user actually resumes or controls the run.
+		if (enabled && hasWorkflow) publishState(false);
 		publishTasks();
 	});
 
@@ -965,7 +1065,7 @@ export default function harness(pi: ExtensionAPI) {
 		activeModelPattern = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
 		const prompt = event.prompt.trim();
 		if (!prompt || prompt.startsWith("/")) return;
-		const resumes = state.editsPending && /^(?:continue|resume|go on|продолж(?:ай|и)?|дальше)\b/i.test(prompt);
+		const resumes = hasWorkflow && state.editsPending && /^(?:continue|resume|go on|продолж(?:ай|и)?|дальше)\b/i.test(prompt);
 		if (!resumes) {
 			const classifierAblated = ABLATIONS.has("classifier");
 			const routingPrompt = classifierAblated ? "Implement the requested repository change with verification." : prompt;
@@ -1004,8 +1104,16 @@ export default function harness(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_start", async () => {
+		foregroundSettlements++;
 		continuationQueued = false;
 		if (continuationWaiter) continuationWaiter.started = true;
+		if (enabled && hasWorkflow) {
+			const next = startForegroundWorkflowStep(state);
+			if (next !== state) {
+				state = next;
+				publishState();
+			}
+		}
 	});
 
 	pi.on("tool_call", async (event) => {
@@ -1120,10 +1228,10 @@ export default function harness(pi: ExtensionAPI) {
 		}
 		if (!enabled) return;
 		if (WRITE_TOOLS.has(name) && !event.isError) {
-			const path = changedPath(args);
+			const path = workspaceRelativePath(activeCwd, changedPath(args) ?? "");
 			if (path && !state.changedFiles.includes(path)) state.changedFiles.push(path);
 			for (const planId of ["plan", "reproduce"]) {
-				if (state.steps.some((step) => step.id === planId && step.status === "pending")) state = updateWorkflowStep(state, planId, "passed", "Planning boundary completed before first edit.");
+				if (state.steps.some((step) => step.id === planId && (step.status === "pending" || step.status === "running"))) state = updateWorkflowStep(state, planId, "passed", "Planning boundary completed before first edit.");
 			}
 			if (state.steps.some((step) => step.id === "build" && step.status !== "running")) state = updateWorkflowStep(state, "build", "running", "Implementation changed project files.");
 			state.editsPending = true;
@@ -1202,8 +1310,8 @@ export default function harness(pi: ExtensionAPI) {
 		publishTasks();
 		try {
 			const diffBase = state.baseRevision || "HEAD";
-			const diffResult = await pi.exec("git", ["diff", "--no-ext-diff", diffBase, "--"], { cwd: activeCwd, timeout: 30_000 });
-			const deletionResult = await pi.exec("git", ["diff", "--name-status", "--diff-filter=D", diffBase, "--"], { cwd: activeCwd, timeout: 30_000 });
+			const diffResult = await pi.exec("git", ["diff", "--no-ext-diff", diffBase, "--", ...WORKFLOW_GIT_PATHS], { cwd: activeCwd, timeout: 30_000 });
+			const deletionResult = await pi.exec("git", ["diff", "--name-status", "--diff-filter=D", diffBase, "--", ...WORKFLOW_GIT_PATHS], { cwd: activeCwd, timeout: 30_000 });
 			const deletedFiles = deletionResult.stdout.split("\n").map((line) => line.split("\t").at(-1)?.trim()).filter((path): path is string => Boolean(path));
 			const promptInput = {
 				objective: state.objective,
@@ -1355,8 +1463,13 @@ export default function harness(pi: ExtensionAPI) {
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		if (!enabled || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+		if (foregroundSettlements <= 0) {
+			log("ignored agent_settled without a matching foreground agent_start");
+			return;
+		}
+		foregroundSettlements--;
 		if (!state.intent.allowsMutation) {
-			for (const step of state.steps) if (step.status === "pending") state = updateWorkflowStep(state, step.id, "passed", "Read-only workflow completed by the agent.");
+			state = completeReadOnlyWorkflow(state);
 			publishState();
 			return;
 		}
@@ -1393,7 +1506,8 @@ export default function harness(pi: ExtensionAPI) {
 		}
 		const currentWorkspace = await workspaceSnapshot();
 		const changedThisTurn = Boolean(currentWorkspace.fingerprint && currentWorkspace.fingerprint !== lastObservedFingerprint);
-		const hasObjectiveDiff = Boolean(currentWorkspace.fingerprint && currentWorkspace.fingerprint !== workspaceBaselineFingerprint);
+		const hasObjectiveDiff = state.editsPending
+			|| Boolean(currentWorkspace.fingerprint && currentWorkspace.fingerprint !== workspaceBaselineFingerprint);
 		lastObservedFingerprint = currentWorkspace.fingerprint || lastObservedFingerprint;
 		if (changedThisTurn) {
 			for (const step of state.steps.filter((item) => item.kind === "gate" && item.status === "passed")) {
@@ -1401,11 +1515,18 @@ export default function harness(pi: ExtensionAPI) {
 			}
 		}
 		if (hasObjectiveDiff) {
-			state.changedFiles = [...new Set([...state.changedFiles, ...currentWorkspace.files])].slice(-200);
+			state.changedFiles = [...new Set([
+				...state.changedFiles.flatMap((path) => workspaceRelativePath(activeCwd, path) ?? []),
+				...currentWorkspace.files,
+			])].slice(-200);
 			for (const planId of ["plan", "reproduce"]) {
-				if (state.steps.some((step) => step.id === planId && step.status === "pending")) state = updateWorkflowStep(state, planId, "passed", "Planning boundary completed before observed repository change.");
+				if (state.steps.some((step) => step.id === planId && (step.status === "pending" || step.status === "running"))) state = updateWorkflowStep(state, planId, "passed", "Planning boundary completed before observed repository change.");
 			}
-			if (state.steps.some((step) => step.id === "build" && step.status !== "running")) state = updateWorkflowStep(state, "build", "running", "Repository diff changed during the implementation turn.");
+			if (changedThisTurn && state.steps.some((step) => step.id === "build" && step.status !== "running")) {
+				state = updateWorkflowStep(state, "build", "running", "Repository diff changed during the implementation turn.");
+			} else if (!changedThisTurn && state.steps.some((step) => step.id === "build" && ["pending", "failed"].includes(step.status))) {
+				state = updateWorkflowStep(state, "build", "passed", "Persisted scoped workspace diff is ready for deterministic verification.");
+			}
 			state.editsPending = true;
 		} else {
 			state.editsPending = false;

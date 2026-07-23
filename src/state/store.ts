@@ -88,6 +88,7 @@ export function isBrowsingAway(ws: WorkspaceChat): boolean {
 }
 
 export function activeBackgroundTaskCount(ws: WorkspaceChat): number {
+  if (!ws.alive) return 0;
   return ws.chat.backgroundTasks.filter((task) => task.status === "queued" || task.status === "running").length;
 }
 
@@ -368,9 +369,16 @@ function flushAgentEvents() {
       const t = ev.type as string;
       if (t === "agent_start") liveStreaming = true;
       else if (t === "agent_end") liveStreaming = false;
-      // Разрешительные диалоги/уведомления применяем всегда — иначе фоновый
-      // агент зависнет в ожидании ответа, пока смотрим другую сессию.
-      const isActionable = t === "extension_ui_request" || t === "error";
+      // Диалоги/уведомления и workspace-level очередь задач применяем всегда:
+      // иначе фоновый агент зависнет либо top-bar покажет устаревший статус.
+      // Session-specific workflow/preview widgets не должны затирать browse-view.
+      const method = String(ev.method ?? "");
+      const isLiveBackgroundWidget = t === "extension_ui_request"
+        && method === "setWidget"
+        && String(ev.widgetKey ?? ev.key ?? "") === "pi-app-background-state";
+      const isActionable = t === "error"
+        || isLiveBackgroundWidget
+        || (t === "extension_ui_request" && (DIALOG_METHODS.has(method) || method === "notify"));
       if (applyToView || isActionable) {
         if (!applied) {
           chat = { ...ws.chat };

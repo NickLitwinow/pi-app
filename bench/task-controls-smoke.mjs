@@ -3,38 +3,44 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-task-controls-smoke-")));
+const project = join(root, "project");
+const sibling = join(root, "sibling");
 const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
 
 try {
 	git("init", "-q", ".");
 	const parentBranch = git("symbolic-ref", "--short", "HEAD");
-	writeFileSync(join(root, "package.json"), JSON.stringify({
+	mkdirSync(project);
+	mkdirSync(sibling);
+	writeFileSync(join(project, "package.json"), JSON.stringify({
 		scripts: {
 			test: "node -e \"const fs=require('fs');if(fs.readFileSync('value.txt','utf8').trim()!=='two')process.exit(1)\"",
 		},
 	}, null, 2));
-	writeFileSync(join(root, "value.txt"), "one\n");
+	writeFileSync(join(project, "value.txt"), "one\n");
+	writeFileSync(join(sibling, "notes.txt"), "clean sibling\n");
 	git("add", "-A");
 	git("-c", "user.name=smoke", "-c", "user.email=smoke@local", "commit", "-qm", "fixture");
 	const baseSha = git("rev-parse", "HEAD");
 	const branch = "agent/task-controls-smoke";
 	git("switch", "-qc", branch);
-	writeFileSync(join(root, "value.txt"), "two\n");
-	git("add", "value.txt");
+	writeFileSync(join(project, "value.txt"), "two\n");
+	git("add", "project/value.txt");
 	git("-c", "user.name=smoke", "-c", "user.email=smoke@local", "commit", "-qm", "candidate");
 	git("switch", "-q", parentBranch);
+	writeFileSync(join(sibling, "notes.txt"), "unrelated parent edit\n");
 
 	const sessionPath = join(root, ".git", "task-controls-smoke.jsonl");
 	const sessionId = randomUUID();
 	const taskId = "smoke-agent";
 	const lines = [
-		{ type: "session", version: 3, id: sessionId, timestamp: new Date().toISOString(), cwd: root },
+		{ type: "session", version: 3, id: sessionId, timestamp: new Date().toISOString(), cwd: project },
 		{
 			type: "custom",
 			customType: "pi-app-background-record",
@@ -47,7 +53,7 @@ try {
 	writeFileSync(sessionPath, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
 	const child = spawn("pi", ["--mode", "rpc", "--session", sessionPath, "--offline", "-a"], {
-		cwd: root,
+		cwd: project,
 		stdio: ["pipe", "pipe", "pipe"],
 		env: { ...process.env, PI_APP_HARNESS_PROFILE: "workflow", PONYTAIL_DEFAULT_MODE: "off" },
 	});
@@ -75,8 +81,10 @@ try {
 	await response;
 	child.kill("SIGTERM");
 
-	assert.equal(readFileSync(join(root, "value.txt"), "utf8"), "two\n");
-	assert.equal(git("status", "--porcelain"), "");
+	assert.equal(readFileSync(join(project, "value.txt"), "utf8"), "two\n");
+	assert.equal(readFileSync(join(sibling, "notes.txt"), "utf8"), "unrelated parent edit\n");
+	assert.equal(git("status", "--porcelain", "--", "project"), "");
+	assert.match(git("status", "--porcelain", "--", "sibling"), /sibling\/notes\.txt/);
 	assert.equal(git("rev-list", "--parents", "-n", "1", "HEAD").split(/\s+/).length, 3, "verified integration should preserve a two-parent merge commit");
 	console.log("direct task merge control smoke passed");
 } finally {
