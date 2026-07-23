@@ -13,6 +13,9 @@ use tokio::task::JoinSet;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PiPackage {
+    /// Exact settings.json spec for installed rows. Catalog rows have no source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub name: String,
     pub version: String,
     pub description: String,
@@ -139,6 +142,7 @@ fn parse_object(o: &Value) -> Option<PiPackage> {
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
     Some(PiPackage {
+        source: None,
         npm_url: as_str(pkg, "/links/npm")
             .unwrap_or_else(|| format!("https://www.npmjs.com/package/{name}")),
         // npm отдаёт repository как git+https://…​.git — нормализуем, иначе open не откроет
@@ -196,7 +200,15 @@ pub async fn search_pi_packages(
     );
 
     let out = Command::new("/usr/bin/curl")
-        .args(["-s", "--compressed", "--max-time", "15", &url])
+        .args([
+            "-s",
+            "--compressed",
+            "--max-time",
+            "15",
+            "--max-filesize",
+            "4194304",
+            &url,
+        ])
         .stdin(Stdio::null())
         .output()
         .await
@@ -256,7 +268,15 @@ async fn fetch_one(spec: String) -> Option<PiPackage> {
     let enc = name.replace('/', "%2F");
     let url = format!("https://registry.npmjs.org/{enc}/latest");
     let out = Command::new("/usr/bin/curl")
-        .args(["-s", "--compressed", "--max-time", "12", &url])
+        .args([
+            "-s",
+            "--compressed",
+            "--max-time",
+            "12",
+            "--max-filesize",
+            "2097152",
+            &url,
+        ])
         .stdin(Stdio::null())
         .output()
         .await
@@ -279,6 +299,7 @@ async fn fetch_one(spec: String) -> Option<PiPackage> {
         })
         .unwrap_or_default();
     Some(PiPackage {
+        source: None,
         npm_url: format!("https://www.npmjs.com/package/{name}"),
         repo_url: clean_repo(&v, "repository"),
         homepage: v
@@ -321,6 +342,17 @@ fn npm_name_and_pin(spec: &str) -> Option<(String, bool)> {
     let (name, pinned) = version_at
         .map(|at| (&raw[..at], true))
         .unwrap_or((raw, false));
+    let parts: Vec<&str> = name.split('/').collect();
+    let valid = if name.starts_with('@') {
+        parts.len() == 2 && parts[0].len() > 1
+    } else {
+        parts.len() == 1
+    } && parts
+        .iter()
+        .all(|part| !part.is_empty() && *part != "." && *part != ".." && !part.contains('\\'));
+    if !valid {
+        return None;
+    }
     Some((name.to_string(), pinned))
 }
 
@@ -338,30 +370,113 @@ fn installed_version(name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn installed_display_name(spec: &str) -> String {
+    if let Some(raw) = spec.strip_prefix("npm:") {
+        return npm_name_and_pin(raw)
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| raw.to_string());
+    }
+    let raw = spec
+        .trim()
+        .strip_prefix("git:")
+        .or_else(|| spec.trim().strip_prefix("file:"))
+        .unwrap_or(spec.trim())
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(['/', '\\']);
+    raw.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(raw)
+        .strip_suffix(".git")
+        .unwrap_or_else(|| raw.rsplit(['/', '\\']).next().unwrap_or(raw))
+        .to_string()
+}
+
+fn installed_fallback(spec: &str) -> PiPackage {
+    let name = installed_display_name(spec);
+    let npm_name = spec
+        .strip_prefix("npm:")
+        .and_then(|raw| npm_name_and_pin(raw).map(|(name, _)| name));
+    let repo_url = spec.strip_prefix("git:").and_then(|raw| {
+        if raw.starts_with("github.com/") {
+            Some(
+                format!("https://{raw}")
+                    .trim_end_matches(".git")
+                    .to_string(),
+            )
+        } else {
+            clean_git_url(raw)
+        }
+    });
+    PiPackage {
+        source: Some(spec.to_string()),
+        name: name.clone(),
+        version: String::new(),
+        description: if spec.starts_with("npm:") {
+            format!("Установленный npm-пакет {name}; метаданные реестра недоступны.")
+        } else if spec.starts_with("git:") {
+            format!("Установленный Git-пакет: {spec}")
+        } else {
+            format!("Локальный пакет: {spec}")
+        },
+        author: String::new(),
+        downloads_monthly: 0,
+        npm_url: npm_name
+            .as_deref()
+            .map(|name| format!("https://www.npmjs.com/package/{name}"))
+            .unwrap_or_default(),
+        repo_url,
+        homepage: None,
+        keywords: Vec::new(),
+        updated: None,
+        popularity: 0.0,
+        installed_version: npm_name.as_deref().and_then(installed_version),
+        update_available: false,
+        pinned: false,
+    }
+}
+
+async fn resolve_installed_package(spec: String) -> Option<PiPackage> {
+    let Some(raw_npm) = spec.strip_prefix("npm:") else {
+        return Some(installed_fallback(&spec));
+    };
+    let Some((name, pinned)) = npm_name_and_pin(raw_npm) else {
+        return Some(installed_fallback(&spec));
+    };
+    let local = installed_version(&name);
+    let mut package = fetch_one(spec.clone())
+        .await
+        .unwrap_or_else(|| installed_fallback(&spec));
+    package.source = Some(spec);
+    package.installed_version = local.clone();
+    package.pinned = pinned;
+    package.update_available = !pinned
+        && local
+            .as_deref()
+            .is_some_and(|version| version != package.version);
+    Some(package)
+}
+
 /// Resolve metadata for a list of installed package specs (from settings.json
 /// `packages`) — used by the "Installed" view so it lists every installed
 /// package, not just those surfaced by a catalog search. Fetched concurrently.
 #[tauri::command]
 pub async fn pi_packages_meta(names: Vec<String>) -> Vec<PiPackage> {
+    const MAX_PACKAGES: usize = 80;
+    const MAX_CONCURRENT_FETCHES: usize = 8;
+    let mut pending = names.into_iter().take(MAX_PACKAGES);
     let mut set = JoinSet::new();
-    for spec in names.into_iter().take(80) {
-        set.spawn(async move {
-            let (name, pinned) = npm_name_and_pin(&spec)?;
-            let local = installed_version(&name);
-            let mut package = fetch_one(spec).await?;
-            package.installed_version = local.clone();
-            package.pinned = pinned;
-            package.update_available = !pinned
-                && local
-                    .as_deref()
-                    .is_some_and(|version| version != package.version);
-            Some(package)
-        });
+    for spec in pending.by_ref().take(MAX_CONCURRENT_FETCHES) {
+        set.spawn(resolve_installed_package(spec));
     }
     let mut out = Vec::new();
     while let Some(res) = set.join_next().await {
         if let Ok(Some(p)) = res {
             out.push(p);
+        }
+        if let Some(spec) = pending.next() {
+            set.spawn(resolve_installed_package(spec));
         }
     }
     out.sort_by_key(|a| a.name.to_lowercase());
@@ -426,5 +541,31 @@ mod tests {
             npm_name_and_pin("npm:@scope/pkg@2.0.0"),
             Some(("@scope/pkg".into(), true))
         );
+        assert_eq!(npm_name_and_pin("npm:pkg/../../outside"), None);
+        assert_eq!(npm_name_and_pin("npm:@scope/../outside"), None);
+        assert_eq!(npm_name_and_pin("npm:pkg\\..\\outside"), None);
+    }
+
+    #[test]
+    fn installed_fallback_preserves_npm_git_and_local_sources() {
+        let npm = installed_fallback("npm:@scope/pkg@2.0.0");
+        assert_eq!(npm.name, "@scope/pkg");
+        assert_eq!(npm.source.as_deref(), Some("npm:@scope/pkg@2.0.0"));
+        assert_eq!(npm.npm_url, "https://www.npmjs.com/package/@scope/pkg");
+
+        let git = installed_fallback("git:github.com/DietrichGebert/ponytail.git");
+        assert_eq!(git.name, "ponytail");
+        assert_eq!(
+            git.repo_url.as_deref(),
+            Some("https://github.com/DietrichGebert/ponytail")
+        );
+
+        let local = installed_fallback("../../GithubControl/pi-app/harness-extension/");
+        assert_eq!(local.name, "harness-extension");
+        assert_eq!(
+            local.source.as_deref(),
+            Some("../../GithubControl/pi-app/harness-extension/")
+        );
+        assert!(local.npm_url.is_empty());
     }
 }

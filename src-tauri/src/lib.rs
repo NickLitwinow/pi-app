@@ -200,6 +200,7 @@ pub fn run() {
             app_update::relaunch_app,
             themes::list_pi_themes,
             themes::save_pi_theme,
+            themes::delete_pi_theme,
             themes::export_pi_theme_package,
         ])
         .build(tauri::generate_context!())

@@ -45,15 +45,19 @@ const NAV: { view: View; label: string; icon: (p: { size?: number }) => ReactEle
 ];
 
 async function openFolder() {
-  const be = await getBackend();
-  if (be.isMock) {
-    const p = window.prompt("Путь к папке проекта:", "/Users/dev/new-project");
-    if (p) addWorkspace(p);
-    return;
+  try {
+    const be = await getBackend();
+    if (be.isMock) {
+      const p = window.prompt("Путь к папке проекта:", "/Users/dev/new-project");
+      if (p) await addWorkspace(p);
+      return;
+    }
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const dir = await open({ directory: true, multiple: false, title: "Открыть папку проекта" });
+    if (typeof dir === "string" && dir) await addWorkspace(dir);
+  } catch (error) {
+    void messageDialog(`Не удалось открыть проект: ${String(error)}`, { kind: "error" });
   }
-  const { open } = await import("@tauri-apps/plugin-dialog");
-  const dir = await open({ directory: true, multiple: false, title: "Открыть папку проекта" });
-  if (typeof dir === "string" && dir) addWorkspace(dir);
 }
 
 const EMPTY_SESSIONS: SessionMeta[] = [];
@@ -67,6 +71,10 @@ function fmtWhen(ms: number): string {
   if (d < 3600e3) return `${Math.max(1, Math.round(d / 60e3))} мин`;
   if (d < 86400e3) return `${Math.round(d / 3600e3)} ч`;
   return new Date(ms).toLocaleDateString("ru-RU", { day: "2-digit", month: "short" });
+}
+
+function reportSidebarError(action: string, operation: Promise<unknown>): void {
+  void operation.catch((error) => messageDialog(`${action}: ${String(error)}`, { kind: "error" }));
 }
 
 // ---------- session row with ⋯ menu ----------
@@ -112,7 +120,11 @@ function SessionRow({
   const commitRename = async () => {
     setRenaming(false);
     const name = draft.trim();
-    if (name && name !== sessionTitle(s)) await renameSessionAction(cwd, s.path, name).catch(() => {});
+    if (name && name !== sessionTitle(s)) {
+      await renameSessionAction(cwd, s.path, name).catch((error) => {
+        void messageDialog(`Не удалось переименовать сессию: ${String(error)}`, { kind: "error" });
+      });
+    }
   };
 
   if (renaming) {
@@ -121,6 +133,7 @@ function SessionRow({
         <input
           autoFocus
           className="sess-rename"
+          aria-label={`Новое имя сессии «${sessionTitle(s)}»`}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
@@ -136,16 +149,29 @@ function SessionRow({
   const submitNewGroup = async () => {
     const name = newGroupName.trim();
     if (!name) return;
-    const id = await createGroup(cwd, name);
-    await moveSessionToGroup(s.path, id);
-    setNewGroupName("");
-    setMenuOpen(false);
+    try {
+      const id = await createGroup(cwd, name);
+      await moveSessionToGroup(s.path, id);
+      setNewGroupName("");
+      setMenuOpen(false);
+    } catch (error) {
+      void messageDialog(`Не удалось создать группу: ${String(error)}`, { kind: "error" });
+    }
   };
 
   return (
     <div
       className={`sess-row ${active ? "active" : ""}`}
+      role="button"
+      tabIndex={0}
+      aria-current={active ? "page" : undefined}
+      aria-label={`Открыть сессию «${sessionTitle(s)}»`}
       onClick={() => void openSession(cwd, s)}
+      onKeyDown={(e) => {
+        if (e.target !== e.currentTarget || (e.key !== "Enter" && e.key !== " ")) return;
+        e.preventDefault();
+        void openSession(cwd, s);
+      }}
       onContextMenu={(e) => {
         e.preventDefault();
         setMenuOpen(true);
@@ -157,6 +183,9 @@ function SessionRow({
       <span className="sess-when">{fmtWhen(s.modifiedMs)}</span>
       <button
         className="sess-more"
+        aria-label={`Действия с сессией «${sessionTitle(s)}»`}
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
         onClick={(e) => {
           e.stopPropagation();
           setMenuOpen(!menuOpen);
@@ -171,7 +200,7 @@ function SessionRow({
               <button
                 onClick={() => {
                   setMenuOpen(false);
-                  void togglePinned(s.path);
+                  reportSidebarError("Не удалось изменить закрепление", togglePinned(s.path));
                 }}
               >
                 {pinned ? "Открепить" : "Закрепить"}
@@ -197,7 +226,7 @@ function SessionRow({
               <button
                 onClick={() => {
                   setMenuOpen(false);
-                  void toggleArchived(s.path);
+                  reportSidebarError("Не удалось изменить архив", toggleArchived(s.path));
                 }}
               >
                 {archived ? "Разархивировать" : "Архивировать"}
@@ -207,7 +236,7 @@ function SessionRow({
                 onClick={() => {
                   setMenuOpen(false);
                   void confirmDialog(`Удалить сессию «${sessionTitle(s)}» безвозвратно?`, { kind: "warning" }).then((ok) => {
-                    if (ok) void deleteSessionAction(cwd, s.path);
+                    if (ok) reportSidebarError("Не удалось удалить сессию", deleteSessionAction(cwd, s.path));
                   });
                 }}
               >
@@ -222,7 +251,7 @@ function SessionRow({
                   key={g.id}
                   onClick={() => {
                     setMenuOpen(false);
-                    void moveSessionToGroup(s.path, g.id);
+                    reportSidebarError("Не удалось переместить сессию", moveSessionToGroup(s.path, g.id));
                   }}
                 >
                   {groupId === g.id ? "✓ " : ""}
@@ -233,7 +262,7 @@ function SessionRow({
                 <button
                   onClick={() => {
                     setMenuOpen(false);
-                    void moveSessionToGroup(s.path, null);
+                    reportSidebarError("Не удалось убрать сессию из группы", moveSessionToGroup(s.path, null));
                   }}
                 >
                   Убрать из группы
@@ -243,6 +272,7 @@ function SessionRow({
                 <input
                   autoFocus={groups.length === 0}
                   placeholder="Новая группа…"
+                  aria-label="Название новой группы"
                   value={newGroupName}
                   onChange={(e) => setNewGroupName(e.target.value)}
                   onKeyDown={(e) => {
@@ -293,7 +323,7 @@ function GroupSection({
   const commitRename = () => {
     setRenaming(false);
     const name = draft.trim();
-    if (name && name !== group.name) void renameGroup(group.id, name);
+    if (name && name !== group.name) reportSidebarError("Не удалось переименовать группу", renameGroup(group.id, name));
   };
 
   if (renaming) {
@@ -304,6 +334,7 @@ function GroupSection({
           <input
             autoFocus
             className="sess-rename"
+            aria-label={`Новое имя группы «${group.name}»`}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
@@ -319,13 +350,28 @@ function GroupSection({
 
   return (
     <div className="sess-group">
-      <div className="sess-row group-head" onClick={() => setOpen(!open)}>
+      <div
+        className="sess-row group-head"
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        aria-label={`${open ? "Свернуть" : "Развернуть"} группу «${group.name}»`}
+        onClick={() => setOpen(!open)}
+        onKeyDown={(e) => {
+          if (e.target !== e.currentTarget || (e.key !== "Enter" && e.key !== " ")) return;
+          e.preventDefault();
+          setOpen(!open);
+        }}
+      >
         <ChevronIcon open={open} size={11} />
         <GroupIcon size={12} />
         <span className="sess-title">{group.name}</span>
         <span className="sess-when">{sessions.length}</span>
         <button
           className="sess-more"
+          aria-label={`Действия с группой «${group.name}»`}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
           onClick={(e) => {
             e.stopPropagation();
             setMenuOpen(!menuOpen);
@@ -349,7 +395,7 @@ function GroupSection({
               onClick={() => {
                 setMenuOpen(false);
                 void confirmDialog(`Удалить группу «${group.name}»? Сессии останутся в проекте.`).then((ok) => {
-                  if (ok) void deleteGroup(group.id);
+                  if (ok) reportSidebarError("Не удалось удалить группу", deleteGroup(group.id));
                 });
               }}
             >
@@ -367,7 +413,9 @@ function GroupSection({
 
 async function revealProject(cwd: string) {
   const be = await getBackend();
-  await be.invoke("reveal_in_finder", { path: cwd }).catch(() => {});
+  await be.invoke("reveal_in_finder", { path: cwd }).catch((error) => {
+    void messageDialog(`Не удалось открыть проект в Finder: ${String(error)}`, { kind: "error" });
+  });
 }
 
 function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: number }) {
@@ -431,7 +479,18 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
     <div className="proj">
       <div
         className={`ws proj-head ${isCurrent ? "active" : ""}`}
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        aria-current={isCurrent ? "page" : undefined}
+        aria-label={`${isCurrent ? "Проект" : "Выбрать проект"} «${name}»`}
         onClick={() => {
+          selectWorkspace(cwd);
+          setExpanded(isCurrent ? !expanded : true);
+        }}
+        onKeyDown={(e) => {
+          if (e.target !== e.currentTarget || (e.key !== "Enter" && e.key !== " ")) return;
+          e.preventDefault();
           selectWorkspace(cwd);
           setExpanded(isCurrent ? !expanded : true);
         }}
@@ -457,6 +516,9 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
         </span>
         <button
           className="sess-more"
+          aria-label={`Действия с проектом «${name}»`}
+          aria-haspopup="menu"
+          aria-expanded={projMenu}
           onClick={(e) => {
             e.stopPropagation();
             setProjMenu(!projMenu);
@@ -482,7 +544,7 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
                   `Открепить «${name}» от сайдбара?\n\nЭто только убирает проект из списка — папка проекта и файлы сессий на диске НЕ удаляются. Проект вернётся, если снова открыть его папку.`,
                   { title: "Открепить проект", kind: "info", okLabel: "Открепить", cancelLabel: "Отмена" },
                 ).then((ok) => {
-                  if (ok) void removeWorkspace(cwd);
+                  if (ok) reportSidebarError("Не удалось открепить проект", removeWorkspace(cwd));
                 });
               }}
             >
@@ -547,13 +609,20 @@ function ProjectBlock({ cwd, name, count }: { cwd: string; name: string; count: 
 
 function SearchResults({ query }: { query: string }) {
   const [hits, setHits] = useState<SearchHit[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let stale = false;
+    setHits(null);
+    setError(null);
     const t = setTimeout(async () => {
-      const be = await getBackend();
-      const res = await be.invoke<SearchHit[]>("search_sessions", { query }).catch(() => []);
-      if (!stale) setHits(res as SearchHit[]);
+      try {
+        const be = await getBackend();
+        const res = await be.invoke<SearchHit[]>("search_sessions", { query });
+        if (!stale) setHits(res);
+      } catch (searchError) {
+        if (!stale) setError(`Не удалось выполнить поиск: ${String(searchError)}`);
+      }
     }, 300);
     return () => {
       stale = true;
@@ -562,15 +631,20 @@ function SearchResults({ query }: { query: string }) {
   }, [query]);
 
   const open = async (h: SearchHit) => {
-    const s = useStore.getState();
-    if (![...s.projects, ...s.extraWorkspaces].some((p) => p.cwd === h.cwd)) addWorkspace(h.cwd);
-    const meta: SessionMeta = {
-      path: h.path, id: h.path, cwd: h.cwd, name: null, createdAt: h.timestamp,
-      modifiedMs: 0, messageCount: 0, userSnippet: h.snippet, costTotal: 0, tokensIn: 0, tokensOut: 0,
-    };
-    await openSession(h.cwd, meta);
+    try {
+      const s = useStore.getState();
+      if (![...s.projects, ...s.extraWorkspaces].some((p) => p.cwd === h.cwd)) await addWorkspace(h.cwd);
+      const meta: SessionMeta = {
+        path: h.path, id: h.path, cwd: h.cwd, name: null, createdAt: h.timestamp,
+        modifiedMs: 0, messageCount: 0, userSnippet: h.snippet, costTotal: 0, tokensIn: 0, tokensOut: 0,
+      };
+      await openSession(h.cwd, meta);
+    } catch (openError) {
+      setError(`Не удалось открыть результат: ${String(openError)}`);
+    }
   };
 
+  if (error) return <div className="alert error" style={{ margin: "8px 10px" }}>{error}</div>;
   if (!hits) return <div className="hint" style={{ padding: "8px 14px" }}>Поиск…</div>;
   if (hits.length === 0) return <div className="hint" style={{ padding: "8px 14px" }}>Ничего не найдено</div>;
   return (
@@ -699,7 +773,24 @@ export default function Sidebar() {
           <UpdateIcon size={13} /> Обновления
         </button>
       </div>
-      <div className="side-resize" onMouseDown={onResizeStart} title="Потяните, чтобы изменить ширину" />
+      <div
+        className="side-resize"
+        role="separator"
+        tabIndex={0}
+        aria-label="Ширина боковой панели"
+        aria-orientation="vertical"
+        aria-valuemin={190}
+        aria-valuemax={400}
+        aria-valuenow={width}
+        onMouseDown={onResizeStart}
+        onKeyDown={(e) => {
+          if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+          e.preventDefault();
+          const direction = e.key === "ArrowLeft" ? -1 : 1;
+          void updateAppConfig({ sidebarWidth: Math.min(400, Math.max(190, width + direction * 10)) });
+        }}
+        title="Потяните или используйте стрелки, чтобы изменить ширину"
+      />
       {updateOpen && <UpdateModal onClose={() => setUpdateOpen(false)} />}
     </div>
   );

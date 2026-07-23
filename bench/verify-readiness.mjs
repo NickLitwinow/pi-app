@@ -8,7 +8,7 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +22,8 @@ const skipRelease = process.argv.includes("--skip-release");
 const reportPath = join(resultsDir, "final-readiness-report.json");
 const agentRoot = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 const modelId = "ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision";
+
+mkdirSync(resultsDir, { recursive: true });
 
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 const failures = [];

@@ -58,10 +58,17 @@ function BranchPicker({
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    const be = await getBackend();
-    setBranches(await be.invoke<BranchInfo[]>("git_branches", { cwd }).catch(() => []));
+    try {
+      const be = await getBackend();
+      setBranches(await be.invoke<BranchInfo[]>("git_branches", { cwd }));
+      setError(null);
+    } catch (loadError) {
+      setBranches([]);
+      setError(`Не удалось загрузить ветки: ${String(loadError)}`);
+    }
   }, [cwd]);
 
   useEffect(() => {
@@ -125,8 +132,22 @@ function BranchPicker({
       {open && (
         <div className="dropdown" style={{ top: "100%", bottom: "auto", marginTop: 6, left: 0 }} onMouseLeave={() => setOpen(false)}>
           <div className="dd-list" style={{ maxHeight: 320 }}>
+            {error && <div className="alert error" style={{ margin: 6 }}>{error}</div>}
             {branches.map((b) => (
-              <div key={b.name} className={`dd-item ${b.current ? "sel" : ""}`} onClick={() => !b.current && !busy && void checkout(b)}>
+              <div
+                key={b.name}
+                className={`dd-item ${b.current ? "sel" : ""}`}
+                role="button"
+                tabIndex={b.current || busy ? -1 : 0}
+                aria-current={b.current ? "page" : undefined}
+                aria-label={`${b.current ? "Текущая ветка" : "Переключиться на ветку"} ${b.name}`}
+                onClick={() => !b.current && !busy && void checkout(b)}
+                onKeyDown={(e) => {
+                  if (e.target !== e.currentTarget || b.current || busy || (e.key !== "Enter" && e.key !== " ")) return;
+                  e.preventDefault();
+                  void checkout(b);
+                }}
+              >
                 <BranchIcon size={12} />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -144,6 +165,7 @@ function BranchPicker({
                     className="danger"
                     style={{ padding: "2px 5px" }}
                     title="Удалить ветку"
+                    aria-label={`Удалить ветку ${b.name}`}
                     onClick={(e) => {
                       e.stopPropagation();
                       void deleteBranch(b);
@@ -172,9 +194,9 @@ function BranchPicker({
                 </button>
               </div>
             ) : (
-              <div className="dd-item" onClick={() => setCreating(true)}>
+              <button type="button" className="dd-item" onClick={() => setCreating(true)}>
                 <PlusIcon size={12} /> Новая ветка от текущей…
-              </div>
+              </button>
             )}
           </div>
         </div>
@@ -257,7 +279,9 @@ function DiffFileBlock({
   const openInEditor = async () => {
     const be = await getBackend();
     const path = `${cwd.replace(/\/$/, "")}/${file.newPath}`;
-    await be.invoke("open_in_editor", { editor, path, line: firstChangedLine(file) }).catch(() => {});
+    await be.invoke("open_in_editor", { editor, path, line: firstChangedLine(file) }).catch((openError) => {
+      void messageDialog(`Не удалось открыть файл в редакторе: ${String(openError)}`, { kind: "error" });
+    });
   };
 
   const renderRow = (row: DiffRow) => {
@@ -397,16 +421,29 @@ function ChangesTab({
   const [commitMsg, setCommitMsg] = useState("");
   const [amend, setAmend] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [diffError, setDiffError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    const be = await getBackend();
-    const entries = await be.invoke<StatusEntry[]>("git_status", { cwd }).catch(() => []);
-    setRows(parseStatusEntries(entries));
+    try {
+      const be = await getBackend();
+      const entries = await be.invoke<StatusEntry[]>("git_status", { cwd });
+      setRows(parseStatusEntries(entries));
+      setStatusError(null);
+    } catch (refreshError) {
+      setStatusError(`Не удалось прочитать состояние Git: ${String(refreshError)}`);
+    }
   }, [cwd]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    setSelected(null);
+    setDiffText("");
+    setDiffError(null);
+  }, [cwd]);
 
   const staged = rows.filter((r) => r.indexStatus !== " " && r.indexStatus !== "?");
   const unstaged = rows.filter((r) => r.worktreeStatus !== " " || r.indexStatus === "?");
@@ -419,11 +456,19 @@ function ChangesTab({
     }
     let stale = false;
     void (async () => {
-      const be = await getBackend();
-      const text = await be
-        .invoke<string>("git_file_diff", { cwd, path: selected.path, staged: selected.staged })
-        .catch(() => "");
-      if (!stale) setDiffText(text);
+      try {
+        const be = await getBackend();
+        const text = await be.invoke<string>("git_file_diff", { cwd, path: selected.path, staged: selected.staged });
+        if (!stale) {
+          setDiffText(text);
+          setDiffError(null);
+        }
+      } catch (loadError) {
+        if (!stale) {
+          setDiffText("");
+          setDiffError(`Не удалось загрузить diff: ${String(loadError)}`);
+        }
+      }
     })();
     return () => {
       stale = true;
@@ -465,6 +510,7 @@ function ChangesTab({
   return (
     <div className="split">
       <div className="left">
+        {statusError && <div className="alert error" style={{ marginBottom: 8 }}>{statusError}</div>}
         <div className="commit-box">
           <textarea
             placeholder={amend ? "Сообщение (amend последнего коммита)…" : "Сообщение коммита…"}
@@ -507,7 +553,16 @@ function ChangesTab({
             <div
               key={`s-${r.path}`}
               className={`file-row ${isSel ? "active" : ""}`}
+              role="button"
+              tabIndex={0}
+              aria-current={isSel ? "true" : undefined}
+              aria-label={`Показать staged diff ${r.path}`}
               onClick={() => setSelected({ path: r.path, staged: true })}
+              onKeyDown={(e) => {
+                if (e.target !== e.currentTarget || (e.key !== "Enter" && e.key !== " ")) return;
+                e.preventDefault();
+                setSelected({ path: r.path, staged: true });
+              }}
               title={r.path}
             >
               <span className={`badge ${b.cls}`}>{b.label}</span>
@@ -536,7 +591,16 @@ function ChangesTab({
             <div
               key={`u-${r.path}`}
               className={`file-row ${isSel ? "active" : ""}`}
+              role="button"
+              tabIndex={0}
+              aria-current={isSel ? "true" : undefined}
+              aria-label={`Показать diff ${r.path}`}
               onClick={() => setSelected({ path: r.path, staged: false })}
+              onKeyDown={(e) => {
+                if (e.target !== e.currentTarget || (e.key !== "Enter" && e.key !== " ")) return;
+                e.preventDefault();
+                setSelected({ path: r.path, staged: false });
+              }}
               title={r.path}
             >
               <span className={`badge ${b.cls}`}>{b.label}</span>
@@ -562,7 +626,9 @@ function ChangesTab({
       </div>
 
       <div className="right" style={{ padding: 14 }}>
-        {selected == null ? (
+        {diffError ? (
+          <div className="alert error">{diffError}</div>
+        ) : selected == null ? (
           <div className="empty">
             <div className="e-icon"><ReviewIcon size={32} /></div>
             <div>Выберите файл, чтобы посмотреть diff{rows.length > 0 ? "" : " — изменений нет"}.</div>
@@ -585,23 +651,45 @@ function HistoryTab({ cwd, onComment }: { cwd: string; onComment: (c: ReviewComm
   const [commits, setCommits] = useState<CommitInfo[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [diffText, setDiffText] = useState("");
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [diffError, setDiffError] = useState<string | null>(null);
 
   useEffect(() => {
     void (async () => {
-      const be = await getBackend();
-      const log = await be.invoke<CommitInfo[]>("git_log", { cwd, limit: 100 }).catch(() => []);
-      setCommits(log);
-      if (log.length > 0) setSelected((s) => s ?? log[0].hash);
+      try {
+        const be = await getBackend();
+        const log = await be.invoke<CommitInfo[]>("git_log", { cwd, limit: 100 });
+        setCommits(log);
+        setHistoryError(null);
+        setSelected(log[0]?.hash ?? null);
+      } catch (loadError) {
+        setCommits([]);
+        setHistoryError(`Не удалось загрузить историю Git: ${String(loadError)}`);
+      }
     })();
   }, [cwd]);
 
   useEffect(() => {
-    if (!selected) return;
+    if (!selected) {
+      setDiffText("");
+      setDiffError(null);
+      return;
+    }
     let stale = false;
     void (async () => {
-      const be = await getBackend();
-      const text = await be.invoke<string>("git_show_commit", { cwd, hash: selected }).catch(() => "");
-      if (!stale) setDiffText(text);
+      try {
+        const be = await getBackend();
+        const text = await be.invoke<string>("git_show_commit", { cwd, hash: selected });
+        if (!stale) {
+          setDiffText(text);
+          setDiffError(null);
+        }
+      } catch (loadError) {
+        if (!stale) {
+          setDiffText("");
+          setDiffError(`Не удалось загрузить коммит: ${String(loadError)}`);
+        }
+      }
     })();
     return () => {
       stale = true;
@@ -614,11 +702,21 @@ function HistoryTab({ cwd, onComment }: { cwd: string; onComment: (c: ReviewComm
   return (
     <div className="split">
       <div className="left">
+        {historyError && <div className="alert error" style={{ marginBottom: 8 }}>{historyError}</div>}
         {commits.map((c) => (
           <div
             key={c.hash}
             className={`file-row commit-row ${selected === c.hash ? "active" : ""}`}
+            role="button"
+            tabIndex={0}
+            aria-current={selected === c.hash ? "true" : undefined}
+            aria-label={`Показать коммит ${c.shortHash}: ${c.subject}`}
             onClick={() => setSelected(c.hash)}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter" && e.key !== " ") return;
+              e.preventDefault();
+              setSelected(c.hash);
+            }}
             title={`${c.shortHash} · ${c.author}`}
           >
             <CommitIcon size={13} />
@@ -634,6 +732,7 @@ function HistoryTab({ cwd, onComment }: { cwd: string; onComment: (c: ReviewComm
         {commits.length === 0 && <div className="muted">Коммитов нет</div>}
       </div>
       <div className="right" style={{ padding: 14 }}>
+        {diffError && <div className="alert error" style={{ marginBottom: 8 }}>{diffError}</div>}
         {current && (
           <div className="card" style={{ marginBottom: 12 }}>
             <div className="c-title" style={{ fontSize: 13 }}>{current.subject}</div>
@@ -660,6 +759,7 @@ function CheckpointsTab({ cwd, onComment, onChanged, initialBase }: { cwd: strin
   const [diffText, setDiffText] = useState("");
   const [loading, setLoading] = useState(false);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -667,8 +767,10 @@ function CheckpointsTab({ cwd, onComment, onChanged, initialBase }: { cwd: strin
       const be = await getBackend();
       const text = await be.invoke<string>("git_review_diff", { cwd, base: base === "HEAD" ? null : base });
       setDiffText(text);
-    } catch {
+      setError(null);
+    } catch (refreshError) {
       setDiffText("");
+      setError(`Не удалось загрузить diff чекпоинта: ${String(refreshError)}`);
     } finally {
       setLoading(false);
     }
@@ -677,6 +779,11 @@ function CheckpointsTab({ cwd, onComment, onChanged, initialBase }: { cwd: strin
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    setBase(initialBase ?? "HEAD");
+    setSelectedFile(null);
+  }, [cwd, initialBase]);
 
   const files = useMemo(() => parseUnifiedDiff(diffText), [diffText]);
   const current = files.find((f) => f.newPath === selectedFile) ?? files[0] ?? null;
@@ -705,7 +812,9 @@ function CheckpointsTab({ cwd, onComment, onChanged, initialBase }: { cwd: strin
         </button>
         <span className="hint">Чекпоинты создаются автоматически перед каждым ходом агента</span>
       </div>
-      {loading && files.length === 0 ? (
+      {error ? (
+        <div className="alert error" style={{ margin: 14 }}>{error}</div>
+      ) : loading && files.length === 0 ? (
         <div className="empty"><div className="spinner" /></div>
       ) : files.length === 0 ? (
         <div className="empty">
@@ -720,7 +829,16 @@ function CheckpointsTab({ cwd, onComment, onChanged, initialBase }: { cwd: strin
                 key={f.newPath}
                 className={`card click ${current?.newPath === f.newPath ? "active" : ""}`}
                 style={{ padding: "8px 10px" }}
+                role="button"
+                tabIndex={0}
+                aria-current={current?.newPath === f.newPath ? "true" : undefined}
+                aria-label={`Показать diff чекпоинта ${f.newPath}`}
                 onClick={() => setSelectedFile(f.newPath)}
+                onKeyDown={(e) => {
+                  if (e.key !== "Enter" && e.key !== " ") return;
+                  e.preventDefault();
+                  setSelectedFile(f.newPath);
+                }}
               >
                 <div className="c-title" style={{ fontSize: 12, fontFamily: "var(--font-mono)" }}>
                   <span className={`badge ${f.status === "added" ? "green" : f.status === "deleted" ? "red" : ""}`}>
@@ -771,14 +889,20 @@ export default function ReviewView() {
   const [isRepo, setIsRepo] = useState<boolean | null>(null);
   const [comments, setComments] = useState<ReviewComment[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [reviewError, setReviewError] = useState<string | null>(null);
 
   const refreshSummary = useCallback(async () => {
     if (!cwd) return;
-    const be = await getBackend();
-    const repo = await be.invoke<boolean>("git_is_repo", { cwd }).catch(() => false);
-    setIsRepo(repo);
-    if (repo) {
-      setSummary(await be.invoke<GitSummary>("git_summary", { cwd }).catch(() => null));
+    try {
+      const be = await getBackend();
+      const repo = await be.invoke<boolean>("git_is_repo", { cwd });
+      setIsRepo(repo);
+      setSummary(repo ? await be.invoke<GitSummary>("git_summary", { cwd }) : null);
+      setReviewError(null);
+    } catch (refreshError) {
+      setIsRepo(null);
+      setSummary(null);
+      setReviewError(`Не удалось прочитать состояние репозитория: ${String(refreshError)}`);
     }
   }, [cwd]);
 
@@ -816,6 +940,19 @@ export default function ReviewView() {
         "серьёзности; только подтверждённые проблемы, без стилистики. Ничего не редактируй — только отчёт.",
     ).catch((e) => notifyChat(cwd, "warning", e instanceof Error ? e.message : String(e)));
   };
+
+  if (reviewError) {
+    return (
+      <div className="chat">
+        <div className="topbar" data-tauri-drag-region>
+          <span className="title">Git</span>
+          <span className="sub">{cwd.split("/").pop()}</span>
+          <button onClick={() => void refreshSummary()}>Повторить</button>
+        </div>
+        <div className="alert error" style={{ margin: 14 }}>{reviewError}</div>
+      </div>
+    );
+  }
 
   if (isRepo === false) {
     return (

@@ -539,7 +539,9 @@ function PinMessageButton({ cwd, msg }: { cwd: string; msg: ChatMessage }) {
       className="tool-btn"
       title={pinned ? "Открепить сообщение" : "Закрепить сообщение (виджет слева сверху)"}
       style={pinned ? { color: "var(--accent)" } : undefined}
-      onClick={() => void toggleMessagePin(cwd, msg)}
+      onClick={() => void toggleMessagePin(cwd, msg).catch((error) => {
+        void messageDialog(`Не удалось изменить закрепление сообщения: ${String(error)}`, { kind: "error" });
+      })}
     >
       {pinned ? <PinOffIcon size={12} /> : <PinIcon size={12} />}
     </button>

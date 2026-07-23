@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { getBackend } from "../lib/backend";
-import type { AppThemePalette, ConfigFile, PiInfo, PiThemeInfo, SkillInfo } from "../lib/types";
+import type { AppThemePalette, ConfigFile, PiInfo, PiThemeInfo } from "../lib/types";
 import { confirmDialog, messageDialog } from "../lib/dialog";
 import { appIconForeground, applyAppThemePalette, applyAppearanceConfig, completePiThemeColors, paletteFromPiColors, resolveAppIconBackground } from "../lib/theme";
-import { modelAliasKey } from "../lib/models";
+import { modelAliasKey, modelForProvider, providerDraftError, type ModelCatalog } from "../lib/models";
 import { updateAppConfig, useStore } from "../state/store";
 import { ModelAvatarPicker } from "./AgentAvatar";
-import Marketplace, { type Recommended } from "./Marketplace";
+import Marketplace from "./Marketplace";
 import { AppearanceIcon, CheckIcon, ErrorIcon, FolderIcon, RefreshIcon, SendIcon, UpdateIcon } from "./icons";
 
-type Tab = "general" | "extensions" | "skills" | "themes" | "prompts" | "mcp" | "models" | "proc" | "app";
+type Tab = "general" | "themes" | "mcp" | "models" | "proc" | "app";
 
 /** Текстовое поле с отложенной записью: локальное значение мгновенно, коммит в файл —
  *  после паузы ввода (иначе settings.json переписывается на каждую букву — I/O-шторм
@@ -21,7 +21,12 @@ function useDebouncedField(
 ): [string, (v: string) => void] {
   const [local, setLocal] = useState(value);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pending = useRef<string | null>(null);
   const committed = useRef(value);
+  const commitRef = useRef(commit);
+  useEffect(() => {
+    commitRef.current = commit;
+  }, [commit]);
   useEffect(() => {
     // внешнее изменение (перечитали файл) — синхронизируем локальное значение
     if (value !== committed.current) {
@@ -31,13 +36,21 @@ function useDebouncedField(
   }, [value]);
   useEffect(() => () => {
     if (timer.current) clearTimeout(timer.current);
+    if (pending.current !== null) {
+      committed.current = pending.current;
+      commitRef.current(pending.current);
+      pending.current = null;
+    }
   }, []);
   const set = (v: string) => {
     setLocal(v);
+    pending.current = v;
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(() => {
       committed.current = v;
-      commit(v);
+      pending.current = null;
+      timer.current = null;
+      commitRef.current(v);
     }, delay);
   };
   return [local, set];
@@ -73,10 +86,16 @@ function formatUptime(ms: number): string {
 
 function ProcessesTab() {
   const [rows, setRows] = useState<ProcStat[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    const be = await getBackend();
-    setRows(await be.invoke<ProcStat[]>("process_stats").catch(() => []));
+    try {
+      const be = await getBackend();
+      setRows(await be.invoke<ProcStat[]>("process_stats"));
+      setError(null);
+    } catch (refreshError) {
+      setError(`Не удалось получить список процессов: ${String(refreshError)}`);
+    }
   }, []);
 
   useEffect(() => {
@@ -86,16 +105,21 @@ function ProcessesTab() {
   }, [refresh]);
 
   const kill = async (r: ProcStat) => {
-    const be = await getBackend();
-    if (r.kind === "agent") await be.invoke("kill_agent", { agentId: r.id }).catch(() => {});
-    else if (r.kind === "preview") await be.invoke("preview_stop", { serverId: r.id }).catch(() => {});
-    void refresh();
+    try {
+      const be = await getBackend();
+      if (r.kind === "agent") await be.invoke("kill_agent", { agentId: r.id });
+      else if (r.kind === "preview") await be.invoke("preview_stop", { serverId: r.id });
+      await refresh();
+    } catch (killError) {
+      setError(`Не удалось остановить процесс: ${String(killError)}`);
+    }
   };
 
   const total = (rows ?? []).reduce((n, r) => n + r.rssMb, 0);
 
   return (
     <div>
+      {error && <div className="alert error" style={{ marginBottom: 10 }}>{error}</div>}
       <div className="hint" style={{ marginBottom: 10 }}>
         Каждый агент pi — это process group: сам pi плюс его MCP-серверы и хелперы; dev-серверы превью —
         тоже группа (npm + vite/node). WebKit-хелперы macOS живут вне групп приложения и здесь не видны.
@@ -126,7 +150,7 @@ function ProcessesTab() {
             {r.rssMb >= 100 ? Math.round(r.rssMb) : r.rssMb.toFixed(1)} МБ
           </div>
           {(r.kind === "agent" || r.kind === "preview") && (
-            <button onClick={() => void kill(r)} title={r.kind === "agent" ? "Остановить агента" : "Остановить dev-сервер"}>
+            <button aria-label={`Остановить ${r.label}`} onClick={() => void kill(r)} title={r.kind === "agent" ? "Остановить агента" : "Остановить dev-сервер"}>
               Стоп
             </button>
           )}
@@ -238,6 +262,12 @@ function PiInstallCard() {
 
 // ---------- shared raw JSON editor ----------
 
+function parseJsonObject(content: string, label: string): Record<string, unknown> {
+  const parsed = JSON.parse(content) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${label}: корень должен быть объектом`);
+  return parsed as Record<string, unknown>;
+}
+
 function RawJsonEditor({
   name,
   onSaved,
@@ -266,7 +296,7 @@ function RawJsonEditor({
 
   const validate = (t: string): string | null => {
     try {
-      JSON.parse(t);
+      parseJsonObject(t, `${name}.json`);
       return null;
     } catch (e) {
       return String(e);
@@ -340,16 +370,20 @@ type PiSettings = Record<string, unknown> & {
   packages?: string[];
 };
 
-function useSettingsJson(): [PiSettings | null, (patch: Partial<PiSettings>) => Promise<void>, () => Promise<void>] {
+function useSettingsJson(): [PiSettings | null, (patch: Partial<PiSettings>) => Promise<boolean>, () => Promise<void>, string | null] {
   const [parsed, setParsed] = useState<PiSettings | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const writeQueue = useRef<Promise<void>>(Promise.resolve());
 
   const reload = useCallback(async () => {
-    const be = await getBackend();
-    const f = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
     try {
-      setParsed(JSON.parse(f.content) as PiSettings);
-    } catch {
+      const be = await getBackend();
+      const f = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
+      setParsed(parseJsonObject(f.content, "settings.json") as PiSettings);
+      setSaveError(null);
+    } catch (error) {
       setParsed(null);
+      setSaveError(`Не удалось прочитать settings.json: ${String(error)}. Исправьте файл в Advanced-редакторе; визуальные настройки не будут его перезаписывать.`);
     }
   }, []);
 
@@ -357,41 +391,50 @@ function useSettingsJson(): [PiSettings | null, (patch: Partial<PiSettings>) => 
     void reload();
   }, [reload]);
 
-  const update = useCallback(async (patch: Partial<PiSettings>) => {
-    const be = await getBackend();
-    // перечитать перед записью, чтобы не затереть внешние изменения
-    const f = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
-    let latest: PiSettings = {};
-    try {
-      latest = JSON.parse(f.content) as PiSettings;
-    } catch {
-      /* повреждённый файл перезапишем патчем */
-    }
-    const next = { ...latest, ...patch };
-    setParsed(next);
-    await be.invoke("write_pi_config", { name: "settings", content: JSON.stringify(next, null, 2) }).catch(() => {});
+  const update = useCallback((patch: Partial<PiSettings>) => {
+    const run = async (): Promise<boolean> => {
+      try {
+        const be = await getBackend();
+        // Перечитываем перед записью, чтобы не затереть внешние изменения. Если
+        // JSON повреждён, визуальный CRUD обязан fail closed, а не стирать ключи,
+        // которых не понимает.
+        const f = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
+        const latest = parseJsonObject(f.content, "settings.json") as PiSettings;
+        const next = { ...latest, ...patch };
+        await be.invoke("write_pi_config", { name: "settings", content: JSON.stringify(next, null, 2) });
+        setParsed(next);
+        setSaveError(null);
+        return true;
+      } catch (error) {
+        setSaveError(`Не удалось сохранить settings.json: ${String(error)}`);
+        return false;
+      }
+    };
+    const result = writeQueue.current.then(run, run);
+    writeQueue.current = result.then(() => undefined, () => undefined);
+    return result;
   }, []);
 
-  return [parsed, update, reload];
+  return [parsed, update, reload, saveError];
 }
 
 // ---------- general ----------
 
 function GeneralTab() {
-  const [parsed, update, reload] = useSettingsJson();
-  const [modelCatalog, setModelCatalog] = useState<Record<string, { models?: { id?: string }[] }>>({});
+  const [parsed, update, reload, saveError] = useSettingsJson();
+  const [modelCatalog, setModelCatalog] = useState<ModelCatalog>({});
   const compaction = parsed?.compaction ?? {};
   const compactionEnabled = compaction.enabled !== false;
-  const [prov, setProv] = useDebouncedField(String(parsed?.defaultProvider ?? ""), (v) => void update({ defaultProvider: v }));
-  const [model, setModel] = useDebouncedField(String(parsed?.defaultModel ?? ""), (v) => void update({ defaultModel: v }));
-  const [tuiTheme, setTuiTheme] = useDebouncedField(String(parsed?.theme ?? ""), (v) => void update({ theme: v }));
+  const prov = String(parsed?.defaultProvider ?? "");
+  const model = String(parsed?.defaultModel ?? "");
+  const tuiTheme = String(parsed?.theme ?? "");
 
   useEffect(() => {
     void (async () => {
       const be = await getBackend();
       const file = await be.invoke<ConfigFile>("read_pi_config", { name: "models" }).catch(() => null);
       try {
-        const next = JSON.parse(file?.content ?? "{}") as { providers?: Record<string, { models?: { id?: string }[] }> };
+        const next = JSON.parse(file?.content ?? "{}") as { providers?: ModelCatalog };
         setModelCatalog(next.providers ?? {});
       } catch {
         setModelCatalog({});
@@ -408,19 +451,28 @@ function GeneralTab() {
   return (
     <div className="settings-page">
       <PiInstallCard />
+      {saveError && <div className="card" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>{saveError}</div>}
 
       {parsed && (
         <>
           <SettingsGroup title="Новая сессия" description="Применяется автоматически при следующем запуске агента">
           <div className="form-row">
             <label>Провайдер <small>Ключ из models.json</small></label>
-            <select aria-label="Провайдер по умолчанию" value={prov} onChange={(e) => setProv(e.target.value)}>
+            <select
+              aria-label="Провайдер по умолчанию"
+              value={prov}
+              onChange={(e) => {
+                const defaultProvider = e.target.value;
+                const defaultModel = modelForProvider(modelCatalog, defaultProvider, model);
+                void update({ defaultProvider, defaultModel });
+              }}
+            >
               {providerOptions.map((provider) => <option key={provider} value={provider}>{provider}</option>)}
             </select>
           </div>
           <div className="form-row">
             <label>Модель <small>Runtime ID, без UI-псевдонима</small></label>
-            <select aria-label="Модель по умолчанию" value={model} onChange={(e) => setModel(e.target.value)}>
+            <select aria-label="Модель по умолчанию" value={model} onChange={(e) => void update({ defaultModel: e.target.value })}>
               {modelOptions.map((modelId) => <option key={modelId} value={modelId}>{modelId}</option>)}
             </select>
           </div>
@@ -444,7 +496,7 @@ function GeneralTab() {
           </div>
           <div className="form-row">
             <label>Тема pi TUI <small>Отдельна от темы приложения</small></label>
-            <select aria-label="Тема pi TUI" value={tuiTheme} onChange={(e) => setTuiTheme(e.target.value)}>
+            <select aria-label="Тема pi TUI" value={tuiTheme} onChange={(e) => void update({ theme: e.target.value })}>
               {Array.from(new Set([tuiTheme, "dark", "light"].filter(Boolean))).map((themeName) => (
                 <option key={themeName} value={themeName}>{themeName}</option>
               ))}
@@ -500,154 +552,6 @@ function GeneralTab() {
   );
 }
 
-// ---------- extensions marketplace (pi.dev community catalog) ----------
-
-/** Расширения, на которые опирается функциональность самого клиента. */
-const RECOMMENDED_EXTENSIONS: Recommended[] = [
-  {
-    pkg: "npm:@gotgenes/pi-permission-system",
-    name: "pi-permission-system",
-    desc: "Права на инструменты: без него не работают режимы Ask / Accept edits / Auto / Bypass в чате.",
-  },
-  {
-    pkg: "npm:@plannotator/pi-extension",
-    name: "plannotator",
-    desc: "Plan mode: агент сначала составляет план с аннотациями, затем правит код (/plannotator).",
-  },
-  {
-    pkg: "npm:@tintinweb/pi-subagents",
-    name: "pi-subagents",
-    desc: "Очередь фоновых агентов, worktree-изоляция, steering и session-scoped расписания.",
-  },
-];
-
-/** Рекомендуемое ядро (ROADMAP §5.9): пакеты вне списка — кандидаты в per-workspace.
- *  Матчинг по подстроке, чтобы покрыть и npm-имена, и локальные пути. */
-const CORE_PACKAGES = [
-  "pi-mcp-adapter",
-  "rpiv-todo",
-  "rpiv-ask-user-question",
-  "pi-permission-system",
-  "pi-claude-style-tools",
-  "pi-retry",
-  "pi-statusline",
-  "plannotator",
-  "harness",
-  "pi-web-access", // возвращён в ядро (H4): без него модель не может в web-факты
-  "pi-subagents",
-  "DietrichGebert/ponytail", // официальный git-пакет; full policy инъектируется перед каждым model turn
-];
-
-/** Грубая оценка токенов текста (≈4 символа/токен для английских описаний). */
-function estTokens(s: string): number {
-  return Math.max(1, Math.round(s.length / 4));
-}
-
-function ExtensionsTab() {
-  const [pkgs, setPkgs] = useState<string[] | null>(null);
-
-  useEffect(() => {
-    void (async () => {
-      const be = await getBackend();
-      const f = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" }).catch(() => null);
-      try {
-        setPkgs((JSON.parse(f?.content ?? "{}").packages ?? []) as string[]);
-      } catch {
-        setPkgs([]);
-      }
-    })();
-  }, []);
-
-  const extras = (pkgs ?? []).filter((p) => !CORE_PACKAGES.some((c) => p.includes(c)));
-
-  return (
-    <div>
-      {pkgs != null && pkgs.length > 0 && (
-        <div className="card" style={{ padding: "10px 12px", marginBottom: 12 }}>
-          <div className="c-title" style={{ fontSize: 13 }}>
-            Куратор окружения: {pkgs.length} глобальных пакетов · {extras.length} вне рекомендуемого ядра
-          </div>
-          {extras.length > 0 ? (
-            <div className="c-sub">
-              Каждое расширение добавляет свои инструкции в стартовый промпт каждой сессии («fewest tools
-              wins» для локальной 35B). Кандидаты на перенос в проектный <code>.pi/settings.json</code>:{" "}
-              {extras.join(", ")}. Обоснование — docs/ROADMAP.md §5.9.
-            </div>
-          ) : (
-            <div className="c-sub">Все пакеты в пределах рекомендуемого ядра pi-app.</div>
-          )}
-        </div>
-      )}
-      <Marketplace
-        kind="extension"
-        recommended={RECOMMENDED_EXTENSIONS}
-        installHint="Маркетплейс сообщества pi.dev. Установка выполняет «pi install»; изменения подхватываются новыми сессиями агента."
-      />
-    </div>
-  );
-}
-
-// ---------- skills marketplace + locally installed ----------
-
-function SkillsTab() {
-  const [skills, setSkills] = useState<SkillInfo[]>([]);
-  const editor = useStore((s) => s.appConfig.editor);
-
-  useEffect(() => {
-    void (async () => {
-      const be = await getBackend();
-      setSkills(await be.invoke<SkillInfo[]>("list_skills").catch(() => []));
-    })();
-  }, []);
-
-  const open = async (path: string) => {
-    const be = await getBackend();
-    await be.invoke("open_in_editor", { editor, path, line: null }).catch(() => {});
-  };
-
-  const grouped = skills.reduce<Record<string, SkillInfo[]>>((acc, s) => {
-    (acc[s.sourceDir] ??= []).push(s);
-    return acc;
-  }, {});
-
-  return (
-    <div>
-      <Marketplace
-        kind="skill"
-        installHint="Skills-пакеты из маркетплейса pi.dev. Ниже — skills, уже установленные локально в ваших каталогах."
-      />
-      <div className="section-title" style={{ padding: "16px 2px 6px" }}>
-        Установленные локально · {skills.length}
-        {skills.length > 0 &&
-          ` · описания ≈ ${skills.reduce((n, s) => n + estTokens(s.name + s.description), 0)} ток. в каждом системном промпте`}
-      </div>
-      <div className="hint" style={{ marginBottom: 10 }}>
-        Каталоги skills настраиваются в settings.json → «skills» (вкладка «Общие»). Описание каждого скилла
-        pi кладёт в стартовый промпт целиком — длинные описания стоят токенов в каждой сессии.
-      </div>
-      {Object.entries(grouped).map(([dir, list]) => (
-        <div key={dir}>
-          <div className="section-title" style={{ padding: "10px 2px 6px" }}>
-            {dir} · {list.length}
-          </div>
-          {list.map((s) => (
-            <div key={s.path} className="card click" style={{ padding: "8px 12px" }} onClick={() => void open(s.path)}>
-              <div className="c-title" style={{ fontSize: 13 }}>
-                {s.name}
-                <span className="muted" style={{ fontWeight: 400, fontSize: 11, marginLeft: 8 }}>
-                  ≈{estTokens(s.name + s.description)} ток.
-                </span>
-              </div>
-              {s.description && <div className="c-sub">{s.description}</div>}
-            </div>
-          ))}
-        </div>
-      ))}
-      {skills.length === 0 && <div className="muted">Локальные skills не найдены</div>}
-    </div>
-  );
-}
-
 function ThemesTab() {
   const cwd = useStore((s) => s.currentCwd);
   const appConfig = useStore((s) => s.appConfig);
@@ -655,10 +559,17 @@ function ThemesTab() {
   const [draft, setDraft] = useState<{ name: string; colors: Record<string, string | number> } | null>(null);
   const [scope, setScope] = useState<"global" | "project">("global");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    const be = await getBackend();
-    setThemes(await be.invoke<PiThemeInfo[]>("list_pi_themes", { cwd }).catch(() => []));
+    try {
+      const be = await getBackend();
+      setThemes(await be.invoke<PiThemeInfo[]>("list_pi_themes", { cwd }));
+      setError(null);
+    } catch (loadError) {
+      setThemes([]);
+      setError(`Не удалось загрузить темы: ${String(loadError)}`);
+    }
   }, [cwd]);
 
   useEffect(() => void load(), [load]);
@@ -678,18 +589,53 @@ function ThemesTab() {
     return () => applyAppearanceConfig(useStore.getState().appConfig);
   }, [previewPalette]);
 
-  const writeActiveTheme = async (name: string) => {
+  const writeActiveTheme = async (name: string | undefined): Promise<string | undefined> => {
     const be = await getBackend();
     const file = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
-    const settings = JSON.parse(file.content || "{}") as Record<string, unknown>;
-    settings.theme = name;
+    const parsed = JSON.parse(file.content || "{}") as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("settings.json: корень должен быть объектом");
+    const settings = parsed as Record<string, unknown>;
+    const previous = typeof settings.theme === "string" ? settings.theme : undefined;
+    if (name) settings.theme = name;
+    else delete settings.theme;
     await be.invoke("write_pi_config", { name: "settings", content: JSON.stringify(settings, null, 2) });
+    return previous;
   };
 
   const applyInstalled = async (theme: PiThemeInfo) => {
-    const palette = paletteFromPiColors(theme.name, theme.resolvedColors);
-    await writeActiveTheme(theme.name);
-    await updateAppConfig({ appearancePreset: "custom", accentColor: palette.accent, customTheme: palette });
+    try {
+      const palette = paletteFromPiColors(theme.name, theme.resolvedColors);
+      const previous = await writeActiveTheme(theme.name);
+      const saved = await updateAppConfig({ appearancePreset: "custom", accentColor: palette.accent, customTheme: palette });
+      if (!saved) {
+        await writeActiveTheme(previous).catch(() => {});
+        throw new Error("палитра приложения не сохранилась; активная тема pi восстановлена");
+      }
+      setError(null);
+    } catch (applyError) {
+      setError(`Не удалось применить тему: ${String(applyError)}`);
+    }
+  };
+
+  const deleteInstalled = async (theme: PiThemeInfo) => {
+    try {
+      const be = await getBackend();
+      const settingsFile = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
+      const parsed = JSON.parse(settingsFile.content) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("settings.json: корень должен быть объектом");
+      const settings = parsed as { theme?: string };
+      if (settings.theme === theme.name) {
+        setError(`Нельзя удалить активную тему «${theme.name}». Сначала примените другую тему.`);
+        return;
+      }
+      const ok = await confirmDialog(`Удалить пользовательскую тему «${theme.name}»?`);
+      if (!ok) return;
+      await be.invoke("delete_pi_theme", { path: theme.path, cwd });
+      if (draft?.name === theme.name) setDraft(null);
+      await load();
+    } catch (deleteError) {
+      setError(`Не удалось удалить тему: ${String(deleteError)}`);
+    }
   };
 
   const startEditor = (theme?: PiThemeInfo) => {
@@ -712,8 +658,12 @@ function ThemesTab() {
     try {
       const be = await getBackend();
       await be.invoke("save_pi_theme", { draft, scope, cwd });
-      await writeActiveTheme(draft.name);
-      await updateAppConfig({ appearancePreset: "custom", accentColor: previewPalette.accent, customTheme: previewPalette });
+      const previous = await writeActiveTheme(draft.name);
+      const saved = await updateAppConfig({ appearancePreset: "custom", accentColor: previewPalette.accent, customTheme: previewPalette });
+      if (!saved) {
+        await writeActiveTheme(previous).catch(() => {});
+        throw new Error("палитра приложения не сохранилась; активная тема pi восстановлена");
+      }
       await load();
       await messageDialog(`Тема «${draft.name}» сохранена и применена к pi и приложению.`, { kind: "info" });
     } catch (error) {
@@ -762,6 +712,8 @@ function ThemesTab() {
         installHint="Темы сообщества pi.dev. Установка добавляет тему в pi; ниже можно применить её одновременно к TUI и интерфейсу приложения."
       />
 
+      {error && <div className="card" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)", marginBottom: 10 }}>{error}</div>}
+
       <div className="section-title theme-local-title">
         Установленные темы · {themes.length}
         <button className="primary" onClick={() => startEditor()}>Создать тему</button>
@@ -784,6 +736,7 @@ function ThemesTab() {
               <div className="pi-theme-actions">
                 <button onClick={() => startEditor(theme)}>Дублировать</button>
                 <button className="primary" disabled={!theme.valid} onClick={() => void applyInstalled(theme)}>Применить</button>
+                {theme.source !== "package" && <button className="danger" aria-label={`Удалить тему ${theme.name}`} onClick={() => void deleteInstalled(theme)}>Удалить</button>}
               </div>
             </div>
           );
@@ -820,7 +773,7 @@ function ThemesTab() {
             ))}
           </div>
           <div className="theme-editor-actions">
-            <select value={scope} onChange={(event) => setScope(event.target.value as "global" | "project")}>
+            <select aria-label="Область сохранения темы" value={scope} onChange={(event) => setScope(event.target.value as "global" | "project")}>
               <option value="global">Для всех проектов</option>
               <option value="project" disabled={!cwd}>Только текущий проект</option>
             </select>
@@ -833,53 +786,66 @@ function ThemesTab() {
   );
 }
 
-function PromptsTab() {
-  return (
-    <Marketplace
-      kind="prompt"
-      installHint="Prompt- и AGENTS.md-пакеты сообщества. После установки пресет доступен новым сессиям; держите активным только нужный набор, чтобы не раздувать системный контекст."
-    />
-  );
-}
-
 // ---------- MCP ----------
 
 function McpTab() {
   const [servers, setServers] = useState<Record<string, Record<string, unknown>>>({});
   const [reloadKey, setReloadKey] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
+  const parseServers = (content: string): { root: Record<string, unknown>; servers: Record<string, Record<string, unknown>> } => {
+    const root = JSON.parse(content) as unknown;
+    if (!root || typeof root !== "object" || Array.isArray(root)) throw new Error("корень mcp.json должен быть объектом");
+    const raw = (root as Record<string, unknown>).mcpServers ?? {};
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("mcpServers должен быть объектом");
+    const entries = Object.entries(raw);
+    if (entries.some(([, value]) => !value || typeof value !== "object" || Array.isArray(value))) {
+      throw new Error("каждый MCP-сервер должен быть объектом");
+    }
+    return { root: root as Record<string, unknown>, servers: Object.fromEntries(entries) as Record<string, Record<string, unknown>> };
+  };
 
   useEffect(() => {
     void (async () => {
-      const be = await getBackend();
-      const f = await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
       try {
-        const parsed = JSON.parse(f.content) as { mcpServers?: Record<string, Record<string, unknown>> };
-        setServers(parsed.mcpServers ?? {});
-      } catch {
+        const be = await getBackend();
+        const f = await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
+        setServers(parseServers(f.content).servers);
+        setError(null);
+      } catch (readError) {
         setServers({});
+        setError(`Не удалось прочитать mcp.json: ${String(readError)}. Исправьте его в Advanced-редакторе.`);
       }
     })();
   }, [reloadKey]);
 
   const removeServer = async (name: string) => {
-    if (!(await confirmDialog(`Удалить MCP-сервер «${name}» из mcp.json?`))) return;
-    const be = await getBackend();
-    const f = await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
-    const parsed = JSON.parse(f.content) as { mcpServers?: Record<string, unknown> };
-    if (parsed.mcpServers) delete parsed.mcpServers[name];
-    await be.invoke("write_pi_config", { name: "mcp", content: JSON.stringify(parsed, null, 2) });
-    setReloadKey((k) => k + 1);
+    try {
+      if (!(await confirmDialog(`Удалить MCP-сервер «${name}» из mcp.json?`))) return;
+      const be = await getBackend();
+      const f = await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
+      const parsed = parseServers(f.content);
+      const nextServers = { ...parsed.servers };
+      delete nextServers[name];
+      await be.invoke("write_pi_config", { name: "mcp", content: JSON.stringify({ ...parsed.root, mcpServers: nextServers }, null, 2) });
+      setServers(nextServers);
+      setError(null);
+      setReloadKey((k) => k + 1);
+    } catch (removeError) {
+      setError(`Не удалось удалить MCP-сервер: ${String(removeError)}`);
+    }
   };
 
   return (
     <div>
+      {error && <div className="card" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)", marginBottom: 10 }}>{error}</div>}
       {Object.entries(servers).map(([name, cfg]) => (
         <div key={name} className="card">
           <div className="row">
             <span className="c-title">{name}</span>
             <span className="badge">{String(cfg.lifecycle ?? "eager")}</span>
             <div className="grow" />
-            <button className="danger" onClick={() => void removeServer(name)}>
+            <button className="danger" aria-label={`Удалить MCP-сервер ${name}`} onClick={() => void removeServer(name)}>
               Удалить
             </button>
           </div>
@@ -937,11 +903,11 @@ function ProviderCard({
         {cfg.api && <span className="badge">{cfg.api}</span>}
         <div className="grow" />
         {cfg.baseUrl && (
-          <button onClick={() => void check()} title="GET {baseUrl}/models">
+          <button aria-label={`Проверить провайдер ${name}`} onClick={() => void check()} title="GET {baseUrl}/models">
             Проверить
           </button>
         )}
-        <button className="danger" onClick={onDelete}>
+        <button className="danger" aria-label={`Удалить провайдер ${name}`} onClick={onDelete}>
           Удалить
         </button>
       </div>
@@ -958,7 +924,7 @@ function ProviderCard({
   );
 }
 
-function AddProviderForm({ onAdd }: { onAdd: (name: string, cfg: ProviderCfg) => void }) {
+function AddProviderForm({ onAdd, existingNames }: { onAdd: (name: string, cfg: ProviderCfg) => Promise<boolean>; existingNames: string[] }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
@@ -967,6 +933,7 @@ function AddProviderForm({ onAdd }: { onAdd: (name: string, cfg: ProviderCfg) =>
   const [models, setModels] = useState("");
   const [ctx, setCtx] = useState("");
   const [reasoning, setReasoning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   if (!open) {
     return (
@@ -976,9 +943,14 @@ function AddProviderForm({ onAdd }: { onAdd: (name: string, cfg: ProviderCfg) =>
     );
   }
 
-  const submit = () => {
+  const validationError = providerDraftError({ name, baseUrl, models, contextWindow: ctx }, existingNames);
+
+  const submit = async () => {
     const n = name.trim();
-    if (!n || !baseUrl.trim()) return;
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
     const ids = models
       .split(/[\n,]+/)
       .map((s) => s.trim())
@@ -994,7 +966,7 @@ function AddProviderForm({ onAdd }: { onAdd: (name: string, cfg: ProviderCfg) =>
         ...(reasoning ? { reasoning: true } : {}),
       })),
     };
-    onAdd(n, cfg);
+    if (!await onAdd(n, cfg)) return;
     setOpen(false);
     setName("");
     setBaseUrl("");
@@ -1002,6 +974,7 @@ function AddProviderForm({ onAdd }: { onAdd: (name: string, cfg: ProviderCfg) =>
     setModels("");
     setCtx("");
     setReasoning(false);
+    setError(null);
   };
 
   return (
@@ -1009,15 +982,15 @@ function AddProviderForm({ onAdd }: { onAdd: (name: string, cfg: ProviderCfg) =>
       <div className="c-title" style={{ marginBottom: 8 }}>Новый провайдер</div>
       <div className="form-row">
         <label>Имя (ключ в models.json)</label>
-        <input placeholder="my-remote" value={name} onChange={(e) => setName(e.target.value)} />
+        <input aria-label="Имя нового провайдера" placeholder="my-remote" value={name} onChange={(e) => { setName(e.target.value); setError(null); }} />
       </div>
       <div className="form-row">
         <label>Base URL</label>
-        <input placeholder="https://llm.example.com/v1" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
+        <input aria-label="Base URL нового провайдера" placeholder="https://llm.example.com/v1" value={baseUrl} onChange={(e) => { setBaseUrl(e.target.value); setError(null); }} />
       </div>
       <div className="form-row">
         <label>API</label>
-        <select value={api} onChange={(e) => setApi(e.target.value)}>
+        <select aria-label="API нового провайдера" value={api} onChange={(e) => setApi(e.target.value)}>
           {API_TYPES.map((a) => (
             <option key={a}>{a}</option>
           ))}
@@ -1025,23 +998,24 @@ function AddProviderForm({ onAdd }: { onAdd: (name: string, cfg: ProviderCfg) =>
       </div>
       <div className="form-row">
         <label>API-ключ ($ENV_VAR или значение)</label>
-        <input placeholder="$MY_API_KEY (пусто = «none» для локальных)" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+        <input aria-label="API-ключ нового провайдера" placeholder="$MY_API_KEY (пусто = «none» для локальных)" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
       </div>
       <div className="form-row">
         <label>Модели (id через запятую)</label>
-        <input placeholder="qwen3-32b, llama3.1:8b" value={models} onChange={(e) => setModels(e.target.value)} />
+        <input aria-label="Модели нового провайдера" placeholder="qwen3-32b, llama3.1:8b" value={models} onChange={(e) => { setModels(e.target.value); setError(null); }} />
       </div>
       <div className="form-row">
         <label>Контекстное окно (токенов)</label>
-        <input type="number" placeholder="128000" value={ctx} onChange={(e) => setCtx(e.target.value)} />
+        <input aria-label="Контекстное окно нового провайдера" type="number" min={1024} step={1024} placeholder="128000" value={ctx} onChange={(e) => { setCtx(e.target.value); setError(null); }} />
       </div>
       <div className="form-row">
         <label>Reasoning-модели</label>
-        <input type="checkbox" style={{ flex: "none", width: 16 }} checked={reasoning} onChange={(e) => setReasoning(e.target.checked)} />
+        <input aria-label="Reasoning-модели нового провайдера" type="checkbox" style={{ flex: "none", width: 16 }} checked={reasoning} onChange={(e) => setReasoning(e.target.checked)} />
       </div>
+      {(error || validationError) && <div className="c-sub" role="alert" style={{ color: "var(--danger)" }}>{error || validationError}</div>}
       <div className="row" style={{ justifyContent: "flex-end" }}>
         <button onClick={() => setOpen(false)}>Отмена</button>
-        <button className="primary" disabled={!name.trim() || !baseUrl.trim()} onClick={submit}>
+        <button className="primary" disabled={Boolean(validationError)} onClick={() => void submit()}>
           Добавить
         </button>
       </div>
@@ -1052,45 +1026,75 @@ function AddProviderForm({ onAdd }: { onAdd: (name: string, cfg: ProviderCfg) =>
 function ModelsTab() {
   const [providers, setProviders] = useState<Record<string, ProviderCfg>>({});
   const [reloadKey, setReloadKey] = useState(0);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     void (async () => {
-      const be = await getBackend();
-      const f = await be.invoke<ConfigFile>("read_pi_config", { name: "models" });
       try {
-        const parsed = JSON.parse(f.content) as { providers?: Record<string, ProviderCfg> };
-        setProviders(parsed.providers ?? {});
-      } catch {
+        const be = await getBackend();
+        const f = await be.invoke<ConfigFile>("read_pi_config", { name: "models" });
+        const parsed = parseJsonObject(f.content, "models.json");
+        const rawProviders = parsed.providers ?? {};
+        if (!rawProviders || typeof rawProviders !== "object" || Array.isArray(rawProviders)) throw new Error("models.json: providers должен быть объектом");
+        const entries = Object.entries(rawProviders);
+        if (entries.some(([, value]) => !value || typeof value !== "object" || Array.isArray(value))) throw new Error("models.json: каждый провайдер должен быть объектом");
+        setProviders(rawProviders as Record<string, ProviderCfg>);
+        setError(null);
+      } catch (readError) {
         setProviders({});
+        setError(`Не удалось прочитать models.json: ${String(readError)}. Визуальный редактор не будет перезаписывать файл.`);
       }
     })();
   }, [reloadKey]);
 
-  const writeProviders = async (next: Record<string, ProviderCfg>) => {
-    const be = await getBackend();
-    const f = await be.invoke<ConfigFile>("read_pi_config", { name: "models" });
-    let parsed: Record<string, unknown> = {};
+  const mutateProviders = async (mutate: (current: Record<string, ProviderCfg>) => Record<string, ProviderCfg>): Promise<boolean> => {
     try {
-      parsed = JSON.parse(f.content) as Record<string, unknown>;
-    } catch {
-      /* повреждённый файл пересоберём */
+      const be = await getBackend();
+      const f = await be.invoke<ConfigFile>("read_pi_config", { name: "models" });
+      const parsed = parseJsonObject(f.content, "models.json");
+      const rawProviders = parsed.providers ?? {};
+      if (!rawProviders || typeof rawProviders !== "object" || Array.isArray(rawProviders)) throw new Error("models.json: providers должен быть объектом");
+      if (Object.values(rawProviders).some((value) => !value || typeof value !== "object" || Array.isArray(value))) throw new Error("models.json: каждый провайдер должен быть объектом");
+      const current = rawProviders as Record<string, ProviderCfg>;
+      const next = mutate(current);
+      parsed.providers = next;
+      await be.invoke("write_pi_config", { name: "models", content: JSON.stringify(parsed, null, 2) });
+      setProviders(next);
+      setError(null);
+      setReloadKey((k) => k + 1);
+      return true;
+    } catch (writeError) {
+      setError(`Не удалось сохранить models.json: ${String(writeError)}`);
+      return false;
     }
-    parsed.providers = next;
-    await be.invoke("write_pi_config", { name: "models", content: JSON.stringify(parsed, null, 2) });
-    setReloadKey((k) => k + 1);
   };
 
-  const addProvider = (name: string, cfg: ProviderCfg) => {
-    void writeProviders({ ...providers, [name]: cfg });
-  };
-
-  const removeProvider = (name: string) => {
-    void confirmDialog(`Удалить провайдер «${name}» из models.json?`).then((ok) => {
-      if (!ok) return;
-      const next = { ...providers };
-      delete next[name];
-      void writeProviders(next);
+  const addProvider = async (name: string, cfg: ProviderCfg) => {
+    return mutateProviders((current) => {
+      if (Object.prototype.hasOwnProperty.call(current, name)) throw new Error(`Провайдер «${name}» уже существует.`);
+      return { ...current, [name]: cfg };
     });
+  };
+
+  const removeProvider = async (name: string) => {
+    try {
+      const be = await getBackend();
+      const settings = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
+      const defaults = parseJsonObject(settings.content, "settings.json") as { defaultProvider?: string };
+      if (defaults.defaultProvider === name) {
+        setError(`Нельзя удалить активный провайдер «${name}». Сначала выберите другой провайдер в разделе «Основные».`);
+        return;
+      }
+      const ok = await confirmDialog(`Удалить провайдер «${name}» из models.json?`);
+      if (!ok) return;
+      await mutateProviders((current) => {
+        const next = { ...current };
+        delete next[name];
+        return next;
+      });
+    } catch (removeError) {
+      setError(`Не удалось проверить или удалить провайдер: ${String(removeError)}`);
+    }
   };
 
   return (
@@ -1099,9 +1103,10 @@ function ModelsTab() {
         Кастомные эндпоинты (удалённые серверы, Ollama, vLLM, LM Studio, прокси) настраиваются здесь и попадают в{" "}
         <code>models.json</code>. Модели появятся в селекторе чата после перезапуска сессии.
       </div>
-      <AddProviderForm onAdd={addProvider} />
+      {error && <div className="card" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)", marginBottom: 10 }}>{error}</div>}
+      <AddProviderForm onAdd={addProvider} existingNames={Object.keys(providers)} />
       {Object.entries(providers).map(([name, cfg]) => (
-        <ProviderCard key={name} name={name} cfg={cfg} onDelete={() => removeProvider(name)} />
+        <ProviderCard key={name} name={name} cfg={cfg} onDelete={() => void removeProvider(name)} />
       ))}
       {Object.keys(providers).length === 0 && <div className="muted">Кастомные провайдеры не настроены</div>}
       <RawJsonEditor name="models" onSaved={() => setReloadKey((k) => k + 1)} />
@@ -1196,10 +1201,16 @@ function AppTab() {
   const iconColor = appConfig.iconColor ?? accentColor;
   const appIconBackground = resolveAppIconBackground(appConfig);
   const [appIconApplyStatus, setAppIconApplyStatus] = useState<AppIconApplyStatus | null>(null);
+  const [configSaveError, setConfigSaveError] = useState<string | null>(null);
   useEffect(() => {
     const onStatus = (event: Event) => setAppIconApplyStatus((event as CustomEvent<AppIconApplyStatus>).detail);
+    const onConfigStatus = (event: Event) => setConfigSaveError((event as CustomEvent<{ error: string | null }>).detail.error);
     window.addEventListener("pi:app-icon-status", onStatus);
-    return () => window.removeEventListener("pi:app-icon-status", onStatus);
+    window.addEventListener("pi:app-config-status", onConfigStatus);
+    return () => {
+      window.removeEventListener("pi:app-icon-status", onStatus);
+      window.removeEventListener("pi:app-config-status", onConfigStatus);
+    };
   }, []);
   const setCustomAccent = (color: string) => void updateAppConfig({
     accentColor: color,
@@ -1209,6 +1220,7 @@ function AppTab() {
 
   return (
     <div className="settings-page">
+      {configSaveError && <div className="card" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>{configSaveError}</div>}
       <SettingsGroup title="Приложение и runtime" description="Настройки сохраняются сразу; процессы пересчитываются без перезапуска UI">
       <div className="form-row">
         <label>Имя для приветствия <small>Стартовый экран</small></label>
@@ -1216,7 +1228,7 @@ function AppTab() {
       </div>
       <div className="form-row">
         <label>Внешний редактор <small>Открытие файлов и diff</small></label>
-        <select value={appConfig.editor} onChange={(e) => void updateAppConfig({ editor: e.target.value })}>
+        <select aria-label="Внешний редактор" value={appConfig.editor} onChange={(e) => void updateAppConfig({ editor: e.target.value })}>
           <option value="code">VS Code</option>
           <option value="cursor">Cursor</option>
           <option value="windsurf">Windsurf</option>
@@ -1241,10 +1253,11 @@ function AppTab() {
         <label>Лимит агентов <small>1–8 параллельных процессов</small></label>
         <input
           type="number"
+          aria-label="Лимит параллельных агентов"
           min={1}
           max={8}
           value={appConfig.processLimit}
-          onChange={(e) => void updateAppConfig({ processLimit: Math.max(1, Number(e.target.value) || 1) })}
+          onChange={(e) => void updateAppConfig({ processLimit: Math.min(8, Math.max(1, Number(e.target.value) || 1)) })}
           disabled={appConfig.processLimitAuto === true}
         />
       </div>
@@ -1278,31 +1291,43 @@ function AppTab() {
         <label>Idle agent timeout <small>Секунды до остановки</small></label>
         <input
           type="number"
+          aria-label="Idle agent timeout в секундах"
           min={60}
+          max={604800}
           step={60}
           value={appConfig.idleKillSecs}
-          onChange={(e) => void updateAppConfig({ idleKillSecs: Math.max(60, Number(e.target.value) || 900) })}
+          onChange={(e) =>
+            void updateAppConfig({ idleKillSecs: Math.min(604800, Math.max(60, Number(e.target.value) || 900)) })
+          }
         />
       </div>
       <div className="form-row">
         <label>Idle Preview timeout <small>0 отключает автоостановку</small></label>
         <input
           type="number"
+          aria-label="Idle Preview timeout в секундах"
           min={0}
+          max={604800}
           step={60}
           value={appConfig.previewIdleKillSecs ?? 600}
-          onChange={(e) => void updateAppConfig({ previewIdleKillSecs: Math.max(0, Number(e.target.value) || 0) })}
+          onChange={(e) =>
+            void updateAppConfig({ previewIdleKillSecs: Math.min(604800, Math.max(0, Number(e.target.value) || 0)) })
+          }
         />
       </div>
       <div className="form-row">
         <label>Provider watchdog <small>Секунды, 0 — выключен</small></label>
         <input
           type="number"
+          aria-label="Provider watchdog в секундах"
           min={0}
+          max={86400}
           step={30}
           value={Math.round((appConfig.piRetryStallTimeoutMs ?? 0) / 1000)}
           onChange={(e) =>
-            void updateAppConfig({ piRetryStallTimeoutMs: Math.max(0, Number(e.target.value) || 0) * 1000 })
+            void updateAppConfig({
+              piRetryStallTimeoutMs: Math.min(86400, Math.max(0, Number(e.target.value) || 0)) * 1000,
+            })
           }
         />
       </div>
@@ -1497,6 +1522,7 @@ function AppTab() {
         <label>Масштаб интерфейса <small>⌘+ / ⌘− / ⌘0</small></label>
         <input
           type="range"
+          aria-label="Масштаб интерфейса"
           min={0.7}
           max={1.6}
           step={0.1}
@@ -1553,10 +1579,7 @@ export default function SettingsView() {
             <span className="realtime-pill"><span className="dot live" /> Live</span>
           </header>
         {effective === "general" && <GeneralTab />}
-        {effective === "extensions" && <ExtensionsTab />}
-        {effective === "skills" && <SkillsTab />}
         {effective === "themes" && <ThemesTab />}
-        {effective === "prompts" && <PromptsTab />}
         {effective === "mcp" && <McpTab />}
         {effective === "models" && <ModelsTab />}
         {effective === "proc" && <ProcessesTab />}

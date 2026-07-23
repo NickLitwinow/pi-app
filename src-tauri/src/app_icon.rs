@@ -101,9 +101,9 @@ pub async fn set_app_icon(app: tauri::AppHandle, background: String) -> Result<(
             let _ = sender.send(apply_macos_icon(&bytes, bundle_path.as_deref()));
         })
         .map_err(|error| error.to_string())?;
-        return receiver
+        receiver
             .await
-            .map_err(|_| "main thread завершился до смены Dock-иконки".to_string())?;
+            .map_err(|_| "main thread завершился до смены Dock-иконки".to_string())?
     }
 
     #[cfg(not(target_os = "macos"))]

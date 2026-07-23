@@ -188,7 +188,7 @@ async fn worktree_snapshot(cwd: &str) -> Result<String, String> {
         command
             .args(args)
             .current_dir(cwd)
-            .env("GIT_INDEX_FILE", &index_path);
+            .env("GIT_INDEX_FILE", index_path);
         command
     };
     let read = run_index(&["read-tree", &head])

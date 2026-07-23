@@ -37,6 +37,178 @@ function asString(v: unknown): string {
   return String(v);
 }
 
+function boundedString(value: unknown, max = 20_000): string {
+  return asString(value).slice(0, max);
+}
+
+function extensionKey(value: unknown, fallback: string): string {
+  const key = boundedString(value ?? fallback, 200).trim();
+  if (!key || key === "__proto__" || key === "prototype" || key === "constructor" || /[\u0000-\u001f]/.test(key)) return "";
+  return key;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function stringList(value: unknown, maxItems = 100, maxLength = 1_000): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, maxItems).map((item) => boundedString(item, maxLength)).filter(Boolean);
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function normalizeWorkflowPayload(value: unknown): WorkflowViewState | null {
+  const root = objectValue(value);
+  const intent = objectValue(root?.intent);
+  if (!root || !intent || !Array.isArray(root.steps) || !Array.isArray(root.events)) return null;
+  const stepStatuses = new Set(["pending", "running", "waiting", "passed", "failed", "skipped"]);
+  const stepKinds = new Set(["plan", "research", "build", "gate", "evaluate", "review"]);
+  const owners = new Set(["orchestrator", "researcher", "executor", "gate-runner", "evaluator", "human"]);
+  const steps = root.steps.slice(0, 200).flatMap((raw) => {
+    const step = objectValue(raw);
+    const id = boundedString(step?.id, 200);
+    if (!step || !id) return [];
+    const status = boundedString(step.status, 30);
+    const kind = boundedString(step.kind, 30);
+    const owner = boundedString(step.owner, 30);
+    return [{
+      id,
+      label: boundedString(step.label, 500),
+      kind: (stepKinds.has(kind) ? kind : "build") as WorkflowViewState["steps"][number]["kind"],
+      deps: stringList(step.deps, 100, 200),
+      status: (stepStatuses.has(status) ? status : "pending") as WorkflowViewState["steps"][number]["status"],
+      acceptance: boundedString(step.acceptance, 4_000),
+      required: step.required !== false,
+      owner: (owners.has(owner) ? owner : "orchestrator") as WorkflowViewState["steps"][number]["owner"],
+      maxAttempts: finiteNumber(step.maxAttempts) ?? 1,
+      command: boundedString(step.command, 4_000) || undefined,
+      attempts: finiteNumber(step.attempts) ?? 0,
+      detail: boundedString(step.detail, 8_000) || undefined,
+      failureReason: boundedString(step.failureReason, 8_000) || undefined,
+      startedAt: finiteNumber(step.startedAt),
+      completedAt: finiteNumber(step.completedAt),
+    }];
+  });
+  const events = root.events.slice(-300).flatMap((raw) => {
+    const event = objectValue(raw);
+    const id = boundedString(event?.id, 200);
+    if (!event || !id) return [];
+    return [{
+      id,
+      stepId: boundedString(event.stepId, 200) || undefined,
+      type: boundedString(event.type, 30) as WorkflowViewState["events"][number]["type"],
+      at: finiteNumber(event.at) ?? 0,
+      message: boundedString(event.message, 4_000),
+    }];
+  });
+  const profiles = new Set(["feature", "bug", "chore", "hotfix", "research", "assessment"]);
+  const statuses = new Set(["active", "needs-human", "blocked", "completed"]);
+  const primaries = new Set(["trivial", "assessment", "research", "debug", "build"]);
+  const risks = new Set(["low", "medium", "high"]);
+  const profile = boundedString(root.profile, 30);
+  const status = boundedString(root.status, 30);
+  const primary = boundedString(intent.primary, 30);
+  const risk = boundedString(intent.risk, 30);
+  return {
+    version: 3,
+    runId: boundedString(root.runId, 200),
+    createdAt: finiteNumber(root.createdAt) ?? 0,
+    updatedAt: finiteNumber(root.updatedAt) ?? 0,
+    objective: boundedString(root.objective, 20_000),
+    profile: (profiles.has(profile) ? profile : "chore") as WorkflowViewState["profile"],
+    status: (statuses.has(status) ? status : "active") as WorkflowViewState["status"],
+    blockedStepId: boundedString(root.blockedStepId, 200) || undefined,
+    blockedReason: boundedString(root.blockedReason, 8_000) || undefined,
+    terminationReason: boundedString(root.terminationReason, 8_000) || undefined,
+    approved: root.approved === true,
+    editsPending: root.editsPending === true,
+    changedFiles: stringList(root.changedFiles, 500, 1_000),
+    evaluatorTaskId: boundedString(root.evaluatorTaskId, 200) || undefined,
+    intent: {
+      primary: (primaries.has(primary) ? primary : "build") as WorkflowViewState["intent"]["primary"],
+      profile: (profiles.has(profile) ? profile : "chore") as WorkflowViewState["profile"],
+      risk: (risks.has(risk) ? risk : "medium") as WorkflowViewState["intent"]["risk"],
+      needsResearch: intent.needsResearch === true,
+      allowsMutation: intent.allowsMutation === true,
+      allowsDeletion: intent.allowsDeletion === true,
+      requiresPlan: intent.requiresPlan === true,
+      requiresSandbox: intent.requiresSandbox === true,
+      requiresEvaluator: intent.requiresEvaluator === true,
+      requiresHumanApproval: intent.requiresHumanApproval === true,
+      signals: stringList(intent.signals, 100, 500),
+    },
+    steps,
+    events,
+  };
+}
+
+function normalizeBackgroundTasks(value: unknown): BackgroundTaskView[] | null {
+  if (!Array.isArray(value)) return null;
+  const statuses = new Set(["queued", "running", "completed", "failed", "cancelled"]);
+  return value.slice(-200).flatMap((raw) => {
+    const task = objectValue(raw);
+    const id = boundedString(task?.id, 200);
+    const status = boundedString(task?.status, 30);
+    if (!task || !id || !statuses.has(status)) return [];
+    return [{
+      id,
+      type: boundedString(task.type, 200),
+      description: boundedString(task.description, 4_000),
+      status: status as BackgroundTaskView["status"],
+      result: boundedString(task.result, 60_000) || undefined,
+      error: boundedString(task.error, 20_000) || undefined,
+      startedAt: finiteNumber(task.startedAt),
+      completedAt: finiteNumber(task.completedAt),
+      heartbeatAt: finiteNumber(task.heartbeatAt),
+      durationMs: finiteNumber(task.durationMs),
+      tokens: finiteNumber(task.tokens),
+      branch: boundedString(task.branch, 1_000) || undefined,
+      baseSha: boundedString(task.baseSha, 200) || undefined,
+      worktreePath: boundedString(task.worktreePath, 2_000) || undefined,
+      outputFile: boundedString(task.outputFile, 2_000) || undefined,
+      prompt: boundedString(task.prompt, 20_000) || undefined,
+      transcript: boundedString(task.transcript, 60_000) || undefined,
+      diff: boundedString(task.diff, 60_000) || undefined,
+      mergedCommit: boundedString(task.mergedCommit, 200) || undefined,
+      evaluatorProtocolVersion: finiteNumber(task.evaluatorProtocolVersion),
+      evaluatorQuorum: typeof task.evaluatorQuorum === "boolean" ? task.evaluatorQuorum : undefined,
+      priority: ["high", "normal", "low"].includes(String(task.priority)) ? task.priority as BackgroundTaskView["priority"] : undefined,
+      queuePosition: finiteNumber(task.queuePosition),
+      etaMs: finiteNumber(task.etaMs),
+      blockedReason: boundedString(task.blockedReason, 8_000) || undefined,
+    }];
+  });
+}
+
+function normalizeCheckpoint(value: unknown): StructuredCheckpoint | null {
+  const item = objectValue(value);
+  const at = finiteNumber(item?.at);
+  if (!item || at == null) return null;
+  const context = objectValue(item.context);
+  return {
+    version: finiteNumber(item.version),
+    at,
+    runId: boundedString(item.runId, 200) || undefined,
+    objective: boundedString(item.objective, 20_000),
+    profile: boundedString(item.profile, 100) || undefined,
+    changedFiles: stringList(item.changedFiles, 500, 1_000),
+    decisions: stringList(item.decisions, 200, 4_000),
+    risks: stringList(item.risks, 200, 4_000),
+    nextReadySteps: stringList(item.nextReadySteps, 200, 1_000),
+    nextAction: boundedString(item.nextAction, 4_000) || undefined,
+    context: context ? {
+      percent: finiteNumber(context.percent),
+      tokens: finiteNumber(context.tokens),
+      contextWindow: finiteNumber(context.contextWindow),
+    } : undefined,
+  };
+}
+
 /** Extract concatenated text from message content (string or blocks). */
 export function contentText(content: ChatMessage["content"] | undefined): string {
   if (content == null) return "";
@@ -57,7 +229,7 @@ export function stripLeadingEmoji(s: string): string {
 }
 
 function pushToast(chat: ChatState, kind: "info" | "error" | "success" | "warning", text: string) {
-  const clean = stripLeadingEmoji(text).trim() || text.trim();
+  const clean = (stripLeadingEmoji(text).trim() || text.trim()).slice(0, 4_000);
   if (!clean) return;
   // дубль уже видимого тоста не добавляем (расширения любят повторять)
   if (chat.toasts.some((t) => t.text === clean)) return;
@@ -122,11 +294,20 @@ function capturePlannedTasks(chat: ChatState, msg: ChatMessage) {
   if (msg.toolName !== "todo") return;
   const details = msg.details as { tasks?: unknown } | undefined;
   if (!Array.isArray(details?.tasks)) return;
-  chat.plannedTasks = details.tasks.filter((task): task is PlannedTaskView => {
-    if (!task || typeof task !== "object") return false;
-    const item = task as Partial<PlannedTaskView>;
-    return typeof item.id === "number" && typeof item.subject === "string"
-      && ["pending", "in_progress", "completed", "deleted"].includes(String(item.status));
+  chat.plannedTasks = details.tasks.slice(0, 500).flatMap((task) => {
+    const item = objectValue(task);
+    const id = finiteNumber(item?.id);
+    const status = boundedString(item?.status, 30);
+    if (!item || id == null || !["pending", "in_progress", "completed", "deleted"].includes(status)) return [];
+    return [{
+      id,
+      subject: boundedString(item.subject, 2_000),
+      description: boundedString(item.description, 8_000) || undefined,
+      activeForm: boundedString(item.activeForm, 2_000) || undefined,
+      status: status as PlannedTaskView["status"],
+      blockedBy: Array.isArray(item.blockedBy) ? item.blockedBy.slice(0, 100).flatMap((value) => finiteNumber(value) ?? []) : undefined,
+      owner: boundedString(item.owner, 500) || undefined,
+    }];
   });
 }
 
@@ -182,8 +363,7 @@ function finalizeMessage(chat: ChatState, msg: ChatMessage) {
 }
 
 function normalizeQueue(v: unknown): string[] {
-  if (!Array.isArray(v)) return [];
-  return v.map((x) => asString(x)).filter(Boolean);
+  return stringList(v, 100, 20_000);
 }
 
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
@@ -361,44 +541,65 @@ export function applyAgentEvent(chat: ChatState, ev: Record<string, unknown>): C
     case "extension_ui_request": {
       const method = asString(ev.method);
       if (DIALOG_METHODS.has(method)) {
-        chat.uiRequests = [...chat.uiRequests, ev as unknown as ExtUiRequest];
+        const id = boundedString(ev.id, 512);
+        if (!id || chat.uiRequests.some((request) => request.id === id)) break;
+        const timeout = finiteNumber(ev.timeout);
+        const request: ExtUiRequest = {
+          id,
+          method,
+          title: boundedString(ev.title, 500) || undefined,
+          message: boundedString(ev.message, 20_000) || undefined,
+          options: stringList(ev.options, 100, 2_000),
+          placeholder: boundedString(ev.placeholder, 1_000) || undefined,
+          prefill: boundedString(ev.prefill, 20_000) || undefined,
+          timeout: timeout == null ? undefined : Math.min(86_400_000, Math.max(0, timeout)),
+        };
+        chat.uiRequests = [...chat.uiRequests, request].slice(-50);
       } else if (method === "notify") {
         const kind = asString(ev.notificationType ?? ev.kind ?? "info");
         const valid = ["info", "error", "success", "warning"].includes(kind) ? kind : "info";
         pushToast(chat, valid as "info", asString(ev.message ?? ev.title ?? ""));
       } else if (method === "setStatus") {
         // real pi 0.80.x wire keys: statusKey / statusText (may contain ANSI)
-        const key = asString(ev.statusKey ?? ev.key ?? "status");
-        const text = asString(ev.statusText ?? ev.text ?? ev.status ?? ev.message ?? "");
+        const key = extensionKey(ev.statusKey ?? ev.key, "status");
+        const text = boundedString(ev.statusText ?? ev.text ?? ev.status ?? ev.message ?? "", 20_000);
+        if (!key) break;
         const entries = { ...chat.statusEntries };
-        if (text) entries[key] = text;
+        if (text && (key in entries || Object.keys(entries).length < 100)) entries[key] = text;
         else delete entries[key];
         chat.statusEntries = entries;
       } else if (method === "setWidget") {
-        const key = asString(ev.widgetKey ?? ev.key ?? "widget");
+        const key = extensionKey(ev.widgetKey ?? ev.key, "widget");
+        if (!key) break;
         const wireLines = (ev as Record<string, unknown>).widgetLines;
         const text = Array.isArray(wireLines)
-          ? wireLines.map(asString).join("\n")
-          : asString(ev.widgetText ?? ev.text ?? ev.lines ?? ev.content ?? ev.widget ?? "");
+          ? stringList(wireLines, 500, 4_000).join("\n").slice(0, 1_000_000)
+          : boundedString(ev.widgetText ?? ev.text ?? ev.lines ?? ev.content ?? ev.widget ?? "", 1_000_000);
         if (key === "pi-app-workflow-state") {
-          try { chat.workflow = text ? JSON.parse(text) as WorkflowViewState : null; } catch { /* keep last valid state */ }
+          try {
+            const normalized = text ? normalizeWorkflowPayload(JSON.parse(text)) : null;
+            if (!text || normalized) chat.workflow = normalized;
+          } catch { /* keep last valid state */ }
         } else if (key === "pi-app-background-state") {
-          try { chat.backgroundTasks = text ? JSON.parse(text) as BackgroundTaskView[] : []; } catch { /* keep last valid state */ }
+          try {
+            const normalized = text ? normalizeBackgroundTasks(JSON.parse(text)) : [];
+            if (normalized) chat.backgroundTasks = normalized;
+          } catch { /* keep last valid state */ }
         } else if (key === "pi-app-checkpoint-state") {
           try {
-            const checkpoint = JSON.parse(text) as StructuredCheckpoint;
-            if (!chat.structuredCheckpoints.some((item) => item.at === checkpoint.at)) {
+            const checkpoint = normalizeCheckpoint(JSON.parse(text));
+            if (checkpoint && !chat.structuredCheckpoints.some((item) => item.at === checkpoint.at)) {
               chat.structuredCheckpoints = [...chat.structuredCheckpoints, checkpoint].slice(-30);
             }
           } catch { /* keep last valid state */ }
         } else {
           const widgets = { ...chat.widgets };
-          if (text) widgets[key] = text;
+          if (text && (key in widgets || Object.keys(widgets).length < 100)) widgets[key] = text.slice(0, 20_000);
           else delete widgets[key];
           chat.widgets = widgets;
         }
       } else if (method === "set_editor_text" || method === "setEditorText") {
-        chat.editorPrefill = asString(ev.text ?? "");
+        chat.editorPrefill = boundedString(ev.text ?? "", 100_000);
       }
       break;
     }

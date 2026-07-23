@@ -58,6 +58,7 @@ class MockBackend implements Backend {
   private deleted = new Set<string>();
   private renamed = new Map<string, string>();
   private forked: SessionMeta[] = [];
+  private deletedThemes = new Set<string>();
   private currentSession = "/mock/a/live.jsonl";
   private rewindTargetBySession = new Map<string, string>();
   private permMode: string | null = null;
@@ -73,10 +74,12 @@ class MockBackend implements Backend {
         "npm:@tintinweb/pi-subagents",
         "npm:@juicesharp/rpiv-todo",
         "npm:@juicesharp/rpiv-ask-user-question",
-        "npm:pi-lens",
         "npm:@gotgenes/pi-permission-system",
         "npm:pi-claude-style-tools",
+        "npm:@narumitw/pi-retry",
+        "npm:@narumitw/pi-statusline",
         "npm:@plannotator/pi-extension",
+        "../../GithubControl/pi-app/harness-extension",
         "git:github.com/DietrichGebert/ponytail",
       ],
       skills: ["~/.claude/skills"],
@@ -597,24 +600,30 @@ class MockBackend implements Backend {
         await sleep(200);
         const names = (args.names as string[]) ?? [];
         return names
-          .filter((s) => s.startsWith("npm:"))
-          .map((s) => s.slice(4))
-          .map((name, index) => ({
+          .map((source, index) => {
+            const npm = source.startsWith("npm:");
+            const raw = npm ? source.slice(4) : source.replace(/^git:/, "").replace(/^file:/, "");
+            const unpinned = raw.startsWith("@")
+              ? raw.slice(0, raw.indexOf("@", raw.indexOf("/") + 1) > 0 ? raw.indexOf("@", raw.indexOf("/") + 1) : undefined)
+              : raw.split("@", 1)[0];
+            const name = npm ? unpinned : raw.replace(/[\\/]+$/, "").split(/[\\/]/).pop()?.replace(/\.git$/, "") || raw;
+            return {
+            source,
             name,
-            version: index === 0 ? "2.1.0" : "1.0.0",
-            installedVersion: index === 0 ? "2.0.0" : "1.0.0",
-            updateAvailable: index === 0,
+            version: npm ? (index === 0 ? "2.1.0" : "1.0.0") : "",
+            installedVersion: npm ? (index === 0 ? "2.0.0" : "1.0.0") : null,
+            updateAvailable: npm && index === 0,
             pinned: false,
             description: `Установленный пакет ${name} (mock-метаданные).`,
             author: name.startsWith("@") ? name.slice(1).split("/")[0] : "community",
             downloadsMonthly: 0,
-            npmUrl: `https://www.npmjs.com/package/${name}`,
-            repoUrl: null,
+            npmUrl: npm ? `https://www.npmjs.com/package/${name}` : "",
+            repoUrl: source.startsWith("git:github.com/") ? `https://${source.slice(4)}` : null,
             homepage: null,
             keywords: [],
             updated: null,
             popularity: 0,
-          })) satisfies PiPackage[] as T;
+          }}) satisfies PiPackage[] as T;
       }
       case "pi_package_details":
         await sleep(160);
@@ -634,9 +643,12 @@ class MockBackend implements Backend {
             valid: true,
             error: null,
           },
-        ] as T;
+        ].filter((theme) => !this.deletedThemes.has(theme.path)) as T;
       case "save_pi_theme":
         return `/Users/dev/.pi/agent/themes/${String((args.draft as { name?: string })?.name ?? "custom")}.json` as T;
+      case "delete_pi_theme":
+        this.deletedThemes.add(String(args.path));
+        return undefined as T;
       case "export_pi_theme_package":
         return `${String(args.destination ?? "/Users/dev/Desktop")}/pi-theme-custom` as T;
       case "preview_configs":
@@ -682,8 +694,8 @@ class MockBackend implements Backend {
       }
       case "list_skills":
         return [
-          { name: "code-review", description: "Review the current diff for bugs", path: "/mock/skills/code-review/SKILL.md", sourceDir: "~/.claude/skills" },
-          { name: "verify", description: "Verify a change by running the app", path: "/mock/skills/verify/SKILL.md", sourceDir: "~/.claude/skills" },
+          { name: "code-review", description: "Review the current diff for bugs", path: "/mock/skills/code-review/SKILL.md", sourceDir: "~/GithubControl/pi-app/agent-skills/code-review/SKILL.md", scope: "global" },
+          { name: "ship", description: "Verify and prepare a finished change", path: "/mock/skills/ship/SKILL.md", sourceDir: "~/GithubControl/pi-app/agent-skills/ship/SKILL.md", scope: "global" },
         ] satisfies SkillInfo[] as T;
       case "list_workspace_files":
         return [
@@ -785,7 +797,7 @@ class MockBackend implements Backend {
       case "git_is_repo":
         return true as T;
       case "git_summary":
-        return { isRepo: true, branch: "main", insertions: 14723, deletions: 1, changedFiles: 12, hasRemote: true, ahead: 2, behind: 0 } as T;
+        return { isRepo: true, branch: "main", insertions: 14723, deletions: 1, changedFiles: 2, hasRemote: true, ahead: 2, behind: 0 } as T;
       case "git_open_pr":
         return undefined as T;
       case "git_branches":

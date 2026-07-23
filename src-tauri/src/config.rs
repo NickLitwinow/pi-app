@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sessions::agent_dir;
 
@@ -121,6 +123,7 @@ pub fn write_project_pi_config(cwd: String, name: String, content: String) -> Re
 
 /// Validate JSON, back up the previous version, then write atomically (tmp + rename).
 pub fn write_json_atomic(path: &Path, content: &str) -> Result<(), String> {
+    static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     serde_json::from_str::<Value>(content).map_err(|e| format!("невалидный JSON: {e}"))?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -129,12 +132,16 @@ pub fn write_json_atomic(path: &Path, content: &str) -> Result<(), String> {
             fs::copy(path, &backup).map_err(|e| format!("backup failed: {e}"))?;
         }
         let tmp = parent.join(format!(
-            ".{}.tmp-{}",
+            ".{}.tmp-{}-{}",
             path.file_name().unwrap_or_default().to_string_lossy(),
-            std::process::id()
+            std::process::id(),
+            WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
         ));
         fs::write(&tmp, content).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+        if let Err(error) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error.to_string());
+        }
         Ok(())
     } else {
         Err("invalid path".into())
@@ -257,6 +264,57 @@ impl Default for AppConfig {
     }
 }
 
+fn normalize_hex_color(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() == 7
+        && trimmed.starts_with('#')
+        && trimmed.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+    {
+        trimmed.to_ascii_uppercase()
+    } else {
+        fallback.into()
+    }
+}
+
+fn normalize_app_config(mut cfg: AppConfig) -> AppConfig {
+    if !matches!(
+        cfg.editor.as_str(),
+        "code" | "cursor" | "windsurf" | "zed" | "subl" | "idea"
+    ) {
+        cfg.editor = "code".into();
+    }
+    cfg.process_limit = cfg.process_limit.clamp(1, 8);
+    cfg.idle_kill_secs = cfg.idle_kill_secs.clamp(60, 7 * 24 * 60 * 60);
+    cfg.preview_idle_kill_secs = cfg.preview_idle_kill_secs.min(7 * 24 * 60 * 60);
+    cfg.pi_retry_stall_timeout_ms = cfg.pi_retry_stall_timeout_ms.min(24 * 60 * 60 * 1000);
+    if !matches!(cfg.theme.as_str(), "system" | "dark" | "light") {
+        cfg.theme = "system".into();
+    }
+    if !cfg.ui_scale.is_finite() {
+        cfg.ui_scale = 1.0;
+    }
+    cfg.ui_scale = cfg.ui_scale.clamp(0.7, 1.6);
+    cfg.sidebar_width = cfg.sidebar_width.clamp(190, 400);
+    cfg.accent_color = normalize_hex_color(&cfg.accent_color, "#8B5CF6");
+    cfg.icon_color = normalize_hex_color(&cfg.icon_color, &cfg.accent_color);
+    if !matches!(
+        cfg.appearance_preset.as_str(),
+        "chatgpt" | "claude" | "gemini" | "custom"
+    ) {
+        cfg.appearance_preset = "chatgpt".into();
+    }
+    if !matches!(cfg.interface_density.as_str(), "compact" | "comfortable") {
+        cfg.interface_density = "comfortable".into();
+    }
+    if !matches!(cfg.transcript_mode.as_str(), "normal" | "compact") {
+        cfg.transcript_mode = "normal".into();
+    }
+    if !matches!(cfg.send_key_behavior.as_str(), "enter" | "mod-enter") {
+        cfg.send_key_behavior = "enter".into();
+    }
+    cfg
+}
+
 /// Локальный provider обычно делит один GPU/model server; два параллельных pi
 /// процесса дают swap/очередь без выигрыша. Не делаем HTTP-запросов — читаем
 /// только models.json.
@@ -310,10 +368,11 @@ fn app_config_path() -> PathBuf {
 }
 
 pub fn load_app_config() -> AppConfig {
-    let mut cfg: AppConfig = fs::read_to_string(app_config_path())
+    let cfg: AppConfig = fs::read_to_string(app_config_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    let mut cfg = normalize_app_config(cfg);
     // приветствие по умолчанию — имя пользователя ОС (пока не задано вручную)
     if cfg.display_name.as_deref().unwrap_or("").trim().is_empty() {
         cfg.display_name = os_display_name();
@@ -329,6 +388,7 @@ pub fn read_app_config() -> AppConfig {
 #[tauri::command]
 pub fn write_app_config(config: AppConfig) -> Result<(), String> {
     let path = app_config_path();
+    let config = normalize_app_config(config);
     let content = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     write_json_atomic(&path, &content)
 }
@@ -367,6 +427,80 @@ pub struct SessionFlags {
     pub hidden_projects: Vec<String>,
 }
 
+fn bounded_string(value: String, max_chars: usize) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.chars().take(max_chars).collect())
+    }
+}
+
+fn bounded_unique_strings(values: Vec<String>, limit: usize, max_chars: usize) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter_map(|value| bounded_string(value, max_chars))
+        .filter(|value| seen.insert(value.clone()))
+        .take(limit)
+        .collect()
+}
+
+fn normalize_session_flags(mut flags: SessionFlags) -> SessionFlags {
+    flags.pinned = bounded_unique_strings(flags.pinned, 5_000, 4_096);
+    flags.archived = bounded_unique_strings(flags.archived, 5_000, 4_096);
+    flags.hidden_projects = bounded_unique_strings(flags.hidden_projects, 1_000, 4_096);
+
+    let mut group_ids = HashSet::new();
+    flags.groups = flags
+        .groups
+        .into_iter()
+        .filter_map(|group| {
+            let id = bounded_string(group.id, 128)?;
+            let name = bounded_string(group.name, 200)?;
+            let cwd = bounded_string(group.cwd, 4_096)?;
+            group_ids
+                .insert(id.clone())
+                .then_some(SessionGroup { id, name, cwd })
+        })
+        .take(500)
+        .collect();
+
+    flags.group_of = flags
+        .group_of
+        .into_iter()
+        .filter_map(|(path, group_id)| {
+            let path = bounded_string(path, 4_096)?;
+            let group_id = bounded_string(group_id, 128)?;
+            group_ids.contains(&group_id).then_some((path, group_id))
+        })
+        .take(5_000)
+        .collect();
+
+    flags.pinned_messages = flags
+        .pinned_messages
+        .into_iter()
+        .filter_map(|(path, messages)| {
+            let path = bounded_string(path, 4_096)?;
+            let messages: Vec<_> = messages
+                .into_iter()
+                .filter_map(|message| {
+                    Some(PinnedMessage {
+                        id: bounded_string(message.id, 256)?,
+                        text: bounded_string(message.text, 20_000)?,
+                        role: bounded_string(message.role, 32)?,
+                        ts: message.ts.max(0),
+                    })
+                })
+                .take(100)
+                .collect();
+            (!messages.is_empty()).then_some((path, messages))
+        })
+        .take(1_000)
+        .collect();
+    flags
+}
+
 fn session_flags_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -379,11 +513,13 @@ pub fn read_session_flags() -> SessionFlags {
     fs::read_to_string(session_flags_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
+        .map(normalize_session_flags)
         .unwrap_or_default()
 }
 
 #[tauri::command]
 pub fn write_session_flags(flags: SessionFlags) -> Result<(), String> {
+    let flags = normalize_session_flags(flags);
     let content = serde_json::to_string_pretty(&flags).map_err(|e| e.to_string())?;
     write_json_atomic(&session_flags_path(), &content)
 }
@@ -688,6 +824,7 @@ pub struct SkillInfo {
     pub description: String,
     pub path: String,
     pub source_dir: String,
+    pub scope: String,
 }
 
 fn expand_tilde(p: &str) -> PathBuf {
@@ -700,9 +837,14 @@ fn expand_tilde(p: &str) -> PathBuf {
 }
 
 fn parse_skill_md(path: &Path) -> (Option<String>, Option<String>) {
-    let Ok(content) = fs::read_to_string(path) else {
+    let Ok(file) = fs::File::open(path) else {
         return (None, None);
     };
+    let mut bytes = Vec::new();
+    if file.take(64 * 1024).read_to_end(&mut bytes).is_err() {
+        return (None, None);
+    }
+    let content = String::from_utf8_lossy(&bytes);
     let mut name = None;
     let mut description = None;
     let mut in_frontmatter = false;
@@ -717,7 +859,7 @@ fn parse_skill_md(path: &Path) -> (Option<String>, Option<String>) {
                 break;
             }
             if let Some(v) = trimmed.strip_prefix("name:") {
-                name = Some(v.trim().to_string());
+                name = Some(v.trim().chars().take(120).collect());
             } else if let Some(v) = trimmed.strip_prefix("description:") {
                 let d: String = v.trim().chars().take(240).collect();
                 description = Some(d);
@@ -729,54 +871,116 @@ fn parse_skill_md(path: &Path) -> (Option<String>, Option<String>) {
     (name, description)
 }
 
-#[tauri::command]
-pub fn list_skills() -> Vec<SkillInfo> {
-    let mut out = Vec::new();
-    // skill dirs come from settings.json "skills" array
-    let settings_path = agent_dir().join("settings.json");
-    let dirs_list: Vec<String> = fs::read_to_string(&settings_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| {
-            v.get("skills").and_then(|s| s.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-        })
-        .unwrap_or_default();
+fn push_skill(
+    skill_md: &Path,
+    source: &str,
+    scope: &str,
+    out: &mut Vec<SkillInfo>,
+    seen: &mut HashSet<PathBuf>,
+) {
+    if !skill_md.is_file() || !seen.insert(skill_md.to_path_buf()) || out.len() >= 500 {
+        return;
+    }
+    let (name, description) = parse_skill_md(skill_md);
+    let fallback = skill_md
+        .parent()
+        .and_then(Path::file_name)
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    out.push(SkillInfo {
+        name: name.unwrap_or(fallback),
+        description: description.unwrap_or_default(),
+        path: skill_md.to_string_lossy().into_owned(),
+        source_dir: source.to_string(),
+        scope: scope.to_string(),
+    });
+}
 
-    for dir_str in &dirs_list {
-        let dir = expand_tilde(dir_str);
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if !p.is_dir() {
-                continue;
-            }
-            let skill_md = p.join("SKILL.md");
-            if skill_md.exists() {
-                let (name, description) = parse_skill_md(&skill_md);
-                out.push(SkillInfo {
-                    name: name.unwrap_or_else(|| {
-                        p.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
-                    }),
-                    description: description.unwrap_or_default(),
-                    path: skill_md.to_string_lossy().into_owned(),
-                    source_dir: dir_str.clone(),
-                });
-            }
+fn collect_skills_from_path(
+    source: &str,
+    scope: &str,
+    base: &Path,
+    out: &mut Vec<SkillInfo>,
+    seen: &mut HashSet<PathBuf>,
+) {
+    let expanded = expand_tilde(source);
+    let path = if expanded.is_absolute() {
+        expanded
+    } else {
+        base.join(expanded)
+    };
+    if path.is_file() {
+        if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+            push_skill(&path, source, scope, out, seen);
+        }
+        return;
+    }
+    if !path.is_dir() {
+        return;
+    }
+    let direct = path.join("SKILL.md");
+    if direct.is_file() {
+        push_skill(&direct, source, scope, out, seen);
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path().join("SKILL.md");
+        push_skill(&candidate, source, scope, out, seen);
+        if out.len() >= 500 {
+            return;
+        }
+    }
+}
+
+fn skill_sources(path: &Path) -> Result<Vec<String>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let value: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    let Some(skills) = value.get("skills") else {
+        return Ok(Vec::new());
+    };
+    let array = skills
+        .as_array()
+        .ok_or_else(|| format!("{}: skills должен быть массивом", path.display()))?;
+    Ok(array
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect())
+}
+
+#[tauri::command]
+pub fn list_skills(cwd: Option<String>) -> Result<Vec<SkillInfo>, String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let root = agent_dir();
+    for source in skill_sources(&root.join("settings.json"))? {
+        collect_skills_from_path(&source, "global", &root, &mut out, &mut seen);
+        if out.len() >= 500 {
+            break;
+        }
+    }
+    if let Some(cwd) = cwd {
+        let workspace = PathBuf::from(cwd);
+        for source in skill_sources(&workspace.join(".pi/settings.json"))? {
+            collect_skills_from_path(&source, "project", &workspace, &mut out, &mut seen);
             if out.len() >= 500 {
-                return out;
+                break;
             }
         }
     }
-    out
+    out.sort_by(|a, b| {
+        a.source_dir
+            .cmp(&b.source_dir)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -801,6 +1005,31 @@ mod tests {
         let backup = path.with_extension("json.pi-app.bak");
         assert_eq!(fs::read_to_string(&backup).unwrap(), r#"{"a":1}"#);
         assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"a":2}"#);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_use_distinct_temp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = std::sync::Arc::new(tmp.path().join("settings.json"));
+        write_json_atomic(&path, r#"{"value":0}"#).unwrap();
+        let handles: Vec<_> = (1..=12)
+            .map(|value| {
+                let path = std::sync::Arc::clone(&path);
+                std::thread::spawn(move || {
+                    write_json_atomic(&path, &format!(r#"{{"value":{value}}}"#))
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let final_value: Value =
+            serde_json::from_str(&fs::read_to_string(&*path).unwrap()).unwrap();
+        assert!(final_value.get("value").and_then(Value::as_u64).is_some());
+        assert!(fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-")));
     }
 
     #[test]
@@ -859,6 +1088,95 @@ mod tests {
         assert_eq!(c.idle_kill_secs, 9000);
         assert_eq!(c.editor, "zed");
         assert_eq!(c.process_limit, 3);
+    }
+
+    #[test]
+    fn app_config_normalizes_out_of_range_and_injectable_values() {
+        let mut c = AppConfig {
+            editor: "$(touch /tmp/nope)".into(),
+            process_limit: 999,
+            idle_kill_secs: 0,
+            preview_idle_kill_secs: u64::MAX,
+            theme: "javascript:alert(1)".into(),
+            ui_scale: 100.0,
+            sidebar_width: 2,
+            pi_retry_stall_timeout_ms: u64::MAX,
+            accent_color: "url(https://tracker.invalid)".into(),
+            icon_color: "red; color: blue".into(),
+            appearance_preset: "unknown".into(),
+            interface_density: "unknown".into(),
+            transcript_mode: "unknown".into(),
+            send_key_behavior: "unknown".into(),
+            ..AppConfig::default()
+        };
+        c = normalize_app_config(c);
+        assert_eq!(c.editor, "code");
+        assert_eq!(c.process_limit, 8);
+        assert_eq!(c.idle_kill_secs, 60);
+        assert_eq!(c.preview_idle_kill_secs, 7 * 24 * 60 * 60);
+        assert_eq!(c.theme, "system");
+        assert_eq!(c.ui_scale, 1.6);
+        assert_eq!(c.sidebar_width, 190);
+        assert_eq!(c.pi_retry_stall_timeout_ms, 24 * 60 * 60 * 1000);
+        assert_eq!(c.accent_color, "#8B5CF6");
+        assert_eq!(c.icon_color, "#8B5CF6");
+        assert_eq!(c.appearance_preset, "chatgpt");
+        assert_eq!(c.interface_density, "comfortable");
+        assert_eq!(c.transcript_mode, "normal");
+        assert_eq!(c.send_key_behavior, "enter");
+    }
+
+    #[test]
+    fn session_flags_are_bounded_and_drop_dangling_groups() {
+        let flags = normalize_session_flags(SessionFlags {
+            pinned: vec![" /one ".into(), "/one".into(), " ".into()],
+            archived: (0..5_100).map(|index| format!("/s/{index}")).collect(),
+            groups: vec![
+                SessionGroup {
+                    id: "valid".into(),
+                    name: " QA ".into(),
+                    cwd: "/repo".into(),
+                },
+                SessionGroup {
+                    id: "valid".into(),
+                    name: "duplicate".into(),
+                    cwd: "/repo".into(),
+                },
+            ],
+            group_of: HashMap::from([
+                ("/s/1".into(), "valid".into()),
+                ("/s/2".into(), "missing".into()),
+            ]),
+            pinned_messages: HashMap::from([(
+                "/s/1".into(),
+                vec![
+                    PinnedMessage {
+                        id: "p1".into(),
+                        text: "hello".into(),
+                        role: "assistant".into(),
+                        ts: -10,
+                    },
+                    PinnedMessage {
+                        id: " ".into(),
+                        text: "invalid".into(),
+                        role: "assistant".into(),
+                        ts: 1,
+                    },
+                ],
+            )]),
+            hidden_projects: vec!["/repo".into(), "/repo".into()],
+        });
+        assert_eq!(flags.pinned, vec!["/one"]);
+        assert_eq!(flags.archived.len(), 5_000);
+        assert_eq!(flags.groups.len(), 1);
+        assert_eq!(flags.groups[0].name, "QA");
+        assert_eq!(
+            flags.group_of,
+            HashMap::from([("/s/1".into(), "valid".into())])
+        );
+        assert_eq!(flags.pinned_messages["/s/1"].len(), 1);
+        assert_eq!(flags.pinned_messages["/s/1"][0].ts, 0);
+        assert_eq!(flags.hidden_projects, vec!["/repo"]);
     }
 
     #[test]
@@ -1025,6 +1343,55 @@ mod tests {
         let (name, desc) = parse_skill_md(&md);
         assert_eq!(name.as_deref(), Some("my-skill"));
         assert_eq!(desc.as_deref(), Some("Does things"));
+    }
+
+    #[test]
+    fn collects_direct_single_and_packaged_skill_paths_without_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let direct_dir = temp.path().join("direct");
+        let pack_dir = temp.path().join("pack");
+        fs::create_dir_all(&direct_dir).unwrap();
+        fs::create_dir_all(pack_dir.join("nested")).unwrap();
+        let direct = direct_dir.join("SKILL.md");
+        let nested = pack_dir.join("nested/SKILL.md");
+        fs::write(
+            &direct,
+            "---\nname: direct-skill\ndescription: Direct\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            &nested,
+            "---\nname: nested-skill\ndescription: Nested\n---\n",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        collect_skills_from_path(
+            direct.to_str().unwrap(),
+            "global",
+            temp.path(),
+            &mut out,
+            &mut seen,
+        );
+        collect_skills_from_path(
+            direct_dir.to_str().unwrap(),
+            "global",
+            temp.path(),
+            &mut out,
+            &mut seen,
+        );
+        collect_skills_from_path(
+            pack_dir.to_str().unwrap(),
+            "global",
+            temp.path(),
+            &mut out,
+            &mut seen,
+        );
+
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|skill| skill.name == "direct-skill"));
+        assert!(out.iter().any(|skill| skill.name == "nested-skill"));
     }
 
     #[test]

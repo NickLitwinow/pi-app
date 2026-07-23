@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { getBackend } from "../lib/backend";
-import type { ConfigFile, PackageKind, PackageSetting } from "../lib/types";
+import type { ConfigFile, PackageKind, PackageSetting, SkillInfo } from "../lib/types";
 import { updateAppConfig, useStore } from "../state/store";
 import Marketplace, { setPackageResourceEnabled, useInstalledPackages, useRunPi } from "./Marketplace";
 import { CheckIcon, PackageIcon } from "./icons";
@@ -31,7 +31,7 @@ const PROFILES: {
   {
     id: "minimal",
     name: "Minimal",
-    desc: "Только разрешения и базовый harness. Минимальный стартовый контекст.",
+    desc: "Добавляет систему разрешений к локальному harness. Другие пакеты не удаляет.",
     packages: ["@gotgenes/pi-permission-system"],
     context: "≈1.2K токенов",
     tone: "lean",
@@ -73,16 +73,20 @@ function useReasoningPreset(scope: "global" | "project", cwd: string | null) {
   const [error, setError] = useState<string | null>(null);
 
   const read = useCallback(async () => {
-    const be = await getBackend();
-    const file = scope === "project" && cwd
-      ? await be.invoke<ConfigFile>("read_project_pi_config", { cwd, name: "mcp" })
-      : await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
-    let config: Record<string, unknown> = {};
-    try { config = JSON.parse(file.content) as Record<string, unknown>; } catch { /* invalid config stays disabled */ }
-    const servers = config.mcpServers && typeof config.mcpServers === "object"
-      ? config.mcpServers as Record<string, unknown>
-      : {};
-    setEnabled(Object.prototype.hasOwnProperty.call(servers, "sequential-thinking"));
+    try {
+      const be = await getBackend();
+      const file = scope === "project" && cwd
+        ? await be.invoke<ConfigFile>("read_project_pi_config", { cwd, name: "mcp" })
+        : await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
+      const parsed = JSON.parse(file.content) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file.path}: корень должен быть объектом`);
+      const rawServers = (parsed as Record<string, unknown>).mcpServers ?? {};
+      if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) throw new Error(`${file.path}: mcpServers должен быть объектом`);
+      setEnabled(Object.prototype.hasOwnProperty.call(rawServers, "sequential-thinking"));
+      setError(null);
+    } catch (readError) {
+      setError(`Не удалось прочитать MCP-пресет: ${String(readError)}`);
+    }
   }, [cwd, scope]);
 
   useEffect(() => { void read(); }, [read]);
@@ -96,15 +100,12 @@ function useReasoningPreset(scope: "global" | "project", cwd: string | null) {
       const file = scope === "project"
         ? await be.invoke<ConfigFile>("read_project_pi_config", { cwd, name: "mcp" })
         : await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
-      let config: Record<string, unknown>;
-      try {
-        config = JSON.parse(file.content) as Record<string, unknown>;
-      } catch {
-        throw new Error(`${file.path} содержит невалидный JSON — исправьте его перед применением пресета`);
-      }
-      const servers = config.mcpServers && typeof config.mcpServers === "object"
-        ? { ...config.mcpServers as Record<string, unknown> }
-        : {};
+      const parsed = JSON.parse(file.content) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file.path}: корень должен быть объектом`);
+      const config = parsed as Record<string, unknown>;
+      const rawServers = config.mcpServers ?? {};
+      if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) throw new Error(`${file.path}: mcpServers должен быть объектом`);
+      const servers = { ...rawServers as Record<string, unknown> };
       if (nextEnabled) servers["sequential-thinking"] = REASONING_SERVER;
       else delete servers["sequential-thinking"];
       const next = { ...config, mcpServers: servers };
@@ -126,6 +127,7 @@ function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | n
   const { installed, specs, reload } = useInstalledPackages(scope, cwd);
   const runner = useRunPi(reload);
   const reasoning = useReasoningPreset(scope, cwd);
+  const [error, setError] = useState<string | null>(null);
 
   const hasProfilePackage = (pkg: ProfilePackage) => {
     const source = profilePackageSource(pkg);
@@ -138,7 +140,9 @@ function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | n
     const file = scope === "project"
       ? await be.invoke<ConfigFile>("read_project_settings", { cwd })
       : await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
-    const settings = JSON.parse(file.content) as Record<string, unknown>;
+    const parsed = JSON.parse(file.content) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file.path}: корень должен быть объектом`);
+    const settings = parsed as Record<string, unknown>;
     const entries = Array.isArray(settings.packages) ? settings.packages as PackageSetting[] : [];
     const packages = setPackageResourceEnabled(entries, pkg.name, "skill", false);
     const content = JSON.stringify({ ...settings, packages }, null, 2) + "\n";
@@ -147,18 +151,27 @@ function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | n
   };
 
   const installProfile = async (packages: ProfilePackage[]) => {
-    for (const pkg of packages) {
-      if (!hasProfilePackage(pkg)) {
-        const installedOk = await runner.runPi(["install", ...(scope === "project" ? ["-l"] : []), profilePackageSource(pkg)], scope === "project" ? cwd : null);
-        if (!installedOk) continue;
+    setError(null);
+    try {
+      for (const pkg of packages) {
+        if (!hasProfilePackage(pkg)) {
+          const installedOk = await runner.runPi(["install", ...(scope === "project" ? ["-l"] : []), profilePackageSource(pkg)], scope === "project" ? cwd : null);
+          if (!installedOk) continue;
+        }
+        await applyProfilePolicy(pkg);
       }
-      await applyProfilePolicy(pkg);
+      reload();
+    } catch (profileError) {
+      setError(`Не удалось применить профиль: ${String(profileError)}`);
     }
-    reload();
   };
 
   return (
     <div className="profile-grid">
+      <div className="hint profile-additive-note">
+        Профили устанавливают недостающие пакеты и не удаляют существующие. Оценка контекста относится только к пакету связки, а не ко всему текущему окружению.
+      </div>
+      {error && <div className="profile-error" role="alert">{error}</div>}
       {PROFILES.map((profile) => {
         const installedCount = profile.packages.filter(hasProfilePackage).length;
         const complete = installedCount === profile.packages.length;
@@ -222,6 +235,57 @@ function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | n
   );
 }
 
+function LocalSkills({ scope, cwd }: { scope: "global" | "project"; cwd: string | null }) {
+  const editor = useStore((state) => state.appConfig.editor);
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const be = await getBackend();
+        const loaded = await be.invoke<SkillInfo[]>("list_skills", { cwd });
+        setSkills(loaded.filter((skill) => skill.scope === scope));
+        setError(null);
+      } catch (loadError) {
+        setSkills([]);
+        setError(`Не удалось прочитать configured skills: ${String(loadError)}`);
+      }
+    })();
+  }, [cwd, scope]);
+
+  const open = async (skill: SkillInfo) => {
+    try {
+      const be = await getBackend();
+      await be.invoke("open_in_editor", { editor, path: skill.path, line: null });
+      setError(null);
+    } catch (openError) {
+      setError(`Не удалось открыть ${skill.name}: ${String(openError)}`);
+    }
+  };
+
+  const contextTokens = skills.reduce((total, skill) => total + Math.max(1, Math.round((skill.name.length + skill.description.length) / 4)), 0);
+  return (
+    <section className="local-skills" aria-label="Настроенные standalone skills">
+      <div className="section-title" style={{ padding: "18px 2px 8px" }}>
+        Standalone skills · {skills.length}{skills.length > 0 ? ` · описания ≈${contextTokens} ток.` : ""}
+      </div>
+      <div className="hint" style={{ marginBottom: 10 }}>
+        Прямые SKILL.md и каталоги из settings.json → skills. Нажмите карточку, чтобы проверить инструкции в редакторе.
+      </div>
+      {error && <div className="card" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>{error}</div>}
+      {skills.map((skill) => (
+        <button key={skill.path} className="card click local-skill-card" aria-label={`Открыть skill ${skill.name}`} onClick={() => void open(skill)}>
+          <span className="c-title">{skill.name}</span>
+          {skill.description && <span className="c-sub">{skill.description}</span>}
+          <code>{skill.sourceDir}</code>
+        </button>
+      ))}
+      {skills.length === 0 && !error && <div className="muted">В этом scope standalone skills не настроены.</div>}
+    </section>
+  );
+}
+
 export default function LibraryView() {
   const cwd = useStore((state) => state.currentCwd);
   const onboardingSeen = useStore((state) => state.appConfig.libraryOnboardingSeen === true);
@@ -261,12 +325,15 @@ export default function LibraryView() {
         <main className="library-content">
           <div className="library-content-title"><div><h2>{current.label}</h2><p>{current.desc} · {scope === "project" ? cwd?.split("/").pop() : "глобально"}</p></div><span className="realtime-pill"><span className="dot live" /> Live</span></div>
           {tab === "profiles" ? <Profiles scope={scope} cwd={cwd} /> : (
-            <Marketplace kind={tab} scope={scope} cwd={cwd} installHint={
-              tab === "extension" ? "Расширения получают полный доступ к системе. Карточки с repo позволяют проверить исходники до установки."
-                : tab === "skill" ? "Описание skill добавляется в стартовый контекст; держите активным только нужный набор."
-                  : tab === "theme" ? "Темы устанавливаются в выбранный scope; редактор и экспорт доступны в Settings → Темы."
-                    : "Prompt templates и AGENTS.md-пресеты для повторяемых рабочих процессов."
-            } />
+            <>
+              <Marketplace kind={tab} scope={scope} cwd={cwd} installHint={
+                tab === "extension" ? "Расширения получают полный доступ к системе. Карточки с repo позволяют проверить исходники до установки."
+                  : tab === "skill" ? "Описание skill добавляется в стартовый контекст; держите активным только нужный набор."
+                    : tab === "theme" ? "Темы устанавливаются в выбранный scope; редактор и экспорт доступны в Settings → Темы."
+                      : "Prompt templates и AGENTS.md-пресеты для повторяемых рабочих процессов."
+              } />
+              {tab === "skill" && <LocalSkills scope={scope} cwd={cwd} />}
+            </>
           )}
         </main>
       </div>

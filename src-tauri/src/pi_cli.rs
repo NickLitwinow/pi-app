@@ -154,11 +154,29 @@ pub async fn pi_cli_run(
 
 /// Probe a custom endpoint (проверка «жив ли» remote/локальный LLM-сервер).
 /// Uses system curl to avoid pulling an HTTP+TLS stack into the binary.
-#[tauri::command]
-pub async fn probe_url(url: String) -> Result<String, String> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+fn validate_probe_url(url: &str) -> Result<(), String> {
+    if url.is_empty() || url.len() > 2_048 || url.chars().any(char::is_whitespace) {
+        return Err("Некорректный URL (пустой, слишком длинный или содержит пробелы)".into());
+    }
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or("URL должен начинаться с http:// или https://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return Err("URL должен начинаться с http:// или https://".into());
     }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err("URL должен содержать имя хоста".into());
+    }
+    if authority.contains('@') {
+        return Err("URL с логином или паролем не поддерживается".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn probe_url(url: String) -> Result<String, String> {
+    validate_probe_url(&url)?;
     let out = Command::new("/usr/bin/curl")
         .args([
             "-s",
@@ -168,6 +186,7 @@ pub async fn probe_url(url: String) -> Result<String, String> {
             "%{http_code}",
             "--max-time",
             "6",
+            "--",
             &url,
         ])
         .stdin(Stdio::null())
@@ -296,5 +315,16 @@ mod version_tests {
         assert!(version_is_newer("0.80.10", "0.80.6"));
         assert!(!version_is_newer("0.80.6", "0.80.6"));
         assert!(!version_is_newer("0.79.9", "0.80.0"));
+    }
+
+    #[test]
+    fn validates_probe_urls_before_passing_them_to_curl() {
+        assert!(validate_probe_url("http://127.0.0.1:8080/health").is_ok());
+        assert!(validate_probe_url("HTTPS://example.com/models?q=1").is_ok());
+        assert!(validate_probe_url("file:///etc/passwd").is_err());
+        assert!(validate_probe_url("http:///missing-host").is_err());
+        assert!(validate_probe_url("http://user:secret@example.com").is_err());
+        assert!(validate_probe_url("http://example.com\n--output=/tmp/x").is_err());
+        assert!(validate_probe_url(&format!("https://{}", "a".repeat(2_100))).is_err());
     }
 }

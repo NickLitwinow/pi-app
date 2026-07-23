@@ -30,12 +30,12 @@ export default function App() {
   const accentColor = useStore((s) => s.appConfig.accentColor ?? "#8b5cf6");
   const iconColor = useStore((s) => s.appConfig.iconColor ?? s.appConfig.accentColor ?? "#8b5cf6");
   const appIconBackground = useStore((s) => resolveAppIconBackground(s.appConfig));
-  const appearancePreset = useStore((s) => s.appConfig.appearancePreset ?? "chatgpt");
+  const appearancePreset = useStore((s) => ["chatgpt", "claude", "gemini", "custom"].includes(s.appConfig.appearancePreset ?? "") ? s.appConfig.appearancePreset! : "chatgpt");
   const visualEffects = useStore((s) => s.appConfig.visualEffects !== false);
-  const interfaceDensity = useStore((s) => s.appConfig.interfaceDensity ?? "comfortable");
+  const interfaceDensity = useStore((s) => s.appConfig.interfaceDensity === "compact" ? "compact" : "comfortable");
   const customTheme = useStore((s) => s.appConfig.customTheme ?? null);
   const sidebarCollapsed = useStore((s) => s.appConfig.sidebarCollapsed ?? false);
-  const sidebarWidth = useStore((s) => s.appConfig.sidebarWidth ?? 240);
+  const sidebarWidth = useStore((s) => Math.min(400, Math.max(190, s.appConfig.sidebarWidth ?? 240)));
   const automaticUpdates = useStore((s) => s.appConfig.automaticUpdates !== false);
   const sourceRepoPath = useStore((s) => s.appConfig.sourceRepoPath ?? null);
   // читшит хоткеев (⌘/); ref — чтобы keydown-эффект с пустыми deps видел актуальное
@@ -277,7 +277,7 @@ export default function App() {
   useEffect(() => {
     const root = document.getElementById("root");
     if (!root) return;
-    const s = uiScale || 1;
+    const s = Number.isFinite(uiScale) ? Math.min(1.6, Math.max(0.7, uiScale || 1)) : 1;
     document.documentElement.style.setProperty("--ui-scale", String(s));
     if (Math.abs(s - 1) < 0.01) {
       root.style.transform = "";

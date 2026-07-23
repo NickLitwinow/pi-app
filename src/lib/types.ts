@@ -536,6 +536,8 @@ export type PackageSetting =
   | ({ source: string } & Partial<Record<"extensions" | "skills" | "themes" | "prompts", string[]>>);
 
 export interface PiPackage {
+  /** Exact settings.json package spec for installed rows (npm/git/local). */
+  source?: string | null;
   name: string;
   version: string;
   description: string;
@@ -591,6 +593,7 @@ export interface SkillInfo {
   description: string;
   path: string;
   sourceDir: string;
+  scope: "global" | "project" | string;
 }
 
 export interface ConfigFile {

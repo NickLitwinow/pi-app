@@ -241,11 +241,43 @@ export async function loadPiDefaults(): Promise<void> {
   });
 }
 
-export async function updateAppConfig(patch: Partial<AppConfig>): Promise<void> {
+let appConfigWriteQueue: Promise<void> = Promise.resolve();
+
+function emitAppConfigStatus(error: string | null): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent("pi:app-config-status", { detail: { error } }));
+  }
+}
+
+export async function updateAppConfig(patch: Partial<AppConfig>): Promise<boolean> {
+  const previous = useStore.getState().appConfig;
   const next = { ...useStore.getState().appConfig, ...patch };
   useStore.setState({ appConfig: next });
-  const be = await getBackend();
-  await be.invoke("write_app_config", { config: next }).catch(() => {});
+  const write = async (): Promise<boolean> => {
+    try {
+      const be = await getBackend();
+      await be.invoke("write_app_config", { config: next });
+      emitAppConfigStatus(null);
+      return true;
+    } catch (error) {
+      // A later optimistic update may already include this patch. Roll back only
+      // when this exact snapshot is still displayed.
+      if (useStore.getState().appConfig === next) {
+        try {
+          const be = await getBackend();
+          const persisted = await be.invoke<AppConfig>("read_app_config");
+          useStore.setState({ appConfig: persisted });
+        } catch {
+          useStore.setState({ appConfig: previous });
+        }
+      }
+      emitAppConfigStatus(`Не удалось сохранить настройки приложения: ${String(error)}`);
+      return false;
+    }
+  };
+  const result = appConfigWriteQueue.then(write, write);
+  appConfigWriteQueue = result.then(() => undefined, () => undefined);
+  return result;
 }
 
 export function insertIntoComposer(text: string): void {
@@ -989,12 +1021,12 @@ export async function setAgentMode(cwd: string, mode: AgentMode): Promise<void> 
   }
 }
 
-export function addWorkspace(cwd: string): void {
+export async function addWorkspace(cwd: string): Promise<void> {
   const s = useStore.getState();
   // повторное добавление ранее скрытой папки — снова показываем её
   const flags = s.sessionFlags;
   if (flags.hiddenProjects.includes(cwd)) {
-    void persistFlags({ ...flags, hiddenProjects: flags.hiddenProjects.filter((p) => p !== cwd) });
+    await persistFlags({ ...flags, hiddenProjects: flags.hiddenProjects.filter((p) => p !== cwd) });
   }
   if ([...s.projects, ...s.extraWorkspaces].some((p) => p.cwd === cwd)) {
     useStore.setState({ currentCwd: cwd, view: "chat" });
@@ -1213,10 +1245,30 @@ export async function renameSessionAction(cwd: string, path: string, name: strin
   await refreshSessions(cwd);
 }
 
+let sessionFlagsWriteQueue: Promise<void> = Promise.resolve();
+
 async function persistFlags(flags: SessionFlags): Promise<void> {
+  const previous = useStore.getState().sessionFlags;
   useStore.setState({ sessionFlags: flags });
-  const be = await getBackend();
-  await be.invoke("write_session_flags", { flags }).catch(() => {});
+  const write = sessionFlagsWriteQueue.then(async () => {
+    const be = await getBackend();
+    await be.invoke("write_session_flags", { flags });
+  });
+  sessionFlagsWriteQueue = write.catch(() => {});
+  try {
+    await write;
+  } catch (error) {
+    if (useStore.getState().sessionFlags === flags) {
+      try {
+        const be = await getBackend();
+        const persisted = await be.invoke<SessionFlags>("read_session_flags");
+        useStore.setState({ sessionFlags: normalizeFlags(persisted) });
+      } catch {
+        useStore.setState({ sessionFlags: previous });
+      }
+    }
+    throw new Error(`Не удалось сохранить метаданные сессий: ${String(error)}`);
+  }
 }
 
 export async function togglePinned(path: string): Promise<void> {

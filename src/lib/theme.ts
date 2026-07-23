@@ -57,8 +57,21 @@ export const APP_THEME_PROPERTIES = [
   "--ok", "--warn", "--danger",
 ] as const;
 
+/** Theme packages are untrusted input. Keep CSS custom properties color-only so
+ * values such as url(...) cannot trigger network requests from the WebView. */
+export function safeThemeColor(value: unknown, fallback: string): string {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw || raw.length > 200 || /[;{}'"\\]/.test(raw) || /(?:url|var|expression)\s*\(/i.test(raw)) return fallback;
+  const syntaxSafe = /^#[\da-f]{3,8}$/i.test(raw)
+    || /^[a-z]+$/i.test(raw)
+    || /^(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color)\([a-z\d.,%+\-/\s]+\)$/i.test(raw);
+  if (!syntaxSafe) return fallback;
+  if (typeof CSS !== "undefined" && typeof CSS.supports === "function" && !CSS.supports("color", raw)) return fallback;
+  return raw;
+}
+
 export function paletteFromPiColors(name: string, colors: Record<string, string>): AppThemePalette {
-  const get = (token: string, fallback: string) => colors[token] || fallback;
+  const get = (token: string, fallback: string) => safeThemeColor(colors[token], fallback);
   const background = get("toolPendingBg", get("customMessageBg", "#111113"));
   return {
     name,
@@ -83,19 +96,19 @@ export function applyAppThemePalette(palette: AppThemePalette | null | undefined
     return;
   }
   const values: Record<(typeof APP_THEME_PROPERTIES)[number], string> = {
-    "--bg": palette.background,
-    "--bg-sidebar": palette.sidebar,
-    "--bg-raised": palette.raised,
-    "--bg-active": palette.active,
-    "--bg-input": palette.raised,
-    "--text": palette.text,
-    "--text-dim": palette.muted,
-    "--border": palette.border,
-    "--brand": palette.accent,
-    "--brand-strong": palette.accent,
-    "--ok": palette.success,
-    "--warn": palette.warning,
-    "--danger": palette.danger,
+    "--bg": safeThemeColor(palette.background, "#111113"),
+    "--bg-sidebar": safeThemeColor(palette.sidebar, "#18181b"),
+    "--bg-raised": safeThemeColor(palette.raised, "#202024"),
+    "--bg-active": safeThemeColor(palette.active, "#303036"),
+    "--bg-input": safeThemeColor(palette.raised, "#202024"),
+    "--text": safeThemeColor(palette.text, "#f4f4f5"),
+    "--text-dim": safeThemeColor(palette.muted, "#a1a1aa"),
+    "--border": safeThemeColor(palette.border, "#3f3f46"),
+    "--brand": safeThemeColor(palette.accent, "#10a37f"),
+    "--brand-strong": safeThemeColor(palette.accent, "#10a37f"),
+    "--ok": safeThemeColor(palette.success, "#22c55e"),
+    "--warn": safeThemeColor(palette.warning, "#f59e0b"),
+    "--danger": safeThemeColor(palette.danger, "#ef4444"),
   };
   for (const [property, value] of Object.entries(values)) root.style.setProperty(property, value);
 }
@@ -103,13 +116,13 @@ export function applyAppThemePalette(palette: AppThemePalette | null | undefined
 export function applyAppearanceConfig(config: AppConfig): void {
   const root = document.documentElement;
   const preset = config.appearancePreset ?? "chatgpt";
-  const accent = preset === "chatgpt" ? "#10a37f" : preset === "claude" ? "#d97757" : preset === "gemini" ? "#6d7cff" : config.accentColor ?? "#8b5cf6";
+  const accent = preset === "chatgpt" ? "#10a37f" : preset === "claude" ? "#d97757" : preset === "gemini" ? "#6d7cff" : safeThemeColor(config.accentColor, "#8b5cf6");
   if (preset === "custom" && config.customTheme) applyAppThemePalette(config.customTheme);
   else {
     applyAppThemePalette(null);
     root.style.setProperty("--brand", accent);
   }
   const effectiveAccent = preset === "custom" && config.customTheme ? config.customTheme.accent : accent;
-  root.style.setProperty("--icon-accent", preset === "custom" ? config.iconColor || effectiveAccent : effectiveAccent);
+  root.style.setProperty("--icon-accent", preset === "custom" ? safeThemeColor(config.iconColor, effectiveAccent) : effectiveAccent);
   root.dataset.appIconBackground = resolveAppIconBackground(config);
 }

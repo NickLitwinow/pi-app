@@ -31,14 +31,20 @@ export function packageNameFromSpec(spec: PackageSetting | unknown): string | nu
     const name = clean.slice(clean.lastIndexOf("/") + 1).replace(/\.git$/, "");
     return name || null;
   }
-  if (!sourceSpec.startsWith("npm:")) return null;
-  const source = sourceSpec.slice(4);
-  if (source.startsWith("@")) {
-    const versionSeparator = source.indexOf("@", source.indexOf("/") + 1);
+  if (sourceSpec.startsWith("npm:")) {
+    const source = sourceSpec.slice(4);
+    if (source.startsWith("@")) {
+      const versionSeparator = source.indexOf("@", source.indexOf("/") + 1);
+      return versionSeparator > 0 ? source.slice(0, versionSeparator) : source;
+    }
+    const versionSeparator = source.indexOf("@");
     return versionSeparator > 0 ? source.slice(0, versionSeparator) : source;
   }
-  const versionSeparator = source.indexOf("@");
-  return versionSeparator > 0 ? source.slice(0, versionSeparator) : source;
+  // Pi also accepts local package directories. Keep those visible in the
+  // Installed view instead of silently dropping every non-npm/non-git spec.
+  const clean = sourceSpec.trim().replace(/^file:/, "").split(/[?#]/, 1)[0].replace(/[\\/]+$/, "");
+  const name = clean.split(/[\\/]/).pop()?.replace(/\.git$/, "");
+  return name || null;
 }
 
 export function isPackageResourceEnabled(spec: PackageSetting, kind: PackageKind): boolean {
@@ -49,18 +55,26 @@ export function isPackageResourceEnabled(spec: PackageSetting, kind: PackageKind
 
 export function setPackageResourceEnabled(
   packages: PackageSetting[],
-  packageName: string,
+  packageIdentifier: string,
   kind: PackageKind,
   enabled: boolean,
 ): PackageSetting[] {
   const key = RESOURCE_KEY[kind];
   return packages.map((spec) => {
-    if (packageNameFromSpec(spec) !== packageName) return spec;
+    if (packageSource(spec) !== packageIdentifier && packageNameFromSpec(spec) !== packageIdentifier) return spec;
     const next: Exclude<PackageSetting, string> = typeof spec === "string" ? { source: spec } : { ...spec };
     if (enabled) delete next[key];
     else next[key] = [];
     return Object.keys(next).length === 1 ? next.source : next;
   });
+}
+
+export function packageCliSource(pkg: Pick<PiPackage, "name" | "source">): string {
+  return pkg.source || `npm:${pkg.name}`;
+}
+
+function isHarnessCorePackage(pkg: Pick<PiPackage, "name" | "source">): boolean {
+  return pkg.name === "harness-extension" && Boolean(pkg.source && !pkg.source.startsWith("npm:"));
 }
 
 /** Installed packages plus scoped, atomic resource controls. */
@@ -214,6 +228,16 @@ const KIND_RISK: Record<PackageKind, { label: string; title: string; className: 
   prompt: { label: "инструкции модели", title: "Prompt меняет инструкции, передаваемые модели", className: "context" },
 };
 
+const INSTALLED_PACKAGE_RISK = {
+  label: "может исполнять код",
+  title: "Установленный pi-пакет может одновременно содержать extensions, skills, themes и prompts; эта вкладка управляет только выбранным типом ресурса",
+  className: "danger",
+};
+
+export function packageRisk(kind: PackageKind, installed: boolean) {
+  return installed ? INSTALLED_PACKAGE_RISK : KIND_RISK[kind];
+}
+
 export default function Marketplace({
   kind,
   recommended,
@@ -315,16 +339,16 @@ export default function Marketplace({
   const canLoadMore = !onlyInstalled && results.length < total;
 
   const install = (name: string) => void runPi(["install", ...(scope === "project" ? ["-l"] : []), `npm:${name}`], scope === "project" ? cwd : null);
-  const updatePackage = (name: string) => void runPi(["update", "--extension", `npm:${name}`], scope === "project" ? cwd : null);
-  const remove = async (name: string) => {
-    if (requiredNames.has(name)) {
+  const updatePackage = (p: PiPackage) => void runPi(["update", "--extension", packageCliSource(p)], scope === "project" ? cwd : null);
+  const remove = async (p: PiPackage) => {
+    if (requiredNames.has(p.name) || isHarnessCorePackage(p)) {
       const ok = await confirmDialog(
-        `«${name}» используется этим клиентом — без него могут перестать работать функции приложения. Всё равно удалить?`,
+        `«${p.name}» используется этим клиентом — без него могут перестать работать функции приложения. Всё равно удалить?`,
         { kind: "warning" },
       );
       if (!ok) return;
     }
-    void runPi(["remove", ...(scope === "project" ? ["-l"] : []), `npm:${name}`], scope === "project" ? cwd : null);
+    void runPi(["remove", ...(scope === "project" ? ["-l"] : []), packageCliSource(p)], scope === "project" ? cwd : null);
   };
 
   const toggleResource = async (name: string, enabled: boolean) => {
@@ -339,24 +363,25 @@ export default function Marketplace({
     }
   };
 
-  const toggleDetails = async (name: string) => {
-    if (expandedPackage === name) {
+  const toggleDetails = async (p: PiPackage) => {
+    const identifier = p.source ?? p.name;
+    if (expandedPackage === identifier) {
       setExpandedPackage(null);
       return;
     }
-    setExpandedPackage(name);
-    if (Object.prototype.hasOwnProperty.call(packageDetails, name)) return;
-    setPackageDetails((current) => ({ ...current, [name]: null }));
+    setExpandedPackage(identifier);
+    if (Object.prototype.hasOwnProperty.call(packageDetails, identifier)) return;
+    setPackageDetails((current) => ({ ...current, [identifier]: null }));
     try {
       const be = await getBackend();
-      const details = await be.invoke<PackageDetails>("pi_package_details", { name });
-      setPackageDetails((current) => ({ ...current, [name]: details }));
+      const details = await be.invoke<PackageDetails>("pi_package_details", { name: p.name });
+      setPackageDetails((current) => ({ ...current, [identifier]: details }));
     } catch (detailsError) {
       setError(`Не удалось загрузить README: ${String(detailsError)}`);
       setExpandedPackage(null);
       setPackageDetails((current) => {
         const next = { ...current };
-        delete next[name];
+        delete next[identifier];
         return next;
       });
     }
@@ -364,13 +389,15 @@ export default function Marketplace({
 
   const renderCard = (p: PiPackage) => {
     const isInstalled = installed.has(p.name);
-    const isRequired = requiredNames.has(p.name);
-    const installedInfo = installedMeta.find((item) => item.name === p.name);
+    const risk = packageRisk(kind, isInstalled);
+    const isRequired = requiredNames.has(p.name) || isHarnessCorePackage(p);
+    const installedInfo = installedMeta.find((item) => p.source ? item.source === p.source : item.name === p.name);
     const updateAvailable = installedInfo?.updateAvailable === true;
-    const installedSpec = entries.find((spec) => packageNameFromSpec(spec) === p.name);
+    const packageIdentifier = p.source ?? p.name;
+    const installedSpec = entries.find((spec) => packageSource(spec) === packageIdentifier || packageNameFromSpec(spec) === p.name);
     const resourceEnabled = installedSpec ? isPackageResourceEnabled(installedSpec, kind) : true;
     return (
-      <div key={p.name} className="card mk-card">
+      <div key={packageIdentifier} className="card mk-card">
         <div className="mk-card-head">
           <div className="mk-card-identity">
             <PackageIcon size={15} />
@@ -382,7 +409,7 @@ export default function Marketplace({
                 )}
               </div>
               <div className="mk-card-badges">
-                <span className={`badge mk-risk ${KIND_RISK[kind].className}`} title={KIND_RISK[kind].title}>{KIND_RISK[kind].label}</span>
+                <span className={`badge mk-risk ${risk.className}`} title={risk.title}>{risk.label}</span>
                 {isRequired && <span className="badge" style={{ color: "var(--warn)" }} title="Нужно для работы этого клиента">нужно приложению</span>}
                 {isInstalled && <span className="badge green">установлено</span>}
                 {updateAvailable && <span className="badge update">доступно {installedInfo?.version}</span>}
@@ -396,30 +423,34 @@ export default function Marketplace({
               <ExternalIcon size={12} /> repo
             </button>
           )}
-          <button className="hint" title="Открыть на npm" onClick={() => void openExternalUrl(p.npmUrl)}>
-            npm ↗
-          </button>
-          <button className={expandedPackage === p.name ? "active" : "hint"} title="README и история изменений" onClick={() => void toggleDetails(p.name)}>
-            {expandedPackage === p.name ? "Скрыть" : "README"}
-          </button>
+          {p.npmUrl && (
+            <button className="hint" title="Открыть на npm" onClick={() => void openExternalUrl(p.npmUrl)}>
+              npm ↗
+            </button>
+          )}
+          {p.npmUrl && (
+            <button className={expandedPackage === packageIdentifier ? "active" : "hint"} title="README и история изменений" onClick={() => void toggleDetails(p)}>
+              {expandedPackage === packageIdentifier ? "Скрыть" : "README"}
+            </button>
+          )}
           {isInstalled ? (
             <>
               <button
                 className={`resource-toggle ${resourceEnabled ? "on" : ""}`}
-                disabled={running || resourceBusy === p.name}
+                disabled={running || resourceBusy !== null}
                 aria-pressed={resourceEnabled}
                 title={`${resourceEnabled ? "Отключить" : "Включить"} ${KIND_LABEL[kind]} пакета в этом scope`}
-                onClick={() => void toggleResource(p.name, !resourceEnabled)}
+                onClick={() => void toggleResource(packageIdentifier, !resourceEnabled)}
               >
                 <span aria-hidden="true" /> {resourceEnabled ? "Активно" : "Выключено"}
               </button>
               {updateAvailable && (
-                <button className="primary" disabled={running} onClick={() => updatePackage(p.name)}>Обновить</button>
+                <button className="primary" disabled={running || resourceBusy !== null} onClick={() => updatePackage(p)}>Обновить</button>
               )}
-              <button className="danger" disabled={running} onClick={() => void remove(p.name)}>Удалить</button>
+              <button className="danger" disabled={running || resourceBusy !== null} onClick={() => void remove(p)}>Удалить</button>
             </>
           ) : (
-            <button className="primary" disabled={running} onClick={() => install(p.name)}>
+            <button className="primary" disabled={running || resourceBusy !== null} onClick={() => install(p.name)}>
               Установить
             </button>
           )}
@@ -430,28 +461,29 @@ export default function Marketplace({
           {(kind === "skill" || kind === "prompt") && p.description && <span className="mk-tag context-cost">≈{Math.max(1, Math.round(p.description.length / 4))} ток. описания</span>}
           {p.author && <span className="mk-tag">@{p.author}</span>}
           {p.version && <span className="mk-tag mono">v{p.version}</span>}
+          {p.source && !p.source.startsWith("npm:") && <span className="mk-tag mono">{p.source}</span>}
           {p.keywords.filter((k) => k !== "pi-package" && k !== `pi-${kind}`).slice(0, 4).map((k) => (
             <span key={k} className="mk-tag">{k}</span>
           ))}
         </div>
-        {expandedPackage === p.name && (
+        {expandedPackage === packageIdentifier && (
           <div className="package-details">
-            {!packageDetails[p.name] ? <div className="muted">Загрузка документации…</div> : (
+            {!packageDetails[packageIdentifier] ? <div className="muted">Загрузка документации…</div> : (
               <>
                 <div className="package-details-head">
                   <strong>README</strong>
                   <div>
-                    {packageDetails[p.name]?.changelog && <a href="#package-changelog">Changelog</a>}
+                    {packageDetails[packageIdentifier]?.changelog && <a href="#package-changelog">Changelog</a>}
                     {p.repoUrl && <button className="hint" onClick={() => void openExternalUrl(`${p.repoUrl}/releases`)}>Releases ↗</button>}
                   </div>
                 </div>
-                {packageDetails[p.name]?.readme
-                  ? <div className="package-markdown"><Markdown source={packageDetails[p.name]!.readme!} final /></div>
+                {packageDetails[packageIdentifier]?.readme
+                  ? <div className="package-markdown"><Markdown source={packageDetails[packageIdentifier]!.readme!} final /></div>
                   : <div className="muted">README не включён в npm-пакет.</div>}
-                {packageDetails[p.name]?.changelog && (
+                {packageDetails[packageIdentifier]?.changelog && (
                   <details id="package-changelog" className="package-changelog">
                     <summary>Changelog из пакета</summary>
-                    <div className="package-markdown"><Markdown source={packageDetails[p.name]!.changelog!} final /></div>
+                    <div className="package-markdown"><Markdown source={packageDetails[packageIdentifier]!.changelog!} final /></div>
                   </details>
                 )}
               </>
@@ -505,7 +537,7 @@ export default function Marketplace({
         <button className={onlyInstalled ? "active" : ""} onClick={() => setOnlyInstalled(!onlyInstalled)} title="Только установленные">
           <CheckIcon size={13} /> Установленные
         </button>
-        <button disabled={running} onClick={() => void runPi(["update", "--extensions"], scope === "project" ? cwd : null)} title="Обновить все незакреплённые пакеты">
+        <button disabled={running || resourceBusy !== null} onClick={() => void runPi(["update", "--extensions"], scope === "project" ? cwd : null)} title="Обновить все незакреплённые пакеты">
           <RefreshIcon size={13} /> Обновить всё
         </button>
       </div>

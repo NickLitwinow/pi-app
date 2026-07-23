@@ -1,9 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
   isPackageResourceEnabled,
+  packageCliSource,
   packageNameFromSpec,
+  packageRisk,
   setPackageResourceEnabled,
 } from "../components/Marketplace";
+
+describe("package risk", () => {
+  it("never labels an installed multi-resource package as theme-only", () => {
+    expect(packageRisk("theme", false).label).toBe("только оформление");
+    expect(packageRisk("theme", true).label).toBe("может исполнять код");
+    expect(packageRisk("skill", true).className).toBe("danger");
+  });
+});
 
 describe("packageNameFromSpec", () => {
   it.each([
@@ -13,12 +23,25 @@ describe("packageNameFromSpec", () => {
     ["npm:@gotgenes/pi-permission-system@0.5.0", "@gotgenes/pi-permission-system"],
     ["git:https://example.com/package.git", "package"],
     ["git:github.com/DietrichGebert/ponytail", "ponytail"],
+    ["../../GithubControl/pi-app/harness-extension", "harness-extension"],
+    ["/Users/example/My Packages/custom-theme/", "custom-theme"],
+    ["file:../shared/custom-skill", "custom-skill"],
   ])("normalizes %s", (source, expected) => {
     expect(packageNameFromSpec(source)).toBe(expected);
   });
 
   it("normalizes object-form package filters", () => {
     expect(packageNameFromSpec({ source: "npm:@scope/pkg@2.0.0", extensions: [] })).toBe("@scope/pkg");
+  });
+});
+
+describe("packageCliSource", () => {
+  it("preserves exact installed sources and defaults catalog rows to npm", () => {
+    expect(packageCliSource({ name: "harness-extension", source: "../../pi-app/harness-extension" }))
+      .toBe("../../pi-app/harness-extension");
+    expect(packageCliSource({ name: "ponytail", source: "git:github.com/DietrichGebert/ponytail" }))
+      .toBe("git:github.com/DietrichGebert/ponytail");
+    expect(packageCliSource({ name: "pi-web-access" })).toBe("npm:pi-web-access");
   });
 });
 
@@ -64,5 +87,13 @@ describe("package resource filters", () => {
     );
     expect(next).toEqual({ source: "git:github.com/DietrichGebert/ponytail", skills: [] });
     expect(isPackageResourceEnabled(next, "extension")).toBe(true);
+  });
+
+  it("targets the exact local source when two packages share a basename", () => {
+    const packages = ["../one/shared", "../two/shared"];
+    expect(setPackageResourceEnabled(packages, "../two/shared", "extension", false)).toEqual([
+      "../one/shared",
+      { source: "../two/shared", extensions: [] },
+    ]);
   });
 });

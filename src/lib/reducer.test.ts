@@ -252,6 +252,89 @@ describe("applyAgentEvent — auxiliary events", () => {
     expect(chat.widgets.todos).toBeUndefined();
   });
 
+  it("bounds untrusted extension dialogs, status entries, and widgets", () => {
+    let chat = applyAgentEvent(emptyChatState(), {
+      type: "extension_ui_request",
+      id: "request-1",
+      method: "select",
+      title: "t".repeat(2_000),
+      message: "m".repeat(40_000),
+      options: Array.from({ length: 150 }, (_, index) => `option-${index}-${"x".repeat(3_000)}`),
+    });
+    expect(chat.uiRequests).toHaveLength(1);
+    expect(chat.uiRequests[0].title).toHaveLength(500);
+    expect(chat.uiRequests[0].message).toHaveLength(20_000);
+    expect(chat.uiRequests[0].options).toHaveLength(100);
+    expect(chat.uiRequests[0].options?.[0]).toHaveLength(2_000);
+
+    chat = applyAgentEvent({ ...chat }, { type: "extension_ui_request", id: "request-1", method: "confirm" });
+    expect(chat.uiRequests).toHaveLength(1);
+
+    chat = applyAgentEvent({ ...chat }, {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "third-party",
+      widgetText: "w".repeat(50_000),
+    });
+    expect(chat.widgets["third-party"]).toHaveLength(20_000);
+    chat = applyAgentEvent({ ...chat }, {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "__proto__",
+      widgetText: "pollute",
+    });
+    expect(Object.prototype).not.toHaveProperty("pollute");
+    expect(Object.keys(chat.widgets)).toEqual(["third-party"]);
+  });
+
+  it("validates reserved harness widget payloads before exposing them to the UI", () => {
+    let chat = applyAgentEvent(emptyChatState(), {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "pi-app-workflow-state",
+      widgetText: JSON.stringify({ steps: "not-an-array", events: [], intent: {} }),
+    });
+    expect(chat.workflow).toBeNull();
+
+    chat = applyAgentEvent({ ...chat }, {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "pi-app-workflow-state",
+      widgetText: JSON.stringify({
+        runId: "run-1",
+        objective: "Verify extension input",
+        profile: "bug",
+        status: "active",
+        approved: false,
+        intent: { primary: "debug", risk: "high", signals: ["extension"] },
+        steps: [{ id: "gate", label: "Gate", kind: "gate", deps: [], status: "running", acceptance: "passes", owner: "gate-runner", attempts: 1 }],
+        events: [],
+      }),
+    });
+    expect(chat.workflow?.steps[0].id).toBe("gate");
+    expect(chat.workflow?.intent.signals).toEqual(["extension"]);
+
+    chat = applyAgentEvent({ ...chat }, {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "pi-app-background-state",
+      widgetText: JSON.stringify({ id: "not-an-array" }),
+    });
+    expect(chat.backgroundTasks).toEqual([]);
+
+    chat = applyAgentEvent({ ...chat }, {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "pi-app-background-state",
+      widgetText: JSON.stringify([
+        { id: "task-1", type: "reviewer", description: "Review", status: "running", transcript: "x".repeat(80_000) },
+        { id: "task-2", status: "unknown" },
+      ]),
+    });
+    expect(chat.backgroundTasks).toHaveLength(1);
+    expect(chat.backgroundTasks[0].transcript).toHaveLength(60_000);
+  });
+
   it("strips leading emoji from toasts and dedupes repeats", () => {
     let chat = applyAgentEvent(emptyChatState(), {
       type: "extension_ui_request",
