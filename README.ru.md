@@ -128,6 +128,14 @@ git checkout -- package-lock.json src-tauri/Cargo.lock
 
 Pi — это Tauri 2-приложение с React 19 фронтендом. Rust-бэкенд запускает `pi --mode rpc` (JSONL через stdio) для каждой активной сессии и потоково передаёт события в WebView.
 
+Для frontend-задач панель Preview и harness сначала читают явный
+`.claude/launch.json`, а при его отсутствии автоматически находят
+`dev`/`start`/`serve`/`preview` в `package.json` либо статический `index.html`.
+Инструмент модели `live_preview` управляет тем же нативным dev-сервером, что и
+UI, ждёт реальной HTTP-готовности и подхватывает фактический локальный URL из
+логов. Проверка `npm run test:preview-model` запускает настоящий RPC-цикл
+ThinkingCap → `live_preview` → `agent_browser` и подтверждает DOM-результат.
+
 ```
 ┌─────────────────────────────────────────────┐
 │  Frontend (React 19 + TypeScript)           │

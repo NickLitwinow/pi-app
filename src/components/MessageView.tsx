@@ -80,25 +80,20 @@ function useExpanded(id: string | undefined): [boolean, () => void] {
 function ThinkingBlock({
   text,
   streaming,
-  forceOpen,
   blockId,
 }: {
   text: string;
   streaming?: boolean;
-  forceOpen?: boolean;
   blockId?: string;
 }) {
   const [open, toggle] = useExpanded(blockId);
-  // forceOpen — идущий ход: рассуждения видны живьём до самого конца хода
-  // (иначе они схлопывались, едва начинал приходить текст), затем уезжают в «Worked for».
-  const shown = open || streaming || forceOpen;
   return (
     <div className="thinking">
-      <div className="t-head" onClick={toggle}>
-        <ChevronIcon open={shown} />
+      <button type="button" className="t-head" aria-expanded={open} onClick={toggle}>
+        <ChevronIcon open={open} />
         {streaming ? "Размышляет…" : `Размышления (${text.trim().length} символов)`}
-      </div>
-      {shown && <div className="t-body">{stripAnsi(text.trim())}</div>}
+      </button>
+      {open && <div className="t-body">{stripAnsi(text.trim())}</div>}
     </div>
   );
 }
@@ -571,7 +566,7 @@ const MessageViewImpl = function MessageView({
   showModelHeader,
   fallbackModel,
   render = "full",
-  liveTurn,
+  expansionScope,
 }: {
   msg: ChatMessage;
   execs: Record<string, ToolExec>;
@@ -590,12 +585,13 @@ const MessageViewImpl = function MessageView({
   showModelHeader?: boolean;
   /** Модель для live-сообщения, если partial ещё не несёт provider/model. */
   fallbackModel?: ModelInfo;
+  /** Stable for one streaming turn so expansion survives token updates, but a
+   *  later turn still starts with thinking collapsed. */
+  expansionScope?: string;
   /** Codex-режим ленты: "full" — всё живьём; "answer" — только итоговый текст
    *  (мысли/инструменты уехали в свёрнутую сводку); "hidden" — сообщение целиком
    *  внутри сводки, в ленте ничего не рисуем. */
   render?: "full" | "answer" | "hidden";
-  /** Сообщение принадлежит идущему ходу — рассуждения держим раскрытыми. */
-  liveTurn?: boolean;
 }) {
   const pinId = useMemo(() => msgPinId(msg), [msg]);
   const aliases = useStore((s) => s.appConfig.modelAliases ?? {});
@@ -676,8 +672,7 @@ const MessageViewImpl = function MessageView({
               key={i}
               text={b.thinking}
               streaming={streaming && i === blocks.length - 1}
-              forceOpen={liveTurn}
-              blockId={`${pinId}-think-${i}`}
+              blockId={`${expansionScope ?? pinId}-think-${i}`}
             />
           );
         }
@@ -723,8 +718,8 @@ export const MessageView = memo(MessageViewImpl, (prev, next) => {
     || prev.transcriptMode !== next.transcriptMode
     || prev.hiddenToolIds !== next.hiddenToolIds
     || prev.showModelHeader !== next.showModelHeader
+    || prev.expansionScope !== next.expansionScope
     || prev.render !== next.render
-    || prev.liveTurn !== next.liveTurn
     // agentState пересоздаётся при каждом get_state — сравниваем по идентичности модели
     || prev.fallbackModel?.provider !== next.fallbackModel?.provider
     || prev.fallbackModel?.id !== next.fallbackModel?.id

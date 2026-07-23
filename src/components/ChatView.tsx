@@ -1553,6 +1553,7 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const virtRef = useRef<VirtuosoHandle>(null);
   const [pinned, setPinned] = useState(true);
+  const touchYRef = useRef<number | null>(null);
   const transcriptMode = useStore((s) => s.appConfig.transcriptMode ?? "normal");
 
   const jumpToPin = (pinId: string) => {
@@ -1648,6 +1649,17 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
       ? [...items, { key: "__live__", live: true as const }]
       : items
   ), [items, ws.chat.isStreaming, ws.chat.streaming, ws.chat.lastError]);
+
+  // Virtuoso's followOutput reacts to appended rows, while token streaming
+  // mostly grows the existing __live__ row. Keep a user who is already at the
+  // bottom attached to every live layout update. We intentionally do not turn
+  // `pinned` off from atBottomStateChange(false): content growth itself can
+  // produce that transition. Explicit upward input below is the detach signal.
+  useLayoutEffect(() => {
+    if (!pinned) return;
+    const frame = window.requestAnimationFrame(() => virtRef.current?.autoscrollToBottom());
+    return () => window.cancelAnimationFrame(frame);
+  }, [pinned, displayItems.length, ws.chat.isStreaming, ws.chat.streaming, ws.chat.toolExecs]);
   const userIndexes = useMemo(() => {
     let userCounter = 0;
     // Extension follow-ups are implementation details, not user-editable turns.
@@ -1683,7 +1695,37 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   );
 
   return (
-    <div ref={rootRef} style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}>
+    <div
+      ref={rootRef}
+      style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}
+      onWheelCapture={(event) => {
+        if (event.deltaY < 0) setPinned(false);
+      }}
+      onTouchStartCapture={(event) => {
+        touchYRef.current = event.touches[0]?.clientY ?? null;
+      }}
+      onTouchMoveCapture={(event) => {
+        const next = event.touches[0]?.clientY;
+        if (next != null && touchYRef.current != null && next > touchYRef.current + 2) {
+          setPinned(false);
+        }
+        touchYRef.current = next ?? null;
+      }}
+      onKeyDownCapture={(event) => {
+        if (["ArrowUp", "PageUp", "Home"].includes(event.key)) setPinned(false);
+        if (event.key === "End") setPinned(true);
+      }}
+      onPointerDownCapture={(event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        const scroller = target.closest<HTMLElement>(".msg-scroll");
+        if (!scroller) return;
+        const bounds = scroller.getBoundingClientRect();
+        // Dragging the scrollbar is another explicit request to leave follow
+        // mode. atBottomStateChange reattaches if it is dragged back to bottom.
+        if (event.clientX >= bounds.right - 14) setPinned(false);
+      }}
+    >
       {searchOpen && (
         <div className="chat-search">
           <input
@@ -1729,7 +1771,9 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
           computeItemKey={(_index, it) => it.key}
           initialTopMostItemIndex={Math.max(0, displayItems.length - 1)}
           followOutput={pinned ? "auto" : false}
-          atBottomStateChange={setPinned}
+          atBottomStateChange={(atBottom) => {
+            if (atBottom) setPinned(true);
+          }}
           increaseViewportBy={{ top: 500, bottom: 700 }}
           itemContent={(index, it) => {
             if ("live" in it) {
@@ -1744,8 +1788,8 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
                       transcriptMode={transcriptMode}
                       /* пока идёт ход, модель представляет «рабочий» аватар в индикаторе ниже */
                       showModelHeader={false}
-                      liveTurn
                       fallbackModel={ws.agentState?.model}
+                      expansionScope={`live-${ws.chat.streamStartedAt ?? "pending"}`}
                     />
                   )}
                   {/* Персистентный индикатор работы: держим его всё время стрима,
@@ -1805,7 +1849,6 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
                 viaExtension={it.viaExtension}
                 transcriptMode={transcriptMode}
                 showModelHeader={!summary && modelHeaderFlags[index] && !runPresentation.liveTurnIndexes.has(index)}
-                liveTurn={runPresentation.liveTurnIndexes.has(index)}
                 render={mode}
               />
               {filesRun && <RunFilesCard run={filesRun} cwd={cwd} />}

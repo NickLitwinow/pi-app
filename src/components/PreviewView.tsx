@@ -62,7 +62,7 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
   const { runPi, running: installing, log: installLog, logRef: installLogRef } = useRunPi(() => reloadInstalled());
   const hasBrowserExt = BROWSER_EXTENSIONS.some((e) => installed.has(e.pkg));
 
-  // Конфигурации dev-сервера из .claude/launch.json проекта. Switching the
+  // Explicit configurations or natively inferred package/static dev servers. Switching the
   // visible workspace detaches this pane but does not kill another session's
   // leased QA server; each workspace is managed independently by the backend.
   useEffect(() => {
@@ -146,14 +146,21 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
       setReady(false);
       setUrl(handle.url);
       setAddress(handle.url);
-      // перезагружаем iframe по фактической готовности порта, а не по таймеру:
-      // dev-серверы поднимаются от сотен мс до десятков секунд
+      // Poll shared native status rather than the initially guessed port:
+      // generic scripts can announce their actual URL only after startup.
       void (async () => {
         for (let i = 0; i < 60; i++) {
           if (serverRef.current !== handle.serverId) return; // сервер сменили/остановили
-          const code = await be.invoke<string>("probe_url", { url: handle.url }).catch(() => null);
-          if (code) {
+          const status = await be.invoke<PreviewStatus | null>("preview_status", { cwd, serverId: handle.serverId }).catch(() => null);
+          if (!status?.running) return;
+          if (status.url && status.url !== handle.url) {
+            applyServer({ serverId: status.serverId, url: status.url, port: status.port });
+            setUrl(status.url);
+            setAddress(status.url);
+          }
+          if (status.ready) {
             setReady(true);
+            if (status.logs?.length) setLogs(status.logs);
             setIframeKey((k) => k + 1);
             return;
           }
@@ -244,7 +251,7 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
 
       <div className="pv-toolbar">
         {configs.length > 0 && (
-          <select value={selected} onChange={(e) => setSelected(e.target.value)} disabled={Boolean(server)} title="Конфигурация из .claude/launch.json">
+          <select value={selected} onChange={(e) => setSelected(e.target.value)} disabled={Boolean(server)} title="Явная или автоматически найденная dev-конфигурация">
             {configs.map((c) => (
               <option key={c.name} value={c.name}>
                 {c.name} :{c.port}
@@ -329,8 +336,8 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
             <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text)" }}>Live-превью интерфейса</div>
             <div>
               {configs.length > 0
-                ? "Нажмите «Запустить» — dev-сервер поднимется из .claude/launch.json."
-                : "Укажите адрес dev-сервера выше или создайте .claude/launch.json в проекте."}
+                ? "Нажмите «Запустить» — dev-сервер поднимется из конфигурации проекта."
+                : "Укажите адрес dev-сервера выше, добавьте package.json dev-скрипт или создайте .claude/launch.json."}
             </div>
           </div>
         )}

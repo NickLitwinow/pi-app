@@ -127,15 +127,21 @@ the updater now refuses to start when it finds any, and lists the files instead.
 
 Pi is a Tauri 2 application with a React 19 frontend. The Rust backend runs `pi --mode rpc` (JSONL over stdio) for each active session and streams events to the WebView.
 
-For frontend work, `.claude/launch.json` is the launch contract shared by the
-Preview pane and the harness. The model-facing `live_preview` tool is bridged
-through the supervisor to the native preview manager; it never starts a second
-untracked dev server. `start` waits up to 60 seconds for a real HTTP response,
-`status` returns recent process logs, and `stop` is scoped to the current
+For frontend work, the Preview pane and harness first read an explicit
+`.claude/launch.json`, then fall back to project-native discovery of
+`package.json` `dev`/`start`/`serve`/`preview` scripts or a static `index.html`.
+The model-facing `live_preview` tool is bridged through the supervisor to the
+native preview manager; it never starts a second untracked dev server. `start`
+waits for a real HTTP response and follows the actual local URL announced in
+server logs, `status` returns recent output, and `stop` is scoped to the current
 workspace. Agent-owned previews receive a bounded eight-hour lease so a long
 reasoning/build turn is not mistaken for an abandoned UI pane. Visual workflow
-steps remain incomplete until a browser tool has
-both navigated to the returned URL and inspected the rendered page.
+steps remain incomplete until a browser tool has both navigated to the returned
+URL and inspected the rendered page.
+
+The opt-in `npm run test:preview-model` gate runs the real desktop RPC bridge
+against the configured ThinkingCap model, requires it to call both
+`live_preview` and `agent_browser`, and verifies evidence from the rendered DOM.
 
 ```
 ┌─────────────────────────────────────────────┐

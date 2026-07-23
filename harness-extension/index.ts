@@ -531,10 +531,10 @@ export default function harness(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "live_preview",
 		label: "Live Preview",
-		description: "Control pi-app's native project preview without starting a duplicate server. List .claude/launch.json configs, start and wait for HTTP readiness, inspect status/recent logs, or stop it. For visual completion, follow a ready start with agent_browser or chrome_* DOM/console/screenshot inspection.",
+		description: "Control pi-app's native project preview without starting a duplicate server. It auto-detects common package.json dev/start/serve/preview scripts and static index.html when no explicit .claude/launch.json exists. Start and wait for HTTP readiness, inspect status/recent logs, or stop it. For visual completion, follow a ready start with agent_browser or chrome_* DOM/console/screenshot inspection.",
 		promptSnippet: "Start, observe and stop the desktop app's native live preview for visual development and QA.",
 		promptGuidelines: [
-			"Use action=configs before start when the launch configuration name is unknown.",
+			"Use action=configs before start when the launch configuration name is unknown. Auto-detected configurations are ready to start and do not need to be copied into .claude/launch.json.",
 			"After action=start reports ready=true, use agent_browser or chrome_navigate plus chrome_snapshot/chrome_inspect/chrome_screenshot against the returned URL.",
 			"Use status for readiness and recent dev-server logs; do not start a shell dev server in parallel.",
 			"Stop the preview when it is no longer needed, unless the user is actively viewing it.",
@@ -580,7 +580,7 @@ export default function harness(pi: ExtensionAPI) {
 					const configurations = Array.isArray(data) ? data : [];
 					const guidance = configurations.length > 0
 						? "Start one of these exact configuration names."
-						: "No launch configuration exists. Add .claude/launch.json with version 0.0.1 and a configurations entry containing name, runtimeExecutable, runtimeArgs, and port; then call configs again. Keep the command project-scoped and review it like executable code.";
+						: "No supported dev script or static index.html was detected. Add a project-scoped dev/start/serve/preview script to package.json, or add .claude/launch.json with version 0.0.1 and a configurations entry containing name, runtimeExecutable, runtimeArgs, and port; then call configs again. Review either command like executable code.";
 					return { content: [{ type: "text" as const, text: `${JSON.stringify({ configurations }, null, 2)}\n\n${guidance}` }], details: { action, data: configurations } };
 				}
 				if (action === "stop") {

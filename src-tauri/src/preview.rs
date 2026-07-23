@@ -158,9 +158,7 @@ fn launch_json_path(cwd: &str) -> PathBuf {
     Path::new(cwd).join(".claude").join("launch.json")
 }
 
-/// Read dev-server configurations from a project's .claude/launch.json.
-#[tauri::command]
-pub fn preview_configs(cwd: String) -> Vec<LaunchConfig> {
+fn configured_preview_configs(cwd: &str) -> Vec<LaunchConfig> {
     let Ok(text) = std::fs::read_to_string(launch_json_path(&cwd)) else {
         return Vec::new();
     };
@@ -177,11 +175,150 @@ pub fn preview_configs(cwd: String) -> Vec<LaunchConfig> {
         .unwrap_or_default()
 }
 
+fn script_port(script: &str, fallback: u16) -> u16 {
+    let tokens: Vec<&str> = script.split_whitespace().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        let cleaned = token
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']'));
+        let inline = ["--port=", "-p=", "PORT="]
+            .iter()
+            .find_map(|prefix| cleaned.strip_prefix(prefix));
+        if let Some(value) = inline.and_then(|value| value.parse::<u16>().ok()) {
+            if value > 0 {
+                return value;
+            }
+        }
+        if matches!(cleaned, "--port" | "-p" | "http.server") {
+            if let Some(value) = tokens
+                .get(index + 1)
+                .map(|value| {
+                    value
+                        .trim_matches(|c: char| !c.is_ascii_digit())
+                        .parse::<u16>()
+                        .ok()
+                })
+                .flatten()
+            {
+                if value > 0 {
+                    return value;
+                }
+            }
+        }
+    }
+    fallback
+}
+
+fn inferred_default_port(script: &str, package: &Value) -> u16 {
+    let lower = script.to_ascii_lowercase();
+    let dependency_text = ["dependencies", "devDependencies"]
+        .iter()
+        .filter_map(|key| package.get(key))
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let fallback = if lower.contains("astro") || dependency_text.contains("\"astro\"") {
+        4321
+    } else if lower.contains("ng serve") || dependency_text.contains("\"@angular/core\"") {
+        4200
+    } else if lower.contains("vite")
+        || dependency_text.contains("\"vite\"")
+        || dependency_text.contains("\"@sveltejs/kit\"")
+    {
+        5173
+    } else {
+        3000
+    };
+    script_port(script, fallback)
+}
+
+fn package_runner(cwd: &Path, package: &Value) -> String {
+    let declared = package
+        .get("packageManager")
+        .and_then(Value::as_str)
+        .and_then(|value| value.split('@').next())
+        .filter(|value| matches!(*value, "npm" | "pnpm" | "yarn" | "bun"));
+    if let Some(value) = declared {
+        return value.to_string();
+    }
+    if cwd.join("pnpm-lock.yaml").is_file() {
+        "pnpm".into()
+    } else if cwd.join("yarn.lock").is_file() {
+        "yarn".into()
+    } else if cwd.join("bun.lock").is_file() || cwd.join("bun.lockb").is_file() {
+        "bun".into()
+    } else {
+        "npm".into()
+    }
+}
+
+fn inferred_preview_configs(cwd: &str) -> Vec<LaunchConfig> {
+    let root = Path::new(cwd);
+    let package_path = root.join("package.json");
+    if let Ok(metadata) = std::fs::metadata(&package_path) {
+        if metadata.len() <= 1024 * 1024 {
+            if let Ok(text) = std::fs::read_to_string(&package_path) {
+                if let Ok(package) = serde_json::from_str::<Value>(&text) {
+                    let runner = package_runner(root, &package);
+                    if let Some(scripts) = package.get("scripts").and_then(Value::as_object) {
+                        let mut inferred = Vec::new();
+                        for name in ["dev", "start", "serve", "preview"] {
+                            let Some(script) = scripts.get(name).and_then(Value::as_str) else {
+                                continue;
+                            };
+                            if script.trim().is_empty() {
+                                continue;
+                            }
+                            inferred.push(LaunchConfig {
+                                name: format!("Auto · {runner} run {name}"),
+                                runtime_executable: runner.clone(),
+                                runtime_args: vec!["run".into(), name.into()],
+                                port: inferred_default_port(script, &package),
+                            });
+                        }
+                        if !inferred.is_empty() {
+                            return inferred;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if root.join("index.html").is_file() {
+        return vec![LaunchConfig {
+            name: "Auto · static index.html".into(),
+            runtime_executable: "python3".into(),
+            runtime_args: vec![
+                "-m".into(),
+                "http.server".into(),
+                "4173".into(),
+                "--bind".into(),
+                "127.0.0.1".into(),
+            ],
+            port: 4173,
+        }];
+    }
+    Vec::new()
+}
+
+/// Read explicit dev-server configurations, falling back to safe,
+/// project-scoped conventions. This makes live preview useful in ordinary
+/// Vite/Next/Astro/etc. repositories without requiring harness-specific files.
+#[tauri::command]
+pub fn preview_configs(cwd: String) -> Vec<LaunchConfig> {
+    let configured = configured_preview_configs(&cwd);
+    if configured.is_empty() {
+        inferred_preview_configs(&cwd)
+    } else {
+        configured
+    }
+}
+
 /// Create or update (matched by name) a dev-server configuration.
 #[tauri::command]
 pub fn preview_save_config(cwd: String, config: LaunchConfig) -> Result<(), String> {
     let path = launch_json_path(&cwd);
-    let mut configs = preview_configs(cwd.clone());
+    let mut configs = configured_preview_configs(&cwd);
     if let Some(existing) = configs.iter_mut().find(|c| c.name == config.name) {
         *existing = config;
     } else {
@@ -447,6 +584,10 @@ pub async fn preview_start_impl<R: Runtime>(
                         record.logs.pop_front();
                     }
                     record.logs.push_back(line.clone());
+                    if let Some((url, port)) = local_url_from_output(&line) {
+                        record.url = url;
+                        record.port = port;
+                    }
                 }
                 let _ = app.emit(
                     "preview-output",
@@ -527,6 +668,51 @@ pub async fn preview_start_impl<R: Runtime>(
     })
 }
 
+fn local_url_from_output(line: &str) -> Option<(String, u16)> {
+    for scheme in ["http://", "https://"] {
+        let mut rest = line;
+        while let Some(offset) = rest.find(scheme) {
+            let candidate = &rest[offset..];
+            let end = candidate
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+                .unwrap_or(candidate.len());
+            let candidate = candidate[..end]
+                .trim_end_matches(|c: char| matches!(c, '/' | ',' | ';' | ')' | ']' | '.'));
+            let authority = candidate
+                .strip_prefix(scheme)
+                .and_then(|value| value.split('/').next())
+                .unwrap_or("");
+            let parsed_authority = if authority.starts_with('[') {
+                authority.find(']').and_then(|closing| {
+                    authority
+                        .get(closing + 1..)
+                        .and_then(|suffix| suffix.strip_prefix(':'))
+                        .map(|port| (&authority[..=closing], port))
+                })
+            } else {
+                authority.rsplit_once(':')
+            };
+            let Some((host, port_text)) = parsed_authority else {
+                rest = &candidate[scheme.len()..];
+                continue;
+            };
+            let local = matches!(
+                host.to_ascii_lowercase().as_str(),
+                "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "[::]"
+            );
+            if local {
+                if let Ok(port) = port_text.parse::<u16>() {
+                    if port > 0 {
+                        return Some((format!("{scheme}localhost:{port}"), port));
+                    }
+                }
+            }
+            rest = &candidate[scheme.len()..];
+        }
+    }
+    None
+}
+
 /// Stop a running dev server started with preview_start.
 #[tauri::command]
 pub fn preview_stop(server_id: String) -> Result<(), String> {
@@ -543,7 +729,10 @@ pub fn preview_stop(server_id: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{idle_expired, idle_expired_with_lease};
+    use super::{
+        idle_expired, idle_expired_with_lease, local_url_from_output, preview_configs, script_port,
+    };
+    use std::fs;
 
     #[test]
     fn preview_idle_timeout_is_disabled_at_zero_and_saturates() {
@@ -561,5 +750,68 @@ mod tests {
             60,
             Some(9_999_999)
         ));
+    }
+
+    #[test]
+    fn preview_infers_package_script_without_harness_config() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("package.json"),
+            r#"{
+              "packageManager": "pnpm@10.0.0",
+              "scripts": {
+                "dev": "vite --host 127.0.0.1 --port 6123",
+                "test": "vitest"
+              },
+              "devDependencies": { "vite": "^6" }
+            }"#,
+        )
+        .unwrap();
+        let configs = preview_configs(temp.path().to_string_lossy().into_owned());
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "Auto · pnpm run dev");
+        assert_eq!(configs[0].runtime_executable, "pnpm");
+        assert_eq!(configs[0].runtime_args, ["run", "dev"]);
+        assert_eq!(configs[0].port, 6123);
+        assert!(!temp.path().join(".claude/launch.json").exists());
+    }
+
+    #[test]
+    fn explicit_preview_config_wins_over_inference() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".claude")).unwrap();
+        fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join(".claude/launch.json"),
+            r#"{"version":"0.0.1","configurations":[{"name":"chosen","runtimeExecutable":"custom","runtimeArgs":["serve"],"port":8088}]}"#,
+        )
+        .unwrap();
+        let configs = preview_configs(temp.path().to_string_lossy().into_owned());
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "chosen");
+        assert_eq!(configs[0].port, 8088);
+    }
+
+    #[test]
+    fn preview_port_and_runtime_url_detection_cover_common_servers() {
+        assert_eq!(script_port("next dev --port=3100", 3000), 3100);
+        assert_eq!(script_port("python3 -m http.server 4567", 3000), 4567);
+        assert_eq!(
+            local_url_from_output("  ➜  Local:   http://0.0.0.0:5173/"),
+            Some(("http://localhost:5173".into(), 5173))
+        );
+        assert_eq!(
+            local_url_from_output("ready on https://[::1]:4443"),
+            Some(("https://localhost:4443".into(), 4443))
+        );
+        assert_eq!(
+            local_url_from_output("Docs https://example.com and Local http://127.0.0.1:6123/"),
+            Some(("http://localhost:6123".into(), 6123))
+        );
+        assert_eq!(local_url_from_output("https://example.com:443"), None);
     }
 }

@@ -305,11 +305,24 @@ test("Live turn shows the process, then folds it into Worked for (Codex flow)", 
   await composer.fill("Покажи процесс");
   await composer.press("Enter");
 
-  // Пока ход идёт (ждём запроса разрешения — середина хода): рассуждения РАСКРЫТЫ
-  // живьём (раньше схлопывались, едва приходил текст), инструмент виден, сводки нет.
+  // Пока токены ещё приходят: thinking по умолчанию свёрнут, но его можно
+  // независимо раскрыть и снова закрыть; выбор переживает следующий delta.
+  const thinkingToggle = page.locator(".thinking .t-head").first();
+  await expect(thinkingToggle).toBeVisible();
+  await expect(thinkingToggle).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator(".thinking .t-body")).toHaveCount(0);
+  await thinkingToggle.click();
+  await expect(thinkingToggle).toHaveAttribute("aria-expanded", "true");
+  await expect(page.locator(".thinking .t-body").first()).toBeVisible();
+  await page.waitForTimeout(250);
+  await expect(thinkingToggle).toHaveAttribute("aria-expanded", "true");
+  await expect(page.locator(".thinking .t-body").first()).toBeVisible();
+  await thinkingToggle.click();
+  await expect(thinkingToggle).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator(".thinking .t-body")).toHaveCount(0);
+
   const block = page.getByRole("button", { name: "Заблокировать" });
   await expect(block).toBeVisible();
-  await expect(page.locator(".thinking .t-body").first()).toBeVisible();
   await expect(page.locator(".toolcard").first()).toBeVisible();
   await expect(page.getByRole("button", { name: /Worked for/ })).toHaveCount(0);
   // во время хода личность модели несёт только индикатор — статичной шапки нет
@@ -327,6 +340,41 @@ test("Live turn shows the process, then folds it into Worked for (Codex flow)", 
   await worked.click();
   await expect(page.locator(".run-summary .thinking")).toHaveCount(1);
   await expectNoHorizontalOverflow(page);
+});
+
+test("Streaming stays pinned at bottom until the user deliberately scrolls up", async ({ page }) => {
+  await boot(page);
+  await page.locator(".sess-row", { hasText: "Старый рефакторинг" }).click();
+  const scroller = page.locator(".msg-scroll");
+  await scroller.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+
+  const composer = page.locator(".composer textarea");
+  await composer.fill("Покажи процесс");
+  await composer.press("Enter");
+  await expect(page.locator(".processing")).toBeVisible();
+
+  // Existing live row grows on every token; follow mode must keep the viewport
+  // magnetized rather than only reacting when a new array item is appended.
+  await expect.poll(() => scroller.evaluate((element) =>
+    Math.round(element.scrollHeight - element.clientHeight - element.scrollTop)
+  )).toBeLessThanOrEqual(2);
+
+  await scroller.hover();
+  await page.mouse.wheel(0, -700);
+  await page.waitForTimeout(80);
+  const detachedTop = await scroller.evaluate((element) => element.scrollTop);
+  await page.waitForTimeout(500);
+  const detached = await scroller.evaluate((element) => ({
+    top: element.scrollTop,
+    gap: element.scrollHeight - element.clientHeight - element.scrollTop,
+  }));
+  expect(Math.abs(detached.top - detachedTop)).toBeLessThan(8);
+  expect(detached.gap).toBeGreaterThan(40);
+
+  // Restore/finish the mocked run so the test does not leave a pending dialog.
+  await page.getByRole("button", { name: "Заблокировать" }).click();
 });
 
 test("Turn timing notice uses the compact status card", async ({ page }) => {

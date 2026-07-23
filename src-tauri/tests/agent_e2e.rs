@@ -37,21 +37,27 @@ async fn real_pi_agent_roundtrip() {
         .local_addr()
         .unwrap()
         .port();
-    fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+    let preview_marker = "PI APP NATIVE PREVIEW E2E";
     fs::write(
-        tmp.path().join(".claude/launch.json"),
+        tmp.path().join("package.json"),
         serde_json::to_vec(&serde_json::json!({
-            "version": "0.0.1",
-            "configurations": [{
-                "name": "bridge-e2e",
-                "runtimeExecutable": "/usr/bin/python3",
-                "runtimeArgs": ["-m", "http.server", port.to_string(), "--bind", "127.0.0.1"],
-                "port": port
-            }]
+            "private": true,
+            "scripts": {
+                "dev": format!("/usr/bin/python3 -m http.server {port} --bind 127.0.0.1")
+            }
         }))
         .unwrap(),
     )
     .unwrap();
+    fs::write(
+        tmp.path().join("index.html"),
+        format!("<!doctype html><title>Preview E2E</title><main><h1>{preview_marker}</h1></main>"),
+    )
+    .unwrap();
+    assert!(
+        !tmp.path().join(".claude/launch.json").exists(),
+        "fixture intentionally proves zero-config preview discovery"
+    );
     let bridge_extension = tmp.path().join("preview-bridge-probe.mjs");
     fs::write(
         &bridge_extension,
@@ -63,14 +69,15 @@ export default function (pi) {
   pi.registerCommand("native-preview-probe", {
     description: "exercise pi-app native preview bridge",
     handler: async (_args, ctx) => {
-      const start = await ctx.ui.input(PREFIX + JSON.stringify({ action: "start", name: "bridge-e2e", waitMs: 15000 }), "");
+      const configs = await ctx.ui.input(PREFIX + JSON.stringify({ action: "configs" }), "");
+      const start = await ctx.ui.input(PREFIX + JSON.stringify({ action: "start", waitMs: 15000 }), "");
       const startReply = JSON.parse(start || "{}");
       const serverId = startReply?.data?.serverId;
-      const repeated = await ctx.ui.input(PREFIX + JSON.stringify({ action: "start", name: "bridge-e2e", waitMs: 15000 }), "");
+      const repeated = await ctx.ui.input(PREFIX + JSON.stringify({ action: "start", waitMs: 15000 }), "");
       const stop = serverId
         ? await ctx.ui.input(PREFIX + JSON.stringify({ action: "stop", serverId }), "")
         : undefined;
-      writeFileSync(join(ctx.cwd, "preview-bridge-result.json"), JSON.stringify({ start: startReply, repeated: JSON.parse(repeated || "{}"), stop: JSON.parse(stop || "{}") }));
+      writeFileSync(join(ctx.cwd, "preview-bridge-result.json"), JSON.stringify({ configs: JSON.parse(configs || "{}"), start: startReply, repeated: JSON.parse(repeated || "{}"), stop: JSON.parse(stop || "{}") }));
     },
   });
 }
@@ -79,19 +86,42 @@ export default function (pi) {
     .unwrap();
 
     // --- spawn the real pi process through the production command ---
+    let mut extra_args = vec![
+        "--session-dir".into(),
+        session_dir.to_string_lossy().into_owned(),
+        "-ne".into(),
+        "-ns".into(),
+        "--thinking".into(),
+        "minimal".into(),
+        "--extension".into(),
+        bridge_extension.to_string_lossy().into_owned(),
+    ];
+    if run_llm_e2e() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repository root");
+        let harness = repo_root.join("harness-extension");
+        let browser = dirs::home_dir()
+            .expect("home directory")
+            .join(".pi/agent/npm/node_modules/pi-agent-browser-native/dist/extensions/agent-browser/index.js");
+        assert!(harness.is_dir(), "harness extension exists: {harness:?}");
+        assert!(
+            browser.is_file(),
+            "native browser extension exists: {browser:?}"
+        );
+        extra_args.extend([
+            "--extension".into(),
+            harness.to_string_lossy().into_owned(),
+            "--extension".into(),
+            browser.to_string_lossy().into_owned(),
+            "--model".into(),
+            "ollama/ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision".into(),
+        ]);
+    }
     let opts = SpawnOpts {
         cwd: cwd.clone(),
         session_path: None,
-        extra_args: vec![
-            "--session-dir".into(),
-            session_dir.to_string_lossy().into_owned(),
-            "-ne".into(),
-            "-ns".into(),
-            "--thinking".into(),
-            "minimal".into(),
-            "--extension".into(),
-            bridge_extension.to_string_lossy().into_owned(),
-        ],
+        extra_args,
     };
     let sup = handle.state::<Supervisor<tauri::test::MockRuntime>>();
     let agent_id = supervisor::spawn_agent_impl(handle.clone(), sup.inner(), opts)
@@ -149,6 +179,13 @@ export default function (pi) {
     .unwrap();
     assert_eq!(
         preview_result
+            .pointer("/configs/data/0/name")
+            .and_then(|value| value.as_str()),
+        Some("Auto · npm run dev"),
+        "native manager inferred the package dev script: {preview_result}"
+    );
+    assert_eq!(
+        preview_result
             .pointer("/start/success")
             .and_then(|value| value.as_bool()),
         Some(true)
@@ -177,7 +214,9 @@ export default function (pi) {
         supervisor::agent_send_impl(
             sup.inner(),
             agent_id.clone(),
-            r#"{"type":"prompt","id":"t2","message":"Reply with exactly: PI-APP-E2E-OK"}"#.into(),
+            format!(
+                r#"{{"type":"prompt","id":"t2","message":"Perform a real visual verification. You MUST call live_preview to start this project (it intentionally has no .claude/launch.json), then call agent_browser to open the returned URL and inspect a compact DOM snapshot. Confirm the page contains the exact heading '{preview_marker}'. Do not use bash and do not answer from source inspection. After both tool calls succeed, reply with exactly: LIVE-PREVIEW-E2E-OK"}}"#
+            ),
         )
         .await
         .expect("agent_send prompt");
@@ -185,8 +224,9 @@ export default function (pi) {
         // streaming flag flips on at agent_start and off at agent_end
         let mut saw_streaming = false;
         let mut turn_done = false;
-        for _ in 0..360 {
-            // up to 3 min: local 35B model can be slow to first token
+        for _ in 0..1200 {
+            // up to 10 min: the local model may spend several minutes in
+            // reasoning and Chromium startup before its second tool turn.
             let agents = supervisor::list_agents_impl(sup.inner()).await.unwrap();
             let a = agents
                 .iter()
@@ -214,10 +254,22 @@ export default function (pi) {
         };
         let content = std::fs::read_to_string(&full_path).expect("session file readable");
         assert!(
-            content.contains("PI-APP-E2E-OK"),
+            content.contains("LIVE-PREVIEW-E2E-OK"),
             "assistant reply persisted in session file {full_path:?}"
         );
-        eprintln!("LLM round-trip OK");
+        assert!(
+            content.contains(r#""name":"live_preview""#),
+            "ThinkingCap called the native live_preview tool: {full_path:?}"
+        );
+        assert!(
+            content.contains(r#""name":"agent_browser""#),
+            "ThinkingCap called the native browser tool: {full_path:?}"
+        );
+        assert!(
+            content.contains(preview_marker),
+            "browser evidence contains the rendered heading: {full_path:?}"
+        );
+        eprintln!("ThinkingCap live preview + browser round-trip OK");
     } else {
         eprintln!("SKIP LLM round-trip: set PI_APP_RUN_LLM_E2E=1 to exercise the configured model");
     }
@@ -232,4 +284,5 @@ export default function (pi) {
         agents.iter().all(|a| a.id != agent_id),
         "agent removed after kill"
     );
+    pi_app_lib::preview::stop_all_servers();
 }
