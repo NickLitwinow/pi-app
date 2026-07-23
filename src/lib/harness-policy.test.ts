@@ -3,6 +3,7 @@ import {
   buildIndependentFalsifierPrompt,
   buildIndependentEvaluatorPrompt,
   classifyTask,
+  classifyPreviewBrowserEvidence,
   executionFailed,
   independentEvaluationAccepted,
   independentEvaluationRepairPrompt,
@@ -64,6 +65,47 @@ describe("background agent result parsing", () => {
   it("does not absorb presentation fields or accept a missing identifier", () => {
     expect(parseBackgroundAgentId(String.raw`Agent ID: worker_2.branch\nType: Agent`)).toBe("worker_2.branch");
     expect(parseBackgroundAgentId("Agent ID: ")).toBeUndefined();
+  });
+});
+
+describe("live preview browser evidence", () => {
+  const url = "http://localhost:1420";
+
+  it("separates navigation from rendered inspection", () => {
+    expect(classifyPreviewBrowserEvidence("chrome_navigate", { url }, url)).toMatchObject({
+      opened: true,
+      inspected: false,
+    });
+    expect(classifyPreviewBrowserEvidence("chrome_snapshot", {}, url)).toMatchObject({
+      opened: false,
+      inspected: true,
+    });
+    expect(classifyPreviewBrowserEvidence("agent_browser", { qa: { url, screenshotPath: "qa.png" } }, url)).toMatchObject({
+      opened: true,
+      inspected: true,
+    });
+    expect(classifyPreviewBrowserEvidence("agent_browser", { args: ["open", `${url}/`] }, url).opened).toBe(true);
+    expect(classifyPreviewBrowserEvidence("agent_browser", { args: ["snapshot", "-i"] }, url).inspected).toBe(true);
+    expect(classifyPreviewBrowserEvidence("agent_browser", {
+      job: { steps: [{ action: "open", url }, { action: "screenshot", path: "qa.png" }] },
+    }, url)).toMatchObject({ opened: true, inspected: true });
+  });
+
+  it("does not accept source tools, another URL, or malformed inputs", () => {
+    expect(classifyPreviewBrowserEvidence("read", { path: "src/App.tsx", note: url }, url)).toMatchObject({
+      opened: false,
+      inspected: false,
+    });
+    expect(classifyPreviewBrowserEvidence("chrome_navigate", { url: "http://localhost:9999" }, url).opened).toBe(false);
+    expect(classifyPreviewBrowserEvidence("agent_browser", { note: url, args: ["open", "http://localhost:9999"] }, url).opened).toBe(false);
+    expect(classifyPreviewBrowserEvidence("agent_browser", { args: ["eval", "open", url] }, url).opened).toBe(false);
+    expect(classifyPreviewBrowserEvidence("agent_browser", { args: ["read", url] }, url).inspected).toBe(false);
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    expect(classifyPreviewBrowserEvidence("agent_browser", circular, url)).toMatchObject({
+      opened: false,
+      inspected: false,
+    });
   });
 });
 
@@ -171,7 +213,9 @@ describe("persisted workflow contract", () => {
     const state = createWorkflowState("Реализуй новую UI панель и тесты", 100);
     expect(state.version).toBe(3);
     expect(state.profile).toBe("feature");
-    expect(state.steps.map((step) => step.id)).toEqual(["plan", "build", "verify", "evaluate", "review"]);
+    expect(state.intent.needsPreview).toBe(true);
+    expect(state.steps.map((step) => step.id)).toEqual(["plan", "build", "preview", "verify", "evaluate", "review"]);
+    expect(state.steps.find((step) => step.id === "verify")?.deps).toEqual(["preview"]);
     expect(state.steps.every((step) => Boolean(step.acceptance))).toBe(true);
     expect(state.steps.every((step) => Boolean(step.owner) && step.maxAttempts > 0)).toBe(true);
     expect(state.status).toBe("active");
@@ -180,6 +224,18 @@ describe("persisted workflow contract", () => {
     const planned = updateWorkflowStep(state, "plan", "passed", "approved", 200);
     expect(readySteps(planned).map((step) => step.id)).toEqual(["build"]);
     expect(planned.events.at(-1)?.type).toBe("passed");
+  });
+
+  it("requires rendered preview evidence only for visual mutations", () => {
+    expect(inferTaskIntent("Исправь адаптивную панель и иконки").needsPreview).toBe(true);
+    expect(inferTaskIntent("Реализуй миграцию JSON конфига").needsPreview).toBe(false);
+    expect(inferTaskIntent("Проанализируй UI без изменений").needsPreview).toBe(false);
+    expect(createWorkflowState("Исправь адаптивную панель").steps.find((step) => step.id === "preview")).toMatchObject({
+      kind: "preview",
+      owner: "preview-runner",
+      deps: ["build"],
+      required: true,
+    });
   });
 
   it("persists explicit human, blocked, and completed workflow lifecycle states", () => {

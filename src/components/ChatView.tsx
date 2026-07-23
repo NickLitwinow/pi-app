@@ -1845,6 +1845,11 @@ export default function ChatView() {
       workspace.chat.backgroundTasks.map((task) => ({ cwd: taskCwd, task }))),
     [chats],
   );
+  const nativePreview = ws.chat.previewRuntime;
+  useEffect(() => {
+    if (!nativePreview || !["starting", "running", "ready"].includes(nativePreview.status)) return;
+    set({ previewOpen: true });
+  }, [nativePreview?.updatedAt, nativePreview?.status, set]);
 
   // drag-resize границы сплита чат/превью (физические координаты → делим на uiScale)
   const onSplitResize = (e: React.MouseEvent) => {
@@ -1924,7 +1929,7 @@ export default function ChatView() {
           onClick={() => set({ previewOpen: !previewOpen })}
           title="Live-превью рядом с чатом (сплит-скрин)"
         >
-          <PreviewIcon size={13} /> Превью
+          <PreviewIcon size={13} /> Превью{nativePreview?.ready ? " · ready" : nativePreview?.status === "starting" || nativePreview?.status === "running" ? " · starting" : nativePreview?.status === "failed" ? " · failed" : ""}
         </button>
         <button className="chip" onClick={() => void newSession(cwd)} title="Новая сессия">
           <PlusIcon size={13} /> Новая сессия

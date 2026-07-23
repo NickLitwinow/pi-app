@@ -145,12 +145,12 @@ export type WorkflowStepStatus = "pending" | "running" | "waiting" | "passed" | 
 export interface WorkflowStepView {
   id: string;
   label: string;
-  kind: "plan" | "research" | "build" | "gate" | "evaluate" | "review";
+  kind: "plan" | "research" | "build" | "preview" | "gate" | "evaluate" | "review";
   deps: string[];
   status: WorkflowStepStatus;
   acceptance: string;
   required: boolean;
-  owner: "orchestrator" | "researcher" | "executor" | "gate-runner" | "evaluator" | "human";
+  owner: "orchestrator" | "researcher" | "executor" | "preview-runner" | "gate-runner" | "evaluator" | "human";
   maxAttempts: number;
   command?: string;
   attempts: number;
@@ -188,6 +188,7 @@ export interface WorkflowViewState {
     profile: WorkflowViewState["profile"];
     risk: "low" | "medium" | "high";
     needsResearch: boolean;
+    needsPreview: boolean;
     allowsMutation: boolean;
     allowsDeletion: boolean;
     requiresPlan: boolean;
@@ -198,6 +199,28 @@ export interface WorkflowViewState {
   };
   steps: WorkflowStepView[];
   events: WorkflowEventView[];
+}
+
+export interface PreviewRuntimeView {
+  status: "idle" | "starting" | "running" | "ready" | "stopped" | "failed";
+  serverId?: string;
+  configName?: string;
+  cwd?: string;
+  url?: string;
+  port?: number;
+  running?: boolean;
+  ready?: boolean;
+  httpStatus?: string;
+  startedAtMs?: number;
+  lastActivityMs?: number;
+  leaseUntilMs?: number;
+  logs?: string[];
+  browserOpened?: boolean;
+  browserInspected?: boolean;
+  evidence?: string[];
+  error?: string;
+  updatedAt: number;
+  source: "agent" | "user";
 }
 
 export interface BackgroundTaskView {
@@ -302,6 +325,8 @@ export interface ChatState {
   statusEntries: Record<string, string>;
   widgets: Record<string, string>;
   workflow: WorkflowViewState | null;
+  /** Native dev-server state emitted by the harness for this session. */
+  previewRuntime: PreviewRuntimeView | null;
   /** Latest persisted snapshot emitted by rpiv-todo's model-facing tool. */
   plannedTasks: PlannedTaskView[];
   backgroundTasks: BackgroundTaskView[];
@@ -334,6 +359,7 @@ export function emptyChatState(): ChatState {
     statusEntries: {},
     widgets: {},
     workflow: null,
+    previewRuntime: null,
     plannedTasks: [],
     backgroundTasks: [],
     compactions: [],
@@ -586,6 +612,18 @@ export interface PreviewHandle {
   serverId: string;
   url: string;
   port: number;
+}
+
+export interface PreviewStatus extends PreviewHandle {
+  configName: string;
+  cwd: string;
+  running: boolean;
+  ready: boolean;
+  httpStatus?: string;
+  startedAtMs: number;
+  lastActivityMs: number;
+  leaseUntilMs?: number;
+  logs: string[];
 }
 
 export interface SkillInfo {

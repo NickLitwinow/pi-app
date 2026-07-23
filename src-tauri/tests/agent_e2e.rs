@@ -7,6 +7,8 @@
 //! it as readiness made ordinary `cargo test` hang for three minutes.
 
 use pi_app_lib::supervisor::{self, SpawnOpts, Supervisor};
+use std::fs;
+use std::net::TcpListener;
 use std::time::Duration;
 use tauri::Manager;
 
@@ -30,6 +32,51 @@ async fn real_pi_agent_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().to_string_lossy().into_owned();
     let session_dir = tmp.path().join("sessions");
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("reserve preview port")
+        .local_addr()
+        .unwrap()
+        .port();
+    fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+    fs::write(
+        tmp.path().join(".claude/launch.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": "0.0.1",
+            "configurations": [{
+                "name": "bridge-e2e",
+                "runtimeExecutable": "/usr/bin/python3",
+                "runtimeArgs": ["-m", "http.server", port.to_string(), "--bind", "127.0.0.1"],
+                "port": port
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let bridge_extension = tmp.path().join("preview-bridge-probe.mjs");
+    fs::write(
+        &bridge_extension,
+        r#"
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+const PREFIX = "__PI_APP_NATIVE_PREVIEW_V1__:";
+export default function (pi) {
+  pi.registerCommand("native-preview-probe", {
+    description: "exercise pi-app native preview bridge",
+    handler: async (_args, ctx) => {
+      const start = await ctx.ui.input(PREFIX + JSON.stringify({ action: "start", name: "bridge-e2e", waitMs: 15000 }), "");
+      const startReply = JSON.parse(start || "{}");
+      const serverId = startReply?.data?.serverId;
+      const repeated = await ctx.ui.input(PREFIX + JSON.stringify({ action: "start", name: "bridge-e2e", waitMs: 15000 }), "");
+      const stop = serverId
+        ? await ctx.ui.input(PREFIX + JSON.stringify({ action: "stop", serverId }), "")
+        : undefined;
+      writeFileSync(join(ctx.cwd, "preview-bridge-result.json"), JSON.stringify({ start: startReply, repeated: JSON.parse(repeated || "{}"), stop: JSON.parse(stop || "{}") }));
+    },
+  });
+}
+"#,
+    )
+    .unwrap();
 
     // --- spawn the real pi process through the production command ---
     let opts = SpawnOpts {
@@ -42,6 +89,8 @@ async fn real_pi_agent_roundtrip() {
             "-ns".into(),
             "--thinking".into(),
             "minimal".into(),
+            "--extension".into(),
+            bridge_extension.to_string_lossy().into_owned(),
         ],
     };
     let sup = handle.state::<Supervisor<tauri::test::MockRuntime>>();
@@ -77,6 +126,50 @@ async fn real_pi_agent_roundtrip() {
     assert!(
         session_path.contains("sessions"),
         "session stored in our --session-dir: {session_path}"
+    );
+
+    // --- hidden extension input → native preview manager → same command reply ---
+    supervisor::agent_send_impl(
+        sup.inner(),
+        agent_id.clone(),
+        r#"{"type":"prompt","id":"preview","message":"/native-preview-probe"}"#.into(),
+    )
+    .await
+    .expect("agent_send preview command");
+    let preview_result_path = tmp.path().join("preview-bridge-result.json");
+    for _ in 0..80 {
+        if preview_result_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let preview_result: serde_json::Value = serde_json::from_slice(
+        &fs::read(&preview_result_path).expect("preview bridge command completed"),
+    )
+    .unwrap();
+    assert_eq!(
+        preview_result
+            .pointer("/start/success")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        preview_result
+            .pointer("/start/data/ready")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "native manager waited for real HTTP readiness: {preview_result}"
+    );
+    assert_eq!(
+        preview_result
+            .pointer("/stop/success")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        preview_result.pointer("/start/data/serverId"),
+        preview_result.pointer("/repeated/data/serverId"),
+        "repeated start reuses the native process instead of duplicating a dev server"
     );
 
     // --- full prompt round-trip through the configured model (explicit opt-in) ---

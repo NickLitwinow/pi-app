@@ -1631,6 +1631,11 @@ html[data-effects="on"] .ss-card { backdrop-filter: blur(24px); -webkit-backdrop
 .pv-header { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
 .pv-header .pv-title { font-weight: 600; }
 .pv-header .pv-sub { color: var(--text-dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv-runtime { padding: 2px 6px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-dim); font-size: 9px; line-height: 1.2; }
+.pv-runtime.ready { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); color: var(--success); background: color-mix(in srgb, var(--success) 8%, transparent); }
+.pv-runtime.starting { color: var(--warning); }
+.pv-runtime.failed { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
+.pv-runtime.inspected { border-color: color-mix(in srgb, var(--brand) 45%, var(--border)); color: var(--brand); }
 .pv-header .grow { flex: 1; }
 
 /* ввод пользователя показывается как набрано (не markdown) */

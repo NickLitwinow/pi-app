@@ -333,6 +333,39 @@ describe("applyAgentEvent — auxiliary events", () => {
     });
     expect(chat.backgroundTasks).toHaveLength(1);
     expect(chat.backgroundTasks[0].transcript).toHaveLength(60_000);
+
+    chat = applyAgentEvent({ ...chat }, {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "pi-app-preview-state",
+      widgetLines: [JSON.stringify({
+        status: "ready",
+        serverId: "prev-1",
+        url: "http://localhost:1420",
+        port: 1420,
+        running: true,
+        ready: true,
+        browserOpened: true,
+        browserInspected: true,
+        logs: ["ready"],
+        updatedAt: 123,
+        source: "agent",
+      })],
+    });
+    expect(chat.previewRuntime).toMatchObject({
+      status: "ready",
+      serverId: "prev-1",
+      ready: true,
+      browserInspected: true,
+    });
+
+    chat = applyAgentEvent({ ...chat }, {
+      type: "extension_ui_request",
+      method: "setWidget",
+      widgetKey: "pi-app-preview-state",
+      widgetText: JSON.stringify({ status: "unknown", serverId: "spoof" }),
+    });
+    expect(chat.previewRuntime?.serverId).toBe("prev-1");
   });
 
   it("strips leading emoji from toasts and dedupes repeats", () => {

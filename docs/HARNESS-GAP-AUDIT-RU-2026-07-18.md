@@ -138,9 +138,13 @@ unknown targets; primary evaluator, falsifier и внешний model judge эт
 
 Следующие пункты полезны, но не должны маскироваться словом «harness»:
 
-1. Для этого проекта Playwright уже объявлен required gate в tracked manifest.
-   Универсального агента, который сам запускает произвольный preview, читает DOM/
-   console и строит новые screenshot probes для незнакомого UI, пока нет.
+1. **Закрыто 2026-07-23:** `live_preview` нативно управляет тем же sandboxed
+   dev-server, что и split UI, ждёт HTTP readiness, возвращает сохранённые логи
+   и автоматически открывает Preview pane. Для visual/frontend intent harness
+   добавляет обязательный `preview`-шаг между build и deterministic gates; он
+   проходит только после наблюдаемой навигации и DOM/console/screenshot-проверки
+   через `agent_browser` или `chrome_*`. Bridge проверен real-Pi E2E без LLM и
+   отдельным Playwright-сценарием UI lifecycle.
 2. Managed worktrees требуют retention policy, snapshot-before-cleanup и Handoff;
    текущий transactional merge решает безопасность merge, но не lifecycle среды.
 3. Side chat, split view, встроенный terminal/editor и drag-and-drop layout — gaps

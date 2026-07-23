@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:visual": "playwright test",
     "test:visual:update": "playwright test --update-snapshots",
+    "test:preview-runtime": "node bench/live-preview-browser-smoke.mjs",
     "patch:pi-subagents": "node scripts/patch-pi-subagents-worktree.mjs",
     "check:pi-subagents": "node scripts/patch-pi-subagents-worktree.mjs --check",
     "verify:harness:final": "node bench/verify-final.mjs",

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { inferTaskIntent, type TaskIntent, type WorkflowProfile } from "./policy.js";
 
 export type WorkflowStepStatus = "pending" | "running" | "waiting" | "passed" | "failed" | "skipped";
-export type WorkflowStepKind = "plan" | "research" | "build" | "gate" | "evaluate" | "review";
+export type WorkflowStepKind = "plan" | "research" | "build" | "preview" | "gate" | "evaluate" | "review";
 export type WorkflowRunStatus = "active" | "needs-human" | "blocked" | "completed";
 
 export type WorkflowStep = {
@@ -14,7 +14,7 @@ export type WorkflowStep = {
 	status: WorkflowStepStatus;
 	acceptance: string;
 	required: boolean;
-	owner: "orchestrator" | "researcher" | "executor" | "gate-runner" | "evaluator" | "human";
+	owner: "orchestrator" | "researcher" | "executor" | "preview-runner" | "gate-runner" | "evaluator" | "human";
 	/** Total attempts, including the initial attempt. */
 	maxAttempts: number;
 	command?: string;
@@ -84,6 +84,7 @@ const STEP_RUNTIME: Record<WorkflowStepKind, Pick<WorkflowStep, "owner" | "maxAt
 	plan: { owner: "orchestrator", maxAttempts: 2 },
 	research: { owner: "researcher", maxAttempts: 3 },
 	build: { owner: "executor", maxAttempts: 5 },
+	preview: { owner: "preview-runner", maxAttempts: 3 },
 	gate: { owner: "gate-runner", maxAttempts: 5 },
 	evaluate: { owner: "evaluator", maxAttempts: 5 },
 	review: { owner: "human", maxAttempts: 1 },
@@ -153,7 +154,12 @@ function lifecycle(steps: WorkflowStep[]): Pick<WorkflowState, "status" | "block
 /** Upgrade persisted v3 records created before lifecycle metadata was added. */
 export function normalizeWorkflowState(state: WorkflowState): WorkflowState {
 	const steps = state.steps.map((step) => ({ ...STEP_RUNTIME[step.kind], ...step }));
-	return { ...state, steps, ...lifecycle(steps) };
+	return {
+		...state,
+		intent: { ...state.intent, needsPreview: state.intent.needsPreview === true },
+		steps,
+		...lifecycle(steps),
+	};
 }
 
 function eventId(): string {
@@ -164,11 +170,35 @@ export function createWorkflowState(prompt: string, now = Date.now(), profileOve
 	const inferred = inferTaskIntent(prompt);
 	const intent = profileOverride ? { ...inferred, profile: profileOverride } : inferred;
 	const approved = !intent.requiresHumanApproval;
-	const steps = PROFILE_STEPS[intent.profile].map((step) => ({
+	let steps: WorkflowStep[] = PROFILE_STEPS[intent.profile].map((step) => ({
 		...step,
 		status: step.id === "approve" ? "waiting" as const : "pending" as const,
 		attempts: 0,
 	}));
+	if (intent.needsPreview) {
+		const buildIndex = steps.findIndex((step) => step.id === "build");
+		if (buildIndex >= 0) {
+			const preview: WorkflowStep = {
+				id: "preview",
+				label: "Live preview QA",
+				kind: "preview",
+				deps: ["build"],
+				status: "pending",
+				acceptance: "The native dev preview is HTTP-ready and a browser tool has inspected the rendered UI, console/DOM, or screenshot.",
+				required: true,
+				...STEP_RUNTIME.preview,
+				attempts: 0,
+			};
+			steps = [
+				...steps.slice(0, buildIndex + 1),
+				preview,
+				...steps.slice(buildIndex + 1).map((step) => ({
+					...step,
+					deps: step.deps.map((dep) => dep === "build" ? "preview" : dep),
+				})),
+			];
+		}
+	}
 	return {
 		version: 3,
 		runId: `wf-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,

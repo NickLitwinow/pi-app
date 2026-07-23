@@ -2,9 +2,9 @@
 
 /**
  * Current-code readiness gate without spending local-model inference time.
- * It reruns deterministic checks and validates the accepted historical long-run
- * artifacts. Those artifacts are reported as compatible evidence, never as an
- * exact fingerprint rerun of the current additive UI/lifecycle patch.
+ * It reruns deterministic checks and reports any retained historical long-run
+ * artifacts as optional compatible evidence. Cleaned/archived historical files
+ * are evidence gaps, never a reason to reject the current source and runtime.
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
@@ -27,10 +27,15 @@ mkdirSync(resultsDir, { recursive: true });
 
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 const failures = [];
+const evidenceGaps = [];
 const checks = [];
 const record = (id, passed, detail) => {
-	checks.push({ id, passed, detail });
+	checks.push({ id, passed, required: true, detail });
 	if (!passed) failures.push(`${id}: ${detail}`);
+};
+const recordEvidence = (id, passed, detail) => {
+	checks.push({ id, passed, required: false, detail });
+	if (!passed) evidenceGaps.push(`${id}: ${detail}`);
 };
 
 function newestMultiTurnSession(root) {
@@ -70,6 +75,7 @@ if (!evidenceOnly) {
 		["runtime-commands", "runtime-command-smoke.mjs"],
 		["task-controls", "task-controls-smoke.mjs"],
 		["sandbox", "macos-sandbox-smoke.mjs"],
+		["live-preview-browser-runtime", "live-preview-browser-smoke.mjs"],
 		["skill-resource", "skill-resource-smoke.mjs"],
 		["fixture-git", "fixture-git-smoke.mjs"],
 		["schedule", "schedule-smoke.mjs"],
@@ -91,6 +97,7 @@ try {
 	record("compaction-config", settings.compaction?.reserveTokens === 32768 && settings.compaction?.keepRecentTokens === 24000, JSON.stringify(settings.compaction ?? null));
 	record("background-config", Number(subagents.maxConcurrent) >= 2 && subagents.schedulingEnabled === true && subagents.outputTranscript === true, JSON.stringify(subagents));
 	record("ponytail-config", ponytail.defaultMode === "full" && settings.packages?.some((item) => String(item).includes("ponytail")), JSON.stringify(ponytail));
+	record("live-preview-browser", settings.packages?.some((item) => String(item).includes("pi-agent-browser-native")), JSON.stringify(settings.packages ?? []));
 	const productionText = ["package.json", "harness-extension/index.ts", "harness-extension/policy.ts", "harness-extension/workflow.ts"]
 		.map((path) => readFileSync(join(repoRoot, path), "utf8")).join("\n");
 	record("fable-retired", !/fable/i.test(productionText) && !settings.packages?.some((item) => /fable/i.test(String(item))), "no production reference");
@@ -115,8 +122,8 @@ for (const [id, name, expectedScore, expectedMax] of artifacts) {
 		const row = report.results?.find((candidate) => candidate.id === id);
 		const passed = report.model === `ollama/${modelId}` && row?.score === expectedScore && row?.maxScore === expectedMax
 			&& row?.success === true && row?.treatmentSuccess === true && row?.workflowCompleted === true && row?.modelJudge?.verdict === "pass";
-		record(`historical:${id}`, passed, path);
-	} catch (error) { record(`historical:${id}`, false, `${path}: ${String(error)}`); }
+		recordEvidence(`historical:${id}`, passed, path);
+	} catch (error) { recordEvidence(`historical:${id}`, false, `${path}: ${String(error)}`); }
 }
 
 try {
@@ -124,8 +131,8 @@ try {
 	const passed = compact.passed === true && compact.mode === "full-compaction" && compact.sourceUnchanged === true
 		&& compact.tokensBefore === 81489 && compact.estimatedTokensAfter === 41921 && compact.customRecord === true
 		&& Array.isArray(compact.missingSections) && compact.missingSections.length === 0;
-	record("historical:live-compaction", passed, `${compact.tokensBefore} -> ${compact.estimatedTokensAfter}`);
-} catch (error) { record("historical:live-compaction", false, String(error)); }
+	recordEvidence("historical:live-compaction", passed, `${compact.tokensBefore} -> ${compact.estimatedTokensAfter}`);
+} catch (error) { recordEvidence("historical:live-compaction", false, String(error)); }
 
 try {
 	const response = await fetch("http://127.0.0.1:8003/v1/models", { signal: AbortSignal.timeout(10_000) });
@@ -135,17 +142,21 @@ try {
 } catch (error) { record("live-model", false, String(error)); }
 
 const report = {
-	version: 1,
+	version: 2,
 	generatedAt: new Date().toISOString(),
-	status: failures.length === 0 ? "passed-compatible-evidence" : "failed",
-	evidenceMode: "current deterministic checks + historical compatible model evidence",
+	status: failures.length === 0
+		? evidenceGaps.length === 0 ? "passed-compatible-evidence" : "passed-current-checks-with-evidence-gaps"
+		: "failed",
+	evidenceMode: "current deterministic checks + optional historical compatible model evidence",
 	exactFingerprintRerun: false,
 	evidenceOnly,
 	checks,
 	failures,
+	evidenceGaps,
 	limitations: [
 		"Independent human-review packets remain pending until scored by a human.",
 		"Historical model artifacts are not relabeled as an exact rerun after additive lifecycle/UI changes.",
+		"Missing historical artifacts remain visible as non-blocking evidence gaps; only a fresh model run can replace them.",
 		"Ponytail and classifier component effects are not statistically established by one-trial ablations.",
 	],
 };
@@ -156,3 +167,4 @@ if (failures.length) {
 	console.error(`Failures:\n- ${failures.join("\n- ")}`);
 	process.exitCode = 1;
 }
+if (evidenceGaps.length) console.warn(`Historical evidence gaps (non-blocking):\n- ${evidenceGaps.join("\n- ")}`);

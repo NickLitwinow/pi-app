@@ -310,6 +310,10 @@ function updateChat(cwd: string, fn: (ws: WorkspaceChat) => WorkspaceChat) {
   setChat(cwd, fn({ ...getChat(cwd) }));
 }
 
+export function setSessionPreviewRuntime(cwd: string, previewRuntime: WorkspaceChat["chat"]["previewRuntime"]): void {
+  updateChat(cwd, (ws) => ({ ...ws, chat: { ...ws.chat, previewRuntime } }));
+}
+
 // ---------- agent event coalescing ----------
 // pi шлёт десятки message_update в секунду; применяем их пачкой раз в кадр,
 // чтобы React делал одну реконсиляцию вместо N (CPU/память при стриминге).

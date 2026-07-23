@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getBackend } from "../lib/backend";
 import { messageDialog } from "../lib/dialog";
-import type { LaunchConfig, PreviewHandle } from "../lib/types";
-import { openExternalUrl, useStore } from "../state/store";
+import type { LaunchConfig, PreviewHandle, PreviewStatus } from "../lib/types";
+import { openExternalUrl, setSessionPreviewRuntime, useStore } from "../state/store";
 import { useInstalledPackages, useRunPi } from "./Marketplace";
 import { ExternalIcon, MinusIcon, MobileIcon, PreviewIcon, RefreshIcon, StopIcon, TabletIcon } from "./icons";
 
@@ -32,12 +32,14 @@ const BROWSER_EXTENSIONS = [
 /** Live-превью dev-сервера как сплит-панель рядом с чатом (в стиле Claude Preview). */
 export default function PreviewPane({ onClose }: { onClose: () => void }) {
   const cwd = useStore((s) => s.currentCwd);
+  const harnessPreview = useStore((s) => cwd ? s.chats[cwd]?.chat.previewRuntime ?? null : null);
   const [configs, setConfigs] = useState<LaunchConfig[]>([]);
   const [selected, setSelected] = useState<string>("");
   const [url, setUrl] = useState("");
   const [address, setAddress] = useState("");
   const [server, setServer] = useState<PreviewHandle | null>(null);
   const [starting, setStarting] = useState(false);
+  const [ready, setReady] = useState(false);
   const [device, setDevice] = useState<Device>("desktop");
   const [iframeKey, setIframeKey] = useState(0);
   const [logs, setLogs] = useState<string[]>([]);
@@ -60,17 +62,20 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
   const { runPi, running: installing, log: installLog, logRef: installLogRef } = useRunPi(() => reloadInstalled());
   const hasBrowserExt = BROWSER_EXTENSIONS.some((e) => installed.has(e.pkg));
 
-  // конфигурации dev-сервера из .claude/launch.json проекта.
-  // Смена проекта гасит прежний сервер и сбрасывает превью.
+  // Конфигурации dev-сервера из .claude/launch.json проекта. Switching the
+  // visible workspace detaches this pane but does not kill another session's
+  // leased QA server; each workspace is managed independently by the backend.
   useEffect(() => {
     if (!cwd) return;
-    if (serverRef.current) void killServer(serverRef.current);
+    let cancelled = false;
     applyServer(null);
+    setReady(false);
     setUrl("");
     setLogs([]);
     void (async () => {
       const be = await getBackend();
       const cfgs = await be.invoke<LaunchConfig[]>("preview_configs", { cwd }).catch(() => []);
+      if (cancelled) return;
       setConfigs(cfgs);
       if (cfgs[0]) {
         setSelected(cfgs[0].name);
@@ -79,8 +84,18 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
         setSelected("");
         setAddress("");
       }
+      const active = await be.invoke<PreviewStatus | null>("preview_status", { cwd, serverId: null }).catch(() => null);
+      if (cancelled) return;
+      if (active?.running) {
+        applyServer({ serverId: active.serverId, url: active.url, port: active.port });
+        setUrl(active.url);
+        setAddress(active.url);
+        setReady(active.ready);
+        setLogs(active.logs ?? []);
+      }
     })();
-  }, [cwd, killServer, applyServer]);
+    return () => { cancelled = true; };
+  }, [cwd, applyServer]);
 
   // поток логов dev-сервера
   useEffect(() => {
@@ -88,28 +103,35 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
     void (async () => {
       const be = await getBackend();
       un = await be.listen("preview-output", (p) => {
-        if (server && p.serverId !== server.serverId) return;
+        const activeId = serverRef.current;
+        if (!activeId || p.serverId !== activeId) return;
         if (p.done) {
           setLogs((l) => [...l, `— сервер остановлен (код ${String(p.code ?? "?")})`]);
-          if (serverRef.current === p.serverId) applyServer(null);
+          if (serverRef.current === p.serverId) {
+            applyServer(null);
+            setReady(false);
+            if (cwd) {
+              const prior = useStore.getState().chats[cwd]?.chat.previewRuntime;
+              if (prior && prior.serverId === p.serverId) {
+                setSessionPreviewRuntime(cwd, { ...prior, source: prior.source ?? "agent", status: "stopped", running: false, ready: false, updatedAt: Date.now() });
+              }
+            }
+          }
         } else if (p.line) {
           setLogs((l) => [...l.slice(-300), String(p.line)]);
         }
       });
     })();
     return () => un?.();
-  }, [server, applyServer]);
+  }, [applyServer, cwd]);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [logs]);
 
-  // остановить dev-сервер при закрытии панели
-  useEffect(() => {
-    return () => {
-      if (serverRef.current) void killServer(serverRef.current);
-    };
-  }, [killServer]);
+  // Closing the split only hides the view. The explicit Stop button and the
+  // native idle reaper own process lifetime, so an agent's active QA run is not
+  // interrupted just because the user temporarily closes the pane.
 
   const start = useCallback(async () => {
     if (!cwd) return;
@@ -121,6 +143,7 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
       const be = await getBackend();
       const handle = await be.invoke<PreviewHandle>("preview_start", { cwd, name: selected || null });
       applyServer(handle);
+      setReady(false);
       setUrl(handle.url);
       setAddress(handle.url);
       // перезагружаем iframe по фактической готовности порта, а не по таймеру:
@@ -130,6 +153,7 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
           if (serverRef.current !== handle.serverId) return; // сервер сменили/остановили
           const code = await be.invoke<string>("probe_url", { url: handle.url }).catch(() => null);
           if (code) {
+            setReady(true);
             setIframeKey((k) => k + 1);
             return;
           }
@@ -144,10 +168,33 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
   }, [cwd, selected, killServer, applyServer]);
 
   const stop = useCallback(async () => {
-    if (!serverRef.current) return;
-    await killServer(serverRef.current);
+    if (!cwd || !serverRef.current) return;
+    const stoppedId = serverRef.current;
+    await killServer(stoppedId);
     applyServer(null);
-  }, [killServer, applyServer]);
+    setReady(false);
+    const prior = useStore.getState().chats[cwd]?.chat.previewRuntime;
+    if (prior && prior.serverId === stoppedId) {
+      setSessionPreviewRuntime(cwd, { ...prior, source: prior.source ?? "agent", status: "stopped", running: false, ready: false, updatedAt: Date.now() });
+    }
+  }, [cwd, killServer, applyServer]);
+
+  useEffect(() => {
+    if (harnessPreview?.status === "failed") {
+      setReady(false);
+      setShowLogs(true);
+      if (harnessPreview.error) setLogs((current) => [...current.slice(-319), `— ${harnessPreview.error}`]);
+      return;
+    }
+    if (!harnessPreview?.serverId || !harnessPreview.url || harnessPreview.running === false) return;
+    if (serverRef.current !== harnessPreview.serverId) {
+      applyServer({ serverId: harnessPreview.serverId, url: harnessPreview.url, port: harnessPreview.port ?? 0 });
+      setUrl(harnessPreview.url);
+      setAddress(harnessPreview.url);
+    }
+    setReady(harnessPreview.ready === true);
+    if (harnessPreview.logs?.length) setLogs(harnessPreview.logs);
+  }, [harnessPreview, applyServer]);
 
   const touchServer = useCallback(() => {
     const id = serverRef.current;
@@ -186,6 +233,9 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
         <PreviewIcon size={14} />
         <span className="pv-title">Превью</span>
         {cwd && <span className="pv-sub">{cwd.split("/").pop()}</span>}
+        {server && <span className={`pv-runtime ${ready ? "ready" : "starting"}`}>{ready ? "ready" : "starting"}</span>}
+        {!server && harnessPreview?.status === "failed" && <span className="pv-runtime failed">failed</span>}
+        {harnessPreview?.browserInspected && <span className="pv-runtime inspected">agent checked</span>}
         <div className="grow" />
         <button title="Закрыть превью" onClick={onClose}>
           <MinusIcon size={14} />

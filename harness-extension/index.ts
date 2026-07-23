@@ -19,7 +19,8 @@ import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "no
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { buildIndependentEvaluatorPrompt, buildIndependentFalsifierPrompt, executionFailed, independentEvaluationAccepted, independentEvaluationRepairPrompt, parseBackgroundAgentId } from "./policy.js";
+import { Type } from "typebox";
+import { buildIndependentEvaluatorPrompt, buildIndependentFalsifierPrompt, classifyPreviewBrowserEvidence, executionFailed, independentEvaluationAccepted, independentEvaluationRepairPrompt, parseBackgroundAgentId } from "./policy.js";
 import {
 	attachVerifierSteps,
 	createWorkflowState,
@@ -91,10 +92,35 @@ type ContinuationWaiter = {
 	finish(completed: boolean): void;
 };
 
+type PreviewRuntime = {
+	status: "idle" | "starting" | "running" | "ready" | "stopped" | "failed";
+	serverId?: string;
+	configName?: string;
+	cwd?: string;
+	url?: string;
+	port?: number;
+	running?: boolean;
+	ready?: boolean;
+	httpStatus?: string;
+	startedAtMs?: number;
+	lastActivityMs?: number;
+	leaseUntilMs?: number;
+	logs?: string[];
+	browserOpened?: boolean;
+	browserInspected?: boolean;
+	evidence?: string[];
+	error?: string;
+	updatedAt: number;
+	source: "agent";
+};
+
+type NativePreviewReply = { success: true; data: unknown } | { success: false; error: string };
+
 const MAX_AUTO_LOOPS = Math.min(4, Math.max(0, Number(process.env.PI_APP_HARNESS_MAX_LOOPS ?? 4) || 0));
 const CHECKPOINT_PERCENT = 75;
 const ABLATIONS = new Set((process.env.PI_APP_HARNESS_ABLATIONS ?? "").split(",").map((value) => value.trim()).filter(Boolean));
 const WRITE_TOOLS = new Set(["edit", "write", "apply_patch", "multi_edit"]);
+const PREVIEW_BRIDGE_PREFIX = "__PI_APP_NATIVE_PREVIEW_V1__:";
 
 const WORKFLOW_GUIDANCE = `
 Workflow contract:
@@ -106,6 +132,7 @@ Workflow contract:
 - Green tests prove only what they assert. An independent evaluator reviews successful builds; completion requires deterministic gates and clause-by-clause evaluator acceptance.
 - Background workers are bounded, isolated workstreams. Preserve their transcript and reconcile their output before merge.
 - For a legitimately long-running command requested by the user, delegate it as a background task and omit the bash timeout (or set it above the declared runtime). Never poll it with sleep loops; rely on task lifecycle events, transcript output, and completion notification.
+- For visual/frontend work, use live_preview to start the project-configured native dev server. Once it is ready, inspect the real render with agent_browser or the chrome_* tools (DOM/snapshot, console/network, and screenshot when relevant). Do not claim visual completion from source inspection alone.
 - At high context usage, leave a structured checkpoint: objective, decisions, changed files, gate evidence, risks, and next ready step.`;
 
 const PONYTAIL_POLICY = `
@@ -212,6 +239,7 @@ export default function harness(pi: ExtensionAPI) {
 	let continuationWaiter: ContinuationWaiter | undefined;
 	let taskUi: { setWidget(key: string, value: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void; setStatus(key: string, value: string | undefined): void } | undefined;
 	let backgroundHeartbeat: ReturnType<typeof setInterval> | undefined;
+	let previewRuntime: PreviewRuntime = { status: "idle", updatedAt: Date.now(), source: "agent" };
 	const toolArgs = new Map<string, unknown>();
 	const backgroundTasks = new Map<string, BackgroundTask>();
 
@@ -290,6 +318,33 @@ export default function harness(pi: ExtensionAPI) {
 		const tasks = decorateTaskQueue([...backgroundTasks.values()].slice(-50), maxConcurrent).map((task) =>
 			task.status === "queued" || task.status === "running" ? { ...task, heartbeatAt: now } : task);
 		taskUi.setWidget("pi-app-background-state", tasks.length > 0 ? [JSON.stringify(tasks)] : undefined, { placement: "aboveEditor" });
+	};
+
+	const publishPreview = () => {
+		if (!taskUi) return;
+		taskUi.setWidget(
+			"pi-app-preview-state",
+			previewRuntime.status === "idle" ? undefined : [JSON.stringify(previewRuntime)],
+			{ placement: "aboveEditor" },
+		);
+	};
+
+	const nativePreviewRequest = async (
+		ctx: { ui: { input(title: string, placeholder?: string): Promise<string | undefined> } },
+		request: Record<string, unknown>,
+	): Promise<unknown> => {
+		const raw = await ctx.ui.input(`${PREVIEW_BRIDGE_PREFIX}${JSON.stringify(request)}`, "");
+		if (!raw) throw new Error("Native preview bridge is unavailable. Run this tool from the pi-app desktop session.");
+		let reply: NativePreviewReply;
+		try {
+			reply = JSON.parse(raw) as NativePreviewReply;
+		} catch {
+			throw new Error("Native preview bridge returned malformed JSON.");
+		}
+		if (!reply || reply.success !== true) {
+			throw new Error(reply && "error" in reply ? reply.error : "Native preview request failed.");
+		}
+		return reply.data;
 	};
 
 	const startBackgroundHeartbeat = () => {
@@ -472,6 +527,126 @@ export default function harness(pi: ExtensionAPI) {
 		}
 		return stopped;
 	};
+
+	pi.registerTool({
+		name: "live_preview",
+		label: "Live Preview",
+		description: "Control pi-app's native project preview without starting a duplicate server. List .claude/launch.json configs, start and wait for HTTP readiness, inspect status/recent logs, or stop it. For visual completion, follow a ready start with agent_browser or chrome_* DOM/console/screenshot inspection.",
+		promptSnippet: "Start, observe and stop the desktop app's native live preview for visual development and QA.",
+		promptGuidelines: [
+			"Use action=configs before start when the launch configuration name is unknown.",
+			"After action=start reports ready=true, use agent_browser or chrome_navigate plus chrome_snapshot/chrome_inspect/chrome_screenshot against the returned URL.",
+			"Use status for readiness and recent dev-server logs; do not start a shell dev server in parallel.",
+			"Stop the preview when it is no longer needed, unless the user is actively viewing it.",
+		],
+		parameters: Type.Object({
+			action: Type.Union([
+				Type.Literal("configs"),
+				Type.Literal("start"),
+				Type.Literal("status"),
+				Type.Literal("stop"),
+			]),
+			name: Type.Optional(Type.String({ maxLength: 500, description: "Launch configuration name for start" })),
+			serverId: Type.Optional(Type.String({ maxLength: 200, description: "Known native preview server id" })),
+			waitMs: Type.Optional(Type.Number({ minimum: 0, maximum: 120_000, description: "How long start waits for HTTP readiness (default 60000)" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const action = String(params.action);
+			if (action === "start") {
+				previewRuntime = {
+					status: "starting",
+					configName: params.name,
+					updatedAt: Date.now(),
+					source: "agent",
+					evidence: [],
+					browserOpened: false,
+					browserInspected: false,
+				};
+				const previewStep = state.steps.find((step) => step.id === "preview");
+				if (enabled && previewStep && previewStep.status !== "running") {
+					state = updateWorkflowStep(state, "preview", "running", "Starting the native dev preview and waiting for HTTP readiness.");
+					publishState();
+				}
+				publishPreview();
+			}
+			try {
+				const data = await nativePreviewRequest(ctx, {
+					action,
+					...(params.name ? { name: params.name } : {}),
+					...(params.serverId || previewRuntime.serverId ? { serverId: params.serverId ?? previewRuntime.serverId } : {}),
+					...(params.waitMs != null ? { waitMs: params.waitMs } : {}),
+				});
+				if (action === "configs") {
+					const configurations = Array.isArray(data) ? data : [];
+					const guidance = configurations.length > 0
+						? "Start one of these exact configuration names."
+						: "No launch configuration exists. Add .claude/launch.json with version 0.0.1 and a configurations entry containing name, runtimeExecutable, runtimeArgs, and port; then call configs again. Keep the command project-scoped and review it like executable code.";
+					return { content: [{ type: "text" as const, text: `${JSON.stringify({ configurations }, null, 2)}\n\n${guidance}` }], details: { action, data: configurations } };
+				}
+				if (action === "stop") {
+					previewRuntime = {
+						...previewRuntime,
+						status: "stopped",
+						running: false,
+						ready: false,
+						updatedAt: Date.now(),
+						source: "agent",
+					};
+					publishPreview();
+					return { content: [{ type: "text" as const, text: `Native preview stopped.\n${JSON.stringify(data, null, 2)}` }], details: { action, data } };
+				}
+				if (!data || typeof data !== "object") {
+					previewRuntime = { status: "idle", updatedAt: Date.now(), source: "agent" };
+					publishPreview();
+					return { content: [{ type: "text" as const, text: "No native preview is active for this workspace." }], details: { action, data: null } };
+				}
+				const status = data as Record<string, unknown>;
+				const ready = status.ready === true;
+				previewRuntime = {
+					...previewRuntime,
+					status: ready ? "ready" : status.running === false ? "stopped" : "running",
+					serverId: typeof status.serverId === "string" ? status.serverId : previewRuntime.serverId,
+					configName: typeof status.configName === "string" ? status.configName : previewRuntime.configName,
+					cwd: typeof status.cwd === "string" ? status.cwd : activeCwd,
+					url: typeof status.url === "string" ? status.url : previewRuntime.url,
+					port: typeof status.port === "number" ? status.port : previewRuntime.port,
+					running: status.running !== false,
+					ready,
+					httpStatus: typeof status.httpStatus === "string" ? status.httpStatus : undefined,
+					startedAtMs: typeof status.startedAtMs === "number" ? status.startedAtMs : previewRuntime.startedAtMs,
+					lastActivityMs: typeof status.lastActivityMs === "number" ? status.lastActivityMs : previewRuntime.lastActivityMs,
+					leaseUntilMs: typeof status.leaseUntilMs === "number" ? status.leaseUntilMs : previewRuntime.leaseUntilMs,
+					logs: Array.isArray(status.logs) ? status.logs.filter((line): line is string => typeof line === "string").slice(-320) : previewRuntime.logs,
+					updatedAt: Date.now(),
+					source: "agent",
+				};
+				publishPreview();
+				const next = ready
+					? "Preview is HTTP-ready. Inspect the returned URL now with agent_browser or chrome_navigate and a snapshot/inspect/screenshot tool; source-only review does not satisfy the visual gate."
+					: "Preview process is running but not HTTP-ready yet. Read recent logs, repair startup if needed, then call status.";
+				return {
+					content: [{ type: "text" as const, text: `${JSON.stringify(previewRuntime, null, 2)}\n\n${next}` }],
+					details: { action, data: previewRuntime },
+				};
+			} catch (error) {
+				previewRuntime = {
+					...previewRuntime,
+					status: "failed",
+					running: false,
+					ready: false,
+					error: error instanceof Error ? error.message : String(error),
+					updatedAt: Date.now(),
+					source: "agent",
+				};
+				if (enabled && state.steps.some((step) => step.id === "preview")) {
+					state = updateWorkflowStep(state, "preview", "failed", previewRuntime.error);
+					publishState();
+				}
+				publishPreview();
+				throw error;
+			}
+		},
+	});
 
 	pi.registerCommand("pi-rewind", {
 		description: "Rewind inside the current session; cancel background work atomically",
@@ -859,7 +1034,7 @@ export default function harness(pi: ExtensionAPI) {
 			}
 		}
 		if (!enabled) return;
-		if (state.intent.requiresHumanApproval && !state.approved && (WRITE_TOOLS.has(name) || ["bash", "agent"].includes(name))) {
+		if (state.intent.requiresHumanApproval && !state.approved && (WRITE_TOOLS.has(name) || ["bash", "agent", "live_preview"].includes(name))) {
 			const reason = "Workflow approval gate: approve the persisted plan in pi-app before mutation, shell execution, or delegated work.";
 			state.events = [...state.events, { id: `gate-${Date.now().toString(36)}`, stepId: "approve", type: "waiting", at: Date.now(), message: reason }].slice(-160);
 			publishState();
@@ -894,6 +1069,34 @@ export default function harness(pi: ExtensionAPI) {
 		const name = String(event.toolName ?? "").toLowerCase();
 		const args = toolArgs.get(event.toolCallId);
 		toolArgs.delete(event.toolCallId);
+		if (!event.isError && previewRuntime.ready && previewRuntime.url) {
+			const { opened, inspected, summary } = classifyPreviewBrowserEvidence(name, args, previewRuntime.url);
+			if (opened || inspected) {
+				previewRuntime = {
+					...previewRuntime,
+					browserOpened: previewRuntime.browserOpened || opened,
+					browserInspected: previewRuntime.browserInspected || inspected,
+					evidence: [
+						...(previewRuntime.evidence ?? []),
+						summary,
+					].slice(-12),
+					updatedAt: Date.now(),
+				};
+				if (previewRuntime.browserOpened && previewRuntime.browserInspected) {
+					const step = state.steps.find((item) => item.id === "preview");
+					if (enabled && step && step.status !== "passed") {
+						state = updateWorkflowStep(
+							state,
+							"preview",
+							"passed",
+							`HTTP ${previewRuntime.httpStatus ?? "ready"} at ${previewRuntime.url}; browser navigation and rendered UI inspection completed with ${name}.`,
+						);
+						publishState();
+					}
+				}
+				publishPreview();
+			}
+		}
 		if (name === "agent" && !event.isError && args && typeof args === "object") {
 			const value = args as Record<string, unknown>;
 			const result = outputText(event.result, 20_000);
@@ -990,7 +1193,7 @@ export default function harness(pi: ExtensionAPI) {
 		if (state.evaluatorTaskId) return "failed";
 		if (!state.steps.some((step) => step.id === "evaluate")) return "passed";
 		state = updateWorkflowStep(state, "evaluate", "running", "Independent read-only evaluator is inspecting the contract, diff and gate evidence.");
-		const evidence = state.steps.filter((step) => step.kind === "gate").map((step) => `${step.label}: ${step.status}\n${step.detail ?? ""}`).join("\n\n");
+		const evidence = state.steps.filter((step) => step.kind === "gate" || step.kind === "preview").map((step) => `${step.label}: ${step.status}\n${step.detail ?? ""}`).join("\n\n");
 		const evaluatorId = `eval-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		const description = `Independent evaluation: ${state.objective.slice(0, 120)}`;
 		state.evaluatorTaskId = evaluatorId;
@@ -1097,7 +1300,13 @@ export default function harness(pi: ExtensionAPI) {
 		verifierRunning = true;
 		try {
 			while (true) {
-				const gates = state.steps.filter((step) => step.kind === "gate" && step.command && ["pending", "failed"].includes(step.status));
+				const satisfied = new Set(state.steps.filter((step) => ["passed", "skipped"].includes(step.status)).map((step) => step.id));
+				const queuedGates = state.steps.filter((step) => step.kind === "gate" && step.command && ["pending", "failed"].includes(step.status));
+				const gates = queuedGates.filter((step) => step.deps.every((dep) => satisfied.has(dep)));
+				if (gates.length === 0 && queuedGates.length > 0) {
+					log(`deterministic gates waiting for dependencies: ${queuedGates.map((step) => `${step.id}<-${step.deps.join(",")}`).join(";")}`);
+					return;
+				}
 				if (gates.length === 0) {
 					const waiting = state.steps.find((step) => step.kind === "gate" && step.status === "waiting");
 					if (waiting) {
@@ -1217,6 +1426,23 @@ export default function harness(pi: ExtensionAPI) {
 		}
 		if (!state.approved) return;
 		if (state.steps.some((step) => step.id === "build" && step.status === "running")) state = updateWorkflowStep(state, "build", "passed", "Implementation turn settled; deterministic gates are next.");
+		const previewStep = state.steps.find((step) => step.id === "preview");
+		if (previewStep && previewStep.status !== "passed" && previewStep.status !== "skipped") {
+			if (!continuationQueued && state.autoLoops < MAX_AUTO_LOOPS) {
+				state.autoLoops++;
+				publishState();
+				await requestContinuation(
+					`Continue the existing objective. Visual work requires native live-preview evidence (${state.autoLoops}/${MAX_AUTO_LOOPS}). Use live_preview to list/start the project configuration and wait for HTTP readiness. Then navigate to its URL with agent_browser or chrome_navigate and inspect the actual rendered page with snapshot/inspect/console/screenshot tools. Repair any observed issue. Do not start a duplicate dev server in bash and do not claim visual completion from source inspection.`,
+					{ reason: "preview-evidence-missing", previewStep: previewStep.id },
+				);
+				return;
+			}
+			if (previewStep.status !== "failed") {
+				state = updateWorkflowStep(state, previewStep.id, "failed", "Native preview and rendered browser inspection evidence were not completed before the retry budget ended.");
+			}
+			publishState();
+			return;
+		}
 		publishState();
 		await runDeterministicGates();
 	});
@@ -1231,7 +1457,7 @@ export default function harness(pi: ExtensionAPI) {
 		if (backgroundHeartbeat) clearInterval(backgroundHeartbeat);
 		backgroundHeartbeat = undefined;
 		ctx.ui.setStatus("pi-app-workflow", undefined);
-		for (const key of ["pi-app-workflow-state", "pi-app-background-state", "pi-app-checkpoint-state"]) ctx.ui.setWidget(key, undefined);
+		for (const key of ["pi-app-workflow-state", "pi-app-background-state", "pi-app-checkpoint-state", "pi-app-preview-state"]) ctx.ui.setWidget(key, undefined);
 		taskUi = undefined;
 		backgroundTasks.clear();
 	});

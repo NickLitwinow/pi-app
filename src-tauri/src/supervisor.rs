@@ -44,11 +44,27 @@ fn canonical_or_original(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+#[cfg(target_os = "macos")]
+fn agent_browser_args_for_outer_sandbox(existing: Option<String>) -> String {
+    let existing = existing.unwrap_or_default();
+    if existing
+        .split([',', '\n'])
+        .any(|argument| argument.trim() == "--no-sandbox")
+    {
+        return existing;
+    }
+    if existing.trim().is_empty() {
+        "--no-sandbox".into()
+    } else {
+        format!("{existing},--no-sandbox")
+    }
+}
+
 /// Allow reads everywhere, but keep all writes from the agent and its child
 /// tools inside the workspace, durable Pi session storage, and OS scratch.
 /// This is deliberately an OS boundary rather than a prompt convention.
 #[cfg(target_os = "macos")]
-fn workspace_sandbox_profile(cwd: &Path, session_path: Option<&str>) -> String {
+pub(crate) fn workspace_sandbox_profile(cwd: &Path, session_path: Option<&str>) -> String {
     let agent_dir = crate::sessions::agent_dir();
     let mut writable = vec![
         canonical_or_original(cwd),
@@ -84,6 +100,12 @@ fn workspace_sandbox_profile(cwd: &Path, session_path: Option<&str>) -> String {
     ];
     if let Some(config_dir) = dirs::config_dir() {
         writable.push(config_dir.join("ponytail"));
+    }
+    if let Some(home_dir) = dirs::home_dir() {
+        // pi-agent-browser-native delegates to agent-browser, whose daemon
+        // keeps only sockets, bounded session state and restore metadata here.
+        // Keep the grant narrow instead of exposing the rest of the home dir.
+        writable.push(home_dir.join(".agent-browser"));
     }
     if let Some(parent) = session_path.and_then(|path| Path::new(path).parent()) {
         writable.push(canonical_or_original(parent));
@@ -403,6 +425,133 @@ fn background_task_count(event: &serde_json::Value) -> Option<u64> {
     )
 }
 
+const PREVIEW_BRIDGE_PREFIX: &str = "__PI_APP_NATIVE_PREVIEW_V1__:";
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PreviewBridgeRequest {
+    action: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    server_id: Option<String>,
+    #[serde(default)]
+    wait_ms: Option<u64>,
+}
+
+fn preview_bridge_request(
+    event: &serde_json::Value,
+) -> Option<Result<(String, PreviewBridgeRequest), String>> {
+    if event.get("type").and_then(|value| value.as_str()) != Some("extension_ui_request")
+        || event.get("method").and_then(|value| value.as_str()) != Some("input")
+    {
+        return None;
+    }
+    let title = event.get("title").and_then(|value| value.as_str())?;
+    let payload = title.strip_prefix(PREVIEW_BRIDGE_PREFIX)?;
+    if payload.len() > 8_192 {
+        return Some(Err("native preview request exceeds 8192 bytes".into()));
+    }
+    let id = match event.get("id").and_then(|value| value.as_str()) {
+        Some(value) if !value.is_empty() && value.len() <= 512 => value.to_string(),
+        _ => {
+            return Some(Err(
+                "native preview request is missing a bounded UI id".into()
+            ))
+        }
+    };
+    let request = match serde_json::from_str::<PreviewBridgeRequest>(payload) {
+        Ok(value)
+            if matches!(
+                value.action.as_str(),
+                "configs" | "start" | "status" | "stop" | "touch"
+            ) =>
+        {
+            value
+        }
+        Ok(_) => return Some(Err("unsupported native preview action".into())),
+        Err(error) => return Some(Err(format!("invalid native preview request: {error}"))),
+    };
+    Some(Ok((id, request)))
+}
+
+async fn execute_preview_bridge<R: Runtime>(
+    app: AppHandle<R>,
+    cwd: String,
+    request: PreviewBridgeRequest,
+) -> Result<serde_json::Value, String> {
+    match request.action.as_str() {
+        "configs" => serde_json::to_value(crate::preview::preview_configs(cwd))
+            .map_err(|error| error.to_string()),
+        "start" => {
+            let handle = crate::preview::preview_start_impl(app, cwd.clone(), request.name).await?;
+            crate::preview::preview_set_lease(&handle.server_id, &cwd, 8 * 60 * 60)?;
+            let wait_ms = request.wait_ms.unwrap_or(60_000).min(120_000);
+            let started = std::time::Instant::now();
+            loop {
+                let status =
+                    crate::preview::preview_status(cwd.clone(), Some(handle.server_id.clone()))
+                        .await?;
+                let Some(status) = status else {
+                    return Err("native preview process exited before HTTP readiness".into());
+                };
+                if status.ready || started.elapsed().as_millis() as u64 >= wait_ms {
+                    return serde_json::to_value(status).map_err(|error| error.to_string());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+        }
+        "status" => {
+            serde_json::to_value(crate::preview::preview_status(cwd, request.server_id).await?)
+                .map_err(|error| error.to_string())
+        }
+        "stop" => {
+            let server_id = match request.server_id {
+                Some(id) => id,
+                None => crate::preview::preview_status(cwd.clone(), None)
+                    .await?
+                    .map(|status| status.server_id)
+                    .ok_or("no active preview for this workspace")?,
+            };
+            if !crate::preview::preview_belongs_to(&server_id, &cwd) {
+                return Err("preview server does not belong to this agent workspace".into());
+            }
+            crate::preview::preview_stop(server_id.clone())?;
+            Ok(serde_json::json!({ "serverId": server_id, "running": false }))
+        }
+        "touch" => {
+            let server_id = request.server_id.ok_or("touch requires serverId")?;
+            if !crate::preview::preview_belongs_to(&server_id, &cwd) {
+                return Err("preview server does not belong to this agent workspace".into());
+            }
+            crate::preview::preview_touch(server_id.clone())?;
+            Ok(serde_json::json!({ "serverId": server_id, "touched": true }))
+        }
+        _ => Err("unsupported native preview action".into()),
+    }
+}
+
+async fn send_extension_input_response(
+    stdin: Arc<Mutex<ChildStdin>>,
+    id: String,
+    reply: Result<serde_json::Value, String>,
+) {
+    let value = match reply {
+        Ok(data) => serde_json::json!({ "success": true, "data": data }),
+        Err(error) => serde_json::json!({ "success": false, "error": error }),
+    };
+    let line = serde_json::json!({
+        "type": "extension_ui_response",
+        "id": id,
+        "value": value.to_string(),
+    })
+    .to_string();
+    let mut writer = stdin.lock().await;
+    let _ = writer.write_all(line.as_bytes()).await;
+    let _ = writer.write_all(b"\n").await;
+    let _ = writer.flush().await;
+}
+
 fn workload_is_active(streaming: bool, background_tasks: u64) -> bool {
     streaming || background_tasks > 0
 }
@@ -536,6 +685,7 @@ async fn kill_by_id<R: Runtime>(
 ) {
     let agent = { agents.lock().await.remove(id) };
     if let Some(agent) = agent {
+        crate::preview::preview_release_lease_for_cwd(&agent.cwd);
         kill_group(&agent.child).await;
         let _ = app.emit(
             "agent-exit",
@@ -569,6 +719,11 @@ pub async fn spawn_agent_impl<R: Runtime>(
     // process hosting background work is busy even after its foreground turn
     // has emitted agent_end.
     let app_config = load_app_config();
+    if app_config.agent_sandbox_mode == "workspace-write" {
+        if let Some(home_dir) = dirs::home_dir() {
+            let _ = std::fs::create_dir_all(home_dir.join(".agent-browser"));
+        }
+    }
     let limit = if app_config.process_limit_auto && crate::config::local_provider_configured() {
         1
     } else {
@@ -626,6 +781,17 @@ pub async fn spawn_agent_impl<R: Runtime>(
     };
     #[cfg(not(target_os = "macos"))]
     let mut cmd = Command::new(&pi);
+    #[cfg(target_os = "macos")]
+    if sandbox_profile.is_some() {
+        // Chromium's own macOS Seatbelt cannot be initialized from a process
+        // that is already inside our workspace-write Seatbelt profile. Disable
+        // only the nested Chromium layer; the Pi process and every descendant
+        // (including Chrome) remain constrained by the outer OS sandbox.
+        cmd.env(
+            "AGENT_BROWSER_ARGS",
+            agent_browser_args_for_outer_sandbox(std::env::var("AGENT_BROWSER_ARGS").ok()),
+        );
+    }
     cmd.args(&args)
         .current_dir(&opts.cwd)
         .env("PATH", child_path())
@@ -692,6 +858,8 @@ pub async fn spawn_agent_impl<R: Runtime>(
     {
         let app = app.clone();
         let id = agent_id.clone();
+        let cwd = agent.cwd.clone();
+        let stdin = agent.stdin.clone();
         let streaming = agent.streaming.clone();
         let background_tasks = agent.background_tasks.clone();
         let last_activity = agent.last_activity.clone();
@@ -708,15 +876,54 @@ pub async fn spawn_agent_impl<R: Runtime>(
                         for line in framer.push(&buf[..n]) {
                             match serde_json::from_str::<serde_json::Value>(&line) {
                                 Ok(event) => {
+                                    if let Some(request) = preview_bridge_request(&event) {
+                                        let app = app.clone();
+                                        let cwd = cwd.clone();
+                                        let stdin = stdin.clone();
+                                        match request {
+                                            Ok((request_id, request)) => {
+                                                tauri::async_runtime::spawn(async move {
+                                                    let reply =
+                                                        execute_preview_bridge(app, cwd, request)
+                                                            .await;
+                                                    send_extension_input_response(
+                                                        stdin, request_id, reply,
+                                                    )
+                                                    .await;
+                                                });
+                                            }
+                                            Err(error) => {
+                                                let request_id = event
+                                                    .get("id")
+                                                    .and_then(|value| value.as_str())
+                                                    .unwrap_or("invalid-preview-request")
+                                                    .to_string();
+                                                tauri::async_runtime::spawn(
+                                                    send_extension_input_response(
+                                                        stdin,
+                                                        request_id,
+                                                        Err(error),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        continue;
+                                    }
                                     if let Some(count) = background_task_count(&event) {
                                         background_tasks.store(count, Ordering::Relaxed);
+                                        if count == 0 && !streaming.load(Ordering::Relaxed) {
+                                            crate::preview::preview_release_lease_for_cwd(&cwd);
+                                        }
                                     }
                                     match event.get("type").and_then(|t| t.as_str()) {
                                         Some("agent_start") => {
                                             streaming.store(true, Ordering::Relaxed)
                                         }
                                         Some("agent_end") => {
-                                            streaming.store(false, Ordering::Relaxed)
+                                            streaming.store(false, Ordering::Relaxed);
+                                            if background_tasks.load(Ordering::Relaxed) == 0 {
+                                                crate::preview::preview_release_lease_for_cwd(&cwd);
+                                            }
                                         }
                                         // Sniff the session path from get_state responses.
                                         Some("response")
@@ -785,6 +992,7 @@ pub async fn spawn_agent_impl<R: Runtime>(
     {
         let app = app.clone();
         let id = agent_id.clone();
+        let cwd = agent.cwd.clone();
         let child = agent.child.clone();
         let agents = sup.agents.clone();
         tauri::async_runtime::spawn(async move {
@@ -795,6 +1003,7 @@ pub async fn spawn_agent_impl<R: Runtime>(
                         Ok(Some(status)) => {
                             let existed = { agents.lock().await.remove(&id).is_some() };
                             if existed {
+                                crate::preview::preview_release_lease_for_cwd(&cwd);
                                 let _ = app.emit(
                                     "agent-exit",
                                     AgentExitPayload {
@@ -1020,7 +1229,8 @@ pub async fn process_stats_impl<R: Runtime>(sup: &Supervisor<R>) -> Result<Vec<P
 #[cfg(test)]
 mod tests {
     use super::{
-        background_task_count, idle_reap_eligible, kill_group, parse_ps, workload_is_active,
+        background_task_count, idle_reap_eligible, kill_group, parse_ps, preview_bridge_request,
+        workload_is_active, PREVIEW_BRIDGE_PREFIX,
     };
     use std::process::Stdio;
     use std::sync::Arc;
@@ -1076,6 +1286,57 @@ mod tests {
     }
 
     #[test]
+    fn native_preview_bridge_accepts_only_hidden_bounded_actions() {
+        let event = serde_json::json!({
+            "type": "extension_ui_request",
+            "method": "input",
+            "id": "preview-1",
+            "title": format!("{PREVIEW_BRIDGE_PREFIX}{}", serde_json::json!({
+                "action": "start",
+                "name": "app",
+                "waitMs": 60000
+            }))
+        });
+        let (id, request) = preview_bridge_request(&event)
+            .expect("bridge event")
+            .expect("valid request");
+        assert_eq!(id, "preview-1");
+        assert_eq!(request.action, "start");
+        assert_eq!(request.name.as_deref(), Some("app"));
+
+        let visible_input = serde_json::json!({
+            "type": "extension_ui_request",
+            "method": "input",
+            "id": "user-input",
+            "title": "Normal extension question"
+        });
+        assert!(preview_bridge_request(&visible_input).is_none());
+
+        let invalid = serde_json::json!({
+            "type": "extension_ui_request",
+            "method": "input",
+            "id": "preview-2",
+            "title": format!("{PREVIEW_BRIDGE_PREFIX}{}", serde_json::json!({
+                "action": "shell",
+                "command": "rm -rf /"
+            }))
+        });
+        assert!(preview_bridge_request(&invalid)
+            .expect("bridge event")
+            .is_err());
+
+        let oversized = serde_json::json!({
+            "type": "extension_ui_request",
+            "method": "input",
+            "id": "preview-3",
+            "title": format!("{PREVIEW_BRIDGE_PREFIX}{}", "x".repeat(8_193))
+        });
+        assert!(preview_bridge_request(&oversized)
+            .expect("bridge event")
+            .is_err());
+    }
+
+    #[test]
     fn silent_eight_hour_background_task_is_not_idle_reaped() {
         let eight_hours_ms = 8 * 60 * 60 * 1_000;
         let idle_ttl_ms = 15 * 60 * 1_000;
@@ -1087,7 +1348,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn workspace_sandbox_allows_workspace_and_escapes_paths() {
-        use super::workspace_sandbox_profile;
+        use super::{agent_browser_args_for_outer_sandbox, workspace_sandbox_profile};
         use std::path::Path;
 
         let profile = workspace_sandbox_profile(
@@ -1105,7 +1366,18 @@ mod tests {
         assert!(profile.contains("mcp-onboarding[.]json[.][0-9]+[.]tmp"));
         assert!(profile.contains("pi-permission-system/logs"));
         assert!(profile.contains("ponytail"));
+        assert!(profile.contains(".agent-browser"));
         assert!(profile.contains("(literal \"/dev/null\")"));
+
+        assert_eq!(agent_browser_args_for_outer_sandbox(None), "--no-sandbox");
+        assert_eq!(
+            agent_browser_args_for_outer_sandbox(Some("--disable-gpu".into())),
+            "--disable-gpu,--no-sandbox"
+        );
+        assert_eq!(
+            agent_browser_args_for_outer_sandbox(Some("--no-sandbox,--disable-gpu".into())),
+            "--no-sandbox,--disable-gpu"
+        );
     }
 
     #[cfg(unix)]

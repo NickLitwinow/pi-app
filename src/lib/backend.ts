@@ -13,6 +13,7 @@ import type {
   PiPackage,
   PiUpdateInfo,
   PreviewHandle,
+  PreviewStatus,
   ProjectInfo,
   SessionMeta,
   SkillInfo,
@@ -62,6 +63,7 @@ class MockBackend implements Backend {
   private currentSession = "/mock/a/live.jsonl";
   private rewindTargetBySession = new Map<string, string>();
   private permMode: string | null = null;
+  private previewRuntime: PreviewStatus | null = null;
   private settings = JSON.stringify(
     {
       defaultProvider: "ollama",
@@ -168,6 +170,36 @@ class MockBackend implements Backend {
     const respond = (id: unknown, command: string, data: Record<string, unknown> = {}) =>
       this.emitAgent(agentId, { type: "response", id, command, success: true, data });
     void respond;
+    if (prompt.includes("[mock-preview]")) {
+      const now = Date.now();
+      this.previewRuntime = {
+        serverId: "prev-agent",
+        configName: "pi-app-ui",
+        cwd: "/Users/demo/pi-app",
+        url: "http://localhost:1420",
+        port: 1420,
+        running: true,
+        ready: true,
+        httpStatus: "200",
+        startedAtMs: now - 2_000,
+        lastActivityMs: now,
+        logs: ["> vite", "VITE ready in 240 ms", "➜ Local: http://localhost:1420/"],
+      };
+      this.emitAgent(agentId, {
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "pi-app-preview-state",
+        widgetLines: [JSON.stringify({
+          ...this.previewRuntime,
+          status: "ready",
+          browserOpened: true,
+          browserInspected: true,
+          evidence: ["chrome_navigate", "chrome_snapshot"],
+          updatedAt: now,
+          source: "agent",
+        })],
+      });
+    }
     if (prompt.includes("[mock-workflow]")) {
       const now = Date.now();
       const workflow = {
@@ -659,6 +691,19 @@ class MockBackend implements Backend {
         return undefined as T;
       case "preview_start": {
         const serverId = `prev-${Date.now()}`;
+        this.previewRuntime = {
+          serverId,
+          configName: String(args.name ?? "pi-app-ui"),
+          cwd: String(args.cwd ?? "/Users/dev/pi-app"),
+          url: "http://localhost:1420",
+          port: 1420,
+          running: true,
+          ready: true,
+          httpStatus: "200",
+          startedAtMs: Date.now(),
+          lastActivityMs: Date.now(),
+          logs: ["> vite", "VITE ready in 240 ms", "➜ Local: http://localhost:1420/"],
+        };
         void (async () => {
           for (const l of ["> vite", "VITE ready in 240 ms", "➜ Local: http://localhost:1420/"]) {
             await sleep(300);
@@ -667,9 +712,15 @@ class MockBackend implements Backend {
         })();
         return { serverId, url: "http://localhost:1420", port: 1420 } satisfies PreviewHandle as T;
       }
+      case "preview_status":
+        return (this.previewRuntime && this.previewRuntime.cwd === String(args.cwd)
+          ? this.previewRuntime
+          : null) as T;
       case "preview_stop":
+        this.previewRuntime = null;
         return undefined as T;
       case "preview_touch":
+        if (this.previewRuntime) this.previewRuntime.lastActivityMs = Date.now();
         return undefined as T;
       case "read_pi_config": {
         const name = String(args.name);

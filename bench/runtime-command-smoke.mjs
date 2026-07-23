@@ -54,6 +54,8 @@ const requiredTools = new Map([
 	["Agent", "npm:@tintinweb/pi-subagents"],
 	["get_subagent_result", "npm:@tintinweb/pi-subagents"],
 	["steer_subagent", "npm:@tintinweb/pi-subagents"],
+	["live_preview", "../../GithubControl/pi-app/harness-extension"],
+	["agent_browser", "npm:pi-agent-browser-native"],
 ]);
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));

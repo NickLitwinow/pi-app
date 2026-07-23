@@ -185,6 +185,7 @@ const quickStages = [
 	nodeStage("runtime-commands", "runtime-command-smoke.mjs"),
 	nodeStage("task-controls", "task-controls-smoke.mjs"),
 	nodeStage("sandbox", "macos-sandbox-smoke.mjs"),
+	nodeStage("live-preview-browser-runtime", "live-preview-browser-smoke.mjs"),
 	nodeStage("skill-resource", "skill-resource-smoke.mjs"),
 	nodeStage("fixture-git", "fixture-git-smoke.mjs"),
 	nodeStage("schedule", "schedule-smoke.mjs"),
@@ -347,6 +348,7 @@ function preflight() {
 	if (!settings.packages?.some((item) => String(item).includes("ponytail"))) failures.push("Ponytail package is not enabled");
 	if (ponytailConfig.defaultMode !== "full") failures.push(`Ponytail defaultMode=${ponytailConfig.defaultMode}; expected full`);
 	if (!settings.packages?.some((item) => String(item).includes("harness-extension"))) failures.push("pi-app harness extension is not enabled");
+	if (!settings.packages?.some((item) => String(item).includes("pi-agent-browser-native"))) failures.push("pi-agent-browser-native is not enabled for live preview inspection");
 	if (!Number.isInteger(subagents.maxConcurrent) || subagents.maxConcurrent < 2) {
 		failures.push(`subagent maxConcurrent=${subagents.maxConcurrent}; expected at least 2 for real background overlap`);
 	}

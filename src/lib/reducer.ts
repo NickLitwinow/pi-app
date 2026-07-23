@@ -8,6 +8,7 @@ import {
   type CompactionRecord,
   type ExtUiRequest,
   type PlannedTaskView,
+  type PreviewRuntimeView,
   type RunMeta,
   type StructuredCheckpoint,
   type ToolExec,
@@ -67,8 +68,8 @@ function normalizeWorkflowPayload(value: unknown): WorkflowViewState | null {
   const intent = objectValue(root?.intent);
   if (!root || !intent || !Array.isArray(root.steps) || !Array.isArray(root.events)) return null;
   const stepStatuses = new Set(["pending", "running", "waiting", "passed", "failed", "skipped"]);
-  const stepKinds = new Set(["plan", "research", "build", "gate", "evaluate", "review"]);
-  const owners = new Set(["orchestrator", "researcher", "executor", "gate-runner", "evaluator", "human"]);
+  const stepKinds = new Set(["plan", "research", "build", "preview", "gate", "evaluate", "review"]);
+  const owners = new Set(["orchestrator", "researcher", "executor", "preview-runner", "gate-runner", "evaluator", "human"]);
   const steps = root.steps.slice(0, 200).flatMap((raw) => {
     const step = objectValue(raw);
     const id = boundedString(step?.id, 200);
@@ -134,6 +135,7 @@ function normalizeWorkflowPayload(value: unknown): WorkflowViewState | null {
       profile: (profiles.has(profile) ? profile : "chore") as WorkflowViewState["profile"],
       risk: (risks.has(risk) ? risk : "medium") as WorkflowViewState["intent"]["risk"],
       needsResearch: intent.needsResearch === true,
+      needsPreview: intent.needsPreview === true,
       allowsMutation: intent.allowsMutation === true,
       allowsDeletion: intent.allowsDeletion === true,
       requiresPlan: intent.requiresPlan === true,
@@ -144,6 +146,35 @@ function normalizeWorkflowPayload(value: unknown): WorkflowViewState | null {
     },
     steps,
     events,
+  };
+}
+
+function normalizePreviewRuntime(value: unknown): PreviewRuntimeView | null {
+  const item = objectValue(value);
+  if (!item) return null;
+  const statuses = new Set(["idle", "starting", "running", "ready", "stopped", "failed"]);
+  const status = boundedString(item.status, 30);
+  if (!statuses.has(status)) return null;
+  return {
+    status: status as PreviewRuntimeView["status"],
+    serverId: boundedString(item.serverId, 200) || undefined,
+    configName: boundedString(item.configName, 500) || undefined,
+    cwd: boundedString(item.cwd, 4_000) || undefined,
+    url: boundedString(item.url, 2_048) || undefined,
+    port: finiteNumber(item.port),
+    running: typeof item.running === "boolean" ? item.running : undefined,
+    ready: typeof item.ready === "boolean" ? item.ready : undefined,
+    httpStatus: boundedString(item.httpStatus, 10) || undefined,
+    startedAtMs: finiteNumber(item.startedAtMs),
+    lastActivityMs: finiteNumber(item.lastActivityMs),
+    leaseUntilMs: finiteNumber(item.leaseUntilMs),
+    logs: stringList(item.logs, 320, 4_000),
+    browserOpened: item.browserOpened === true,
+    browserInspected: item.browserInspected === true,
+    evidence: stringList(item.evidence, 20, 2_000),
+    error: boundedString(item.error, 8_000) || undefined,
+    updatedAt: finiteNumber(item.updatedAt) ?? 0,
+    source: "agent",
   };
 }
 
@@ -591,6 +622,11 @@ export function applyAgentEvent(chat: ChatState, ev: Record<string, unknown>): C
             if (checkpoint && !chat.structuredCheckpoints.some((item) => item.at === checkpoint.at)) {
               chat.structuredCheckpoints = [...chat.structuredCheckpoints, checkpoint].slice(-30);
             }
+          } catch { /* keep last valid state */ }
+        } else if (key === "pi-app-preview-state") {
+          try {
+            const preview = text ? normalizePreviewRuntime(JSON.parse(text)) : null;
+            if (!text || preview) chat.previewRuntime = preview;
           } catch { /* keep last valid state */ }
         } else {
           const widgets = { ...chat.widgets };

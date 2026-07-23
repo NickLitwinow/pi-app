@@ -163,6 +163,7 @@ pub fn run() {
             preview::preview_configs,
             preview::preview_save_config,
             preview::preview_start,
+            preview::preview_status,
             preview::preview_stop,
             preview::preview_touch,
             gitops::git_is_repo,

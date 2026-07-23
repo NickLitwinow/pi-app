@@ -28,6 +28,7 @@ Lightweight native macOS app for **[pi](https://pi.dev)** — a full-featured AI
 - **Permission system** — native extension UI (select/confirm/input/editor), non-blocking
 - **Background work** — queued subagents remain visible above the composer with isolated worktree support
 - **Adaptive execution workflow** — observable project gates, independent evaluation, bounded repair, and always-on hardened Ponytail policy
+- **Agent-native live preview** — the model controls the same sandboxed dev server as the split UI via `live_preview`, waits for HTTP readiness, reads retained logs, and must verify visual work through `agent_browser`/`chrome_*` evidence before workflow gates can pass
 - **Memory-efficient** — background history offloaded to files, tool outputs bounded
 - **Create PR/MR** — GitHub (`gh`), GitLab (`glab`), or browser-based
 - **Self-update** — check latest version on GitHub, rebuild from source, relaunch
@@ -125,6 +126,16 @@ the updater now refuses to start when it finds any, and lists the files instead.
 ## 🏗 Architecture
 
 Pi is a Tauri 2 application with a React 19 frontend. The Rust backend runs `pi --mode rpc` (JSONL over stdio) for each active session and streams events to the WebView.
+
+For frontend work, `.claude/launch.json` is the launch contract shared by the
+Preview pane and the harness. The model-facing `live_preview` tool is bridged
+through the supervisor to the native preview manager; it never starts a second
+untracked dev server. `start` waits up to 60 seconds for a real HTTP response,
+`status` returns recent process logs, and `stop` is scoped to the current
+workspace. Agent-owned previews receive a bounded eight-hour lease so a long
+reasoning/build turn is not mistaken for an abandoned UI pane. Visual workflow
+steps remain incomplete until a browser tool has
+both navigated to the returned URL and inspected the rendered page.
 
 ```
 ┌─────────────────────────────────────────────┐

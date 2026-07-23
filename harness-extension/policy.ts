@@ -15,6 +15,106 @@ export function parseBackgroundAgentId(result: string): string | undefined {
 	return /Agent ID:\s*([A-Za-z0-9][A-Za-z0-9._-]*)/i.exec(result)?.[1];
 }
 
+export function classifyPreviewBrowserEvidence(
+	toolName: string,
+	args: unknown,
+	previewUrl: string,
+): { opened: boolean; inspected: boolean; summary: string } {
+	const name = toolName.toLowerCase();
+	let summaryInput = "";
+	try {
+		summaryInput = JSON.stringify(args ?? {});
+	} catch {
+		return { opened: false, inspected: false, summary: `${name}: unreadable input` };
+	}
+	const input = args && typeof args === "object" && !Array.isArray(args)
+		? args as Record<string, unknown>
+		: {};
+	const sameUrl = (value: unknown) => {
+		if (typeof value !== "string") return false;
+		try {
+			return new URL(value).href === new URL(previewUrl).href;
+		} catch {
+			return value === previewUrl;
+		}
+	};
+	const chromeOpened = (name === "chrome_navigate" || name === "chrome_launch")
+		&& [input.url, input.href, input.targetUrl].some(sameUrl);
+	const chromeInspected = [
+		"chrome_snapshot",
+		"chrome_inspect",
+		"chrome_screenshot",
+		"chrome_list_console_messages",
+		"chrome_list_network_requests",
+	].includes(name);
+	if (name !== "agent_browser") {
+		return {
+			opened: chromeOpened,
+			inspected: chromeInspected,
+			summary: `${name}: ${summaryInput.slice(0, 800)}`,
+		};
+	}
+
+	const inspectionCommands = new Set(["snapshot", "screenshot", "console", "errors"]);
+	const classifyCommand = (tokens: unknown[]): { opened: boolean; inspected: boolean } => {
+		const values = tokens.filter((value): value is string => typeof value === "string");
+		const flagsWithValues = new Set([
+			"--session", "--namespace", "--profile", "--state", "--provider", "-p",
+			"--executable-path", "--allowed-domains", "--config",
+		]);
+		let index = 0;
+		while (index < values.length && values[index].startsWith("-")) {
+			index += flagsWithValues.has(values[index]) ? 2 : 1;
+		}
+		const command = values[index];
+		const rest = values.slice(index + 1);
+		return {
+			opened: command === "open" && sameUrl(rest[0]),
+			inspected: inspectionCommands.has(command)
+				|| (command === "network" && rest[0] === "requests"),
+		};
+	};
+
+	let opened = false;
+	let inspected = false;
+	if (Array.isArray(input.args)) {
+		({ opened, inspected } = classifyCommand(input.args));
+		if (input.args.includes("batch") && typeof input.stdin === "string") {
+			try {
+				const steps = JSON.parse(input.stdin) as unknown;
+				if (Array.isArray(steps)) {
+					for (const step of steps) {
+						if (!Array.isArray(step)) continue;
+						const evidence = classifyCommand(step);
+						opened ||= evidence.opened;
+						inspected ||= evidence.inspected;
+					}
+				}
+			} catch { /* malformed batch input is not evidence */ }
+		}
+	}
+	const qa = input.qa && typeof input.qa === "object" && !Array.isArray(input.qa)
+		? input.qa as Record<string, unknown>
+		: undefined;
+	if (qa) {
+		const targetsPreview = sameUrl(qa.url);
+		opened ||= targetsPreview;
+		inspected ||= targetsPreview;
+	}
+	const job = input.job && typeof input.job === "object" && !Array.isArray(input.job)
+		? input.job as Record<string, unknown>
+		: undefined;
+	if (job && Array.isArray(job.steps)) {
+		for (const rawStep of job.steps) {
+			if (!rawStep || typeof rawStep !== "object" || Array.isArray(rawStep)) continue;
+			const step = rawStep as Record<string, unknown>;
+			opened ||= step.action === "open" && sameUrl(step.url);
+			inspected ||= ["snapshot", "screenshot", "assertText", "assertSelector"].includes(String(step.action));
+		}
+	}
+	return { opened, inspected, summary: `${name}: ${summaryInput.slice(0, 800)}` };
+}
+
 /**
  * A task can require several capabilities at once. Keeping those axes independent
  * prevents words such as "research" or "bug" from accidentally discarding an
@@ -25,6 +125,7 @@ export type TaskIntent = {
 	profile: WorkflowProfile;
 	risk: TaskRisk;
 	needsResearch: boolean;
+	needsPreview: boolean;
 	allowsMutation: boolean;
 	allowsDeletion: boolean;
 	requiresPlan: boolean;
@@ -45,6 +146,7 @@ const APPROVAL_REQUIRED = /(production|продакшн|deploy|релиз|drop\s
 const CHORE = /(chore|dependency|dependencies|зависимост|конфиг|config|format|lint|rename|переимен)/i;
 const DELETE_EXPLICIT = /\b(?:delete|remove)\b|удал\w*|убер(?:и|ите)\b/i;
 const DELETE_DENIAL = /\b(?:do not|don't|without)\s+(?:delete|remove)\b|не\s+(?:удал\w*|убира\w*)/i;
+const VISUAL_PREVIEW = /(?:\bui\b|\bux\b|frontend|front-end|live[- ]?preview|screenshot|responsive|visual regression|интерфейс|визуаль|в[её]рстк|превью|скриншот|адаптив|иконк|кнопк|топ[- ]?бар|панел)/i;
 
 export function inferTaskIntent(prompt: string): TaskIntent {
 	const text = prompt.trim();
@@ -54,6 +156,7 @@ export function inferTaskIntent(prompt: string): TaskIntent {
 	const asksAssessment = ASSESS.test(text);
 	const allowsMutation = MUTATE.test(text);
 	const allowsDeletion = allowsMutation && DELETE_EXPLICIT.test(text) && !DELETE_DENIAL.test(text);
+	const needsPreview = allowsMutation && VISUAL_PREVIEW.test(text);
 	const debugSignal = DEBUG.test(text);
 	const hotfixSignal = HOTFIX.test(riskText);
 	const highRiskSignal = HIGH_RISK.test(riskText);
@@ -85,6 +188,7 @@ export function inferTaskIntent(prompt: string): TaskIntent {
 		highRiskSignal && "high-risk",
 		coupled && "coupled",
 		buildScopeSignal && "architectural",
+		needsPreview && "visual-preview",
 	].filter((value): value is string => Boolean(value));
 
 	return {
@@ -92,6 +196,7 @@ export function inferTaskIntent(prompt: string): TaskIntent {
 		profile,
 		risk,
 		needsResearch,
+		needsPreview,
 		allowsMutation,
 		allowsDeletion,
 		requiresPlan: allowsMutation && (coupled || risk !== "low"),

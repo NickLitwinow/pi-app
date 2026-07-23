@@ -558,3 +558,30 @@ test("Application hotkeys — workspaces and roadmap navigation", async ({ page 
   await page.keyboard.press("Meta+Slash");
   await expect(page.getByText("Переключить workspace по номеру", { exact: true })).toBeVisible();
 });
+
+test("Live preview — shared native server exposes readiness, logs and responsive frame", async ({ page }) => {
+  await boot(page);
+  await page.keyboard.press("Meta+e");
+  const preview = page.locator(".preview-pane");
+  await expect(preview).toBeVisible();
+  await preview.getByRole("button", { name: /Запустить/ }).click();
+  await expect(preview.locator(".pv-runtime.ready")).toHaveText("ready");
+  await expect(preview.locator("iframe[title=preview]")).toHaveAttribute("src", "http://localhost:1420");
+  await expect(preview.locator(".pv-logs")).toContainText("VITE ready");
+  await expectNoHorizontalOverflow(page);
+  await preview.getByRole("button", { name: /Стоп/ }).click();
+  await expect(preview.locator(".pv-runtime")).toHaveCount(0);
+});
+
+test("Live preview — harness event opens the split and exposes agent inspection evidence", async ({ page }) => {
+  await boot(page);
+  const composer = page.locator(".composer textarea");
+  await composer.fill("[mock-preview] inspect the rendered UI");
+  await composer.press("Enter");
+  const preview = page.locator(".preview-pane");
+  await expect(preview).toBeVisible();
+  await expect(preview.locator(".pv-runtime.ready")).toHaveText("ready");
+  await expect(preview.locator(".pv-runtime.inspected")).toHaveText("agent checked");
+  await expect(page.locator(".topbar").getByRole("button", { name: /Превью · ready/ })).toBeVisible();
+  await expect(preview.locator("iframe[title=preview]")).toHaveAttribute("src", "http://localhost:1420");
+});
