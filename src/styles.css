@@ -555,7 +555,7 @@ html[data-effects="on"] .background-task-popover { background: color-mix(in srgb
 .chat { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .msg-scroll { flex: 1; overflow-y: auto; scroll-behavior: auto; }
 .msg-col { max-width: var(--content-w); margin: 0 auto; padding: 18px 24px 8px; }
-.virtual-message { max-width: var(--content-w); margin: 0 auto; padding: 0 24px; }
+.virtual-message { min-height: 1px; max-width: var(--content-w); margin: 0 auto; padding: 0 24px; }
 .virtual-footer { padding-bottom: 8px; }
 
 .msg { margin-bottom: 18px; animation: msg-in 0.22s ease both; }
@@ -1653,6 +1653,16 @@ html[data-effects="on"] .ss-card { backdrop-filter: blur(24px); -webkit-backdrop
 /* панель чата не схлопывается ниже пригодной ширины; превью при нехватке места
    ужимается (flex-shrink) вместо того, чтобы давить чат в кашу */
 .chat-pane { flex: 1 1 0; display: flex; flex-direction: column; min-height: 0; min-width: 360px; position: relative; }
+.attachment-drop-overlay {
+  position: absolute; inset: 10px; z-index: 90; display: grid; place-content: center; justify-items: center; gap: 6px;
+  border: 1.5px dashed color-mix(in srgb, var(--brand) 70%, var(--border)); border-radius: 14px;
+  color: var(--text); background: color-mix(in srgb, var(--bg-raised) 91%, transparent);
+  box-shadow: 0 18px 60px rgba(0,0,0,.28); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+  pointer-events: none;
+}
+.attachment-drop-overlay > span { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 12px; color: var(--brand); background: var(--brand-soft); }
+.attachment-drop-overlay strong { font-size: 13px; }
+.attachment-drop-overlay small { max-width: 360px; color: var(--text-dim); font-size: 10.5px; text-align: center; }
 .chat-vresize { width: 6px; flex-shrink: 0; cursor: col-resize; background: var(--border); transition: background 0.12s ease; }
 .chat-vresize:hover { background: var(--accent-soft); }
 .preview-col { flex: 0 1 auto; min-width: 300px; display: flex; }
@@ -1671,16 +1681,71 @@ html[data-effects="on"] .ss-card { backdrop-filter: blur(24px); -webkit-backdrop
 /* ввод пользователя показывается как набрано (не markdown) */
 .user-plain { white-space: pre-wrap; overflow-wrap: anywhere; }
 
+.attachment-tray { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 7px; margin: 7px 2px 4px; }
+.image-attachment-grid { display: flex; flex-wrap: wrap; gap: 7px; min-width: 0; }
+.image-attachment-grid.message { margin: 0 0 8px; }
+.msg.user .image-attachment-grid.message { justify-content: flex-end; }
+.msg.user .image-attachment-grid.message + .user-plain { margin-top: 2px; }
+.image-attachment-tile { position: relative; flex: 0 0 auto; }
+.image-attachment-preview {
+  position: relative; display: grid; place-items: center; overflow: hidden; padding: 0;
+  border: 1px solid color-mix(in srgb, var(--border) 88%, white 5%); border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-raised) 88%, black); box-shadow: inset 0 1px 0 rgba(255,255,255,.05);
+  transition: border-color var(--dur-1) ease, transform var(--dur-1) ease, box-shadow var(--dur-1) ease;
+}
+.image-attachment-grid.composer .image-attachment-preview { width: 62px; height: 62px; }
+.image-attachment-grid.message .image-attachment-preview { width: 112px; height: 112px; }
+.image-attachment-preview:hover, .image-attachment-preview:focus-visible {
+  border-color: color-mix(in srgb, var(--brand) 68%, var(--border)); transform: translateY(-1px);
+  box-shadow: 0 7px 18px rgba(0,0,0,.22);
+}
+.image-attachment-preview img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.image-attachment-name {
+  position: absolute; inset: auto 0 0; overflow: hidden; padding: 14px 6px 5px;
+  color: rgba(255,255,255,.92); background: linear-gradient(transparent, rgba(0,0,0,.76));
+  font-size: 9px; font-weight: 570; line-height: 1.2; opacity: 0; text-overflow: ellipsis; white-space: nowrap;
+  transition: opacity var(--dur-1) ease;
+}
+.image-attachment-preview:hover .image-attachment-name, .image-attachment-preview:focus-visible .image-attachment-name { opacity: 1; }
+.image-attachment-failed { display: grid; place-items: center; gap: 4px; padding: 6px; color: var(--text-dim); text-align: center; }
+.image-attachment-failed small { font-size: 8.5px; line-height: 1.15; }
+.image-attachment-remove {
+  position: absolute; top: -5px; right: -5px; z-index: 2; display: grid; place-items: center;
+  width: 19px; height: 19px; padding: 0 0 1px; border: 1px solid rgba(255,255,255,.22); border-radius: 50%;
+  color: rgba(255,255,255,.94); background: rgba(20,20,22,.9); box-shadow: 0 2px 8px rgba(0,0,0,.36);
+  font-size: 15px; line-height: 1;
+}
+.image-attachment-remove:hover { color: white; background: var(--danger); }
+.attachment-loading { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; color: var(--text-dim); font-size: 10.5px; }
+.attachment-loading .spinner { width: 11px; height: 11px; }
 .attachment-chip { max-width: min(260px, 100%); gap: 5px; }
-.attachment-chip > span, .attachment-open { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.attachment-open { display: inline-flex; align-items: center; gap: 5px; max-width: 220px; padding: 0; color: inherit; }
+.attachment-chip > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-chip > button:last-child { padding: 0 2px; color: var(--text-dim); }
 .attachment-mode { flex: 0 0 auto; padding: 1px 4px; border-radius: 5px; color: var(--text-dim); background: color-mix(in srgb, var(--bg) 65%, transparent); font-size: 8px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
-.context-file-row { flex-wrap: wrap; margin-top: 4px; }
-.attachment-lightbox { position: fixed; inset: 0; z-index: 1200; display: grid; place-items: center; padding: 46px; background: color-mix(in srgb, #000 78%, transparent); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }
-.attachment-lightbox img { max-width: min(92vw, 1400px); max-height: 82vh; border-radius: 14px; box-shadow: 0 30px 100px rgba(0,0,0,.65); }
-.attachment-lightbox > span { position: fixed; bottom: 18px; max-width: 80vw; overflow: hidden; color: rgba(255,255,255,.78); text-overflow: ellipsis; white-space: nowrap; }
-.attachment-lightbox-close { position: fixed; top: 18px; right: 20px; width: 36px; height: 36px; border: 1px solid rgba(255,255,255,.17); border-radius: 50%; color: white; background: rgba(255,255,255,.08); font-size: 22px; }
+.attachment-lightbox {
+  position: fixed; inset: 0; z-index: 1200; display: grid; grid-template-columns: 54px minmax(0, 1fr) 54px;
+  place-items: center; padding: 46px 24px 24px; background: color-mix(in srgb, #000 82%, transparent);
+  backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+}
+.attachment-lightbox figure { grid-column: 2; display: grid; justify-items: center; gap: 12px; max-width: 100%; max-height: 100%; margin: 0; }
+.attachment-lightbox figure img { display: block; max-width: min(84vw, 1400px); max-height: 78vh; border-radius: 14px; box-shadow: 0 30px 100px rgba(0,0,0,.65); object-fit: contain; }
+.attachment-lightbox figcaption { display: flex; align-items: center; justify-content: center; gap: 9px; max-width: min(84vw, 900px); color: rgba(255,255,255,.64); font-size: 11px; }
+.attachment-lightbox figcaption strong { overflow: hidden; color: rgba(255,255,255,.9); font-weight: 570; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-lightbox-close {
+  position: fixed; top: 18px; right: 20px; width: 36px; height: 36px; padding: 0 0 2px;
+  border: 1px solid rgba(255,255,255,.17); border-radius: 50%; color: white; background: rgba(255,255,255,.08);
+  font-size: 22px; line-height: 1;
+}
+.attachment-lightbox-close:hover, .attachment-lightbox-nav:hover { background: rgba(255,255,255,.16); }
+.attachment-lightbox-nav { width: 38px; height: 38px; padding: 0; border: 1px solid rgba(255,255,255,.14); border-radius: 50%; color: white; background: rgba(255,255,255,.07); }
+.attachment-lightbox-nav.previous { grid-column: 1; }
+.attachment-lightbox-nav.previous svg { transform: rotate(180deg); }
+.attachment-lightbox-nav.next { grid-column: 3; }
+@media (max-width: 700px) {
+  .image-attachment-grid.message .image-attachment-preview { width: 88px; height: 88px; }
+  .attachment-lightbox { grid-template-columns: 42px minmax(0, 1fr) 42px; padding-inline: 8px; }
+  .attachment-lightbox figcaption { flex-wrap: wrap; gap: 4px 8px; }
+}
 
 /* user-сообщение, отправленное расширением (pi-goal и т.п.), а не пользователем */
 .via-ext { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }

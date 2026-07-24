@@ -9,7 +9,7 @@ import {
 } from "../state/store";
 
 const catalog = [
-  { id: "qwen-local", provider: "ollama", contextWindow: 128_000, reasoning: true },
+  { id: "qwen-local", provider: "ollama", contextWindow: 128_000, reasoning: true, input: ["text", "image"] },
   { id: "claude-sonnet-4", provider: "anthropic", contextWindow: 200_000 },
 ];
 
@@ -33,6 +33,16 @@ describe("effectiveModel — выбор модели до старта аген�
   it("prefers the live agent model once it is running", () => {
     const live = ws({ agentState: { model: { id: "claude-sonnet-4", provider: "anthropic" } } });
     expect(effectiveModel(live, defaults())).toMatchObject({ id: "claude-sonnet-4" });
+  });
+
+  it("enriches an exact live model with catalog capabilities", () => {
+    const live = ws({ agentState: { model: { id: "qwen-local", provider: "ollama" } } });
+    expect(effectiveModel(live, defaults())).toMatchObject({ input: ["text", "image"] });
+  });
+
+  it("does not grant catalog capabilities to an unknown live model", () => {
+    const live = ws({ agentState: { model: { id: "custom-local", provider: "ollama" } } });
+    expect(effectiveModel(live, defaults())).toEqual({ id: "custom-local", provider: "ollama" });
   });
 
   it("shows the pre-spawn pick over the pi default", () => {

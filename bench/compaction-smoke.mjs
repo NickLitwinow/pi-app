@@ -20,6 +20,7 @@ function sha256(path) {
 }
 
 function walkJsonl(root) {
+	if (!existsSync(root)) return [];
 	const files = [];
 	for (const entry of readdirSync(root, { withFileTypes: true })) {
 		const path = join(root, entry.name);
@@ -38,11 +39,82 @@ function selectSourceSession() {
 		.sort((left, right) => right.size - left.size)[0]?.path;
 }
 
-const sourceSession = selectSourceSession();
-if (!sourceSession || !existsSync(sourceSession)) throw new Error("No uncompacted source session with at least three user turns was found");
+const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-compaction-smoke-")));
+
+function createSyntheticSourceSession(path) {
+	const model = "ThinkingCap-Qwen3.6-27B-oQ4e-M4Q-DWQ-MTP-Vision";
+	const baseTime = Date.parse("2026-07-24T00:00:00.000Z");
+	const entries = [{
+		type: "session",
+		version: 3,
+		id: "compaction-source-session",
+		timestamp: new Date(baseTime).toISOString(),
+		cwd: root,
+	}];
+	let parentId = null;
+	const append = (entry) => {
+		const id = `compaction-entry-${entries.length}`;
+		entries.push({
+			...entry,
+			id,
+			parentId,
+			timestamp: new Date(baseTime + entries.length * 1_000).toISOString(),
+		});
+		parentId = id;
+	};
+	append({ type: "model_change", provider: "ollama", modelId: model });
+	append({ type: "thinking_level_change", thinkingLevel: thinking });
+	for (let turn = 1; turn <= 4; turn++) {
+		const evidence = Array.from(
+			{ length: 220 },
+			(_, index) => `turn-${turn}-fact-${index}: objective=preserve-state constraint=offline changed=src/file-${turn}.ts gate=test-pass next=review.`,
+		).join(" ");
+		append({
+			type: "message",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: `Continue compaction fixture turn ${turn}. ${evidence}` }],
+				timestamp: baseTime + entries.length * 1_000,
+			},
+		});
+		append({
+			type: "message",
+			message: {
+				role: "assistant",
+				api: "openai-completions",
+				provider: "ollama",
+				model,
+				content: [{
+					type: "text",
+					text: `Completed fixture turn ${turn}. Decision D${turn} is retained. ${evidence}`,
+				}],
+				usage: {
+					input: 8_000,
+					output: 4_000,
+					cacheRead: 0,
+					cacheWrite: 0,
+					reasoning: 0,
+					totalTokens: 12_000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: baseTime + entries.length * 1_000,
+			},
+		});
+	}
+	writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+}
+
+let sourceSession = selectSourceSession();
+let sourceGenerated = false;
+if (!sourceSession) {
+	sourceSession = join(root, "synthetic-source-session.jsonl");
+	createSyntheticSourceSession(sourceSession);
+	sourceGenerated = true;
+}
+if (!existsSync(sourceSession)) throw new Error(`Compaction source session does not exist: ${sourceSession}`);
 const sourceHashBefore = sha256(sourceSession);
 
-const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-compaction-smoke-")));
 const agentRoot = join(root, ".pi", "agent");
 const sessionRoot = join(agentRoot, "sessions");
 const sessionFile = join(sessionRoot, "compaction-smoke.jsonl");
@@ -168,6 +240,7 @@ const result = {
 	exitCode,
 	sandbox: invocation.mode,
 	sourceSession,
+	sourceGenerated,
 	sourceUnchanged: sourceHashAfter === sourceHashBefore,
 	sourceHashBefore,
 	sourceHashAfter,

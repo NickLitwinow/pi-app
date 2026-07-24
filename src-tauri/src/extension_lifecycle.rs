@@ -341,8 +341,8 @@ fn package_roots(args: &[String], cwd: Option<&Path>, agent_root: &Path) -> Vec<
     if !local {
         roots.push(agent_root.to_path_buf());
     }
-    if (local || (update && cwd.is_some())) && cwd.is_some() {
-        roots.push(cwd.expect("checked").join(".pi"));
+    if let Some(cwd) = cwd.filter(|_| local || update) {
+        roots.push(cwd.join(".pi"));
     }
     roots
 }

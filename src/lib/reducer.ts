@@ -401,9 +401,26 @@ function finalizeMessage(chat: ChatState, msg: ChatMessage) {
     // помечаем viaExtension (бейдж в UI вместо маскировки под пользователя).
     const text = contentText(msg.content);
     const from = Math.max(0, chat.items.length - 6);
-    for (let i = chat.items.length - 1; i >= from; i--) {
+    const sameImages = (left: ChatMessage["content"], right: ChatMessage["content"]): boolean => {
+      const images = (content: ChatMessage["content"]) => Array.isArray(content)
+        ? content.filter((block) => block.type === "image")
+        : [];
+      const leftImages = images(left);
+      const rightImages = images(right);
+      return leftImages.length === rightImages.length && leftImages.every((block, index) => (
+        block.data === rightImages[index]?.data && block.mimeType === rightImages[index]?.mimeType
+      ));
+    };
+    // Pi echoes queued prompts in submission order. Matching FIFO keeps two
+    // image-only messages (both have empty text) from swapping their previews.
+    for (let i = from; i < chat.items.length; i++) {
       const it = chat.items[i];
-      if (it.optimistic && it.msg.role === "user" && contentText(it.msg.content) === text) {
+      if (
+        it.optimistic
+        && it.msg.role === "user"
+        && contentText(it.msg.content) === text
+        && sameImages(it.msg.content, msg.content)
+      ) {
         const items = [...chat.items];
         // The persisted/runtime echo is authoritative and includes image blocks.
         items[i] = { key: it.key, msg, optimistic: false };
@@ -411,7 +428,7 @@ function finalizeMessage(chat: ChatState, msg: ChatMessage) {
         return;
       }
     }
-    for (let i = chat.items.length - 1; i >= from; i--) {
+    for (let i = from; i < chat.items.length; i++) {
       const it = chat.items[i];
       if (it.optimistic && it.msg.role === "user") {
         const items = [...chat.items];
@@ -792,10 +809,20 @@ export function entriesToChatState(entries: Record<string, unknown>[]): ChatStat
 }
 
 /** Add an optimistic user message (used on send). */
-export function addUserMessage(chat: ChatState, text: string, images: Array<{ data: string; mimeType: string }> = []): ChatState {
+export function addUserMessage(
+  chat: ChatState,
+  text: string,
+  images: Array<{ data: string; mimeType: string; name?: string; sizeBytes?: number }> = [],
+): ChatState {
   const content = [
     { type: "text", text },
-    ...images.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType })),
+    ...images.map((image) => ({
+      type: "image",
+      data: image.data,
+      mimeType: image.mimeType,
+      ...(image.name ? { name: image.name } : {}),
+      ...(image.sizeBytes != null ? { sizeBytes: image.sizeBytes } : {}),
+    })),
   ];
   chat.items = [
     ...chat.items,

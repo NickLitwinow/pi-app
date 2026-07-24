@@ -138,6 +138,9 @@ export interface ComposerAttachment {
   data: string;
   mimeType: string;
   name: string;
+  /** Original decoded byte size when known. Persisted with the Pi image block
+   * so rewind/history can present useful metadata without decoding base64. */
+  sizeBytes?: number;
 }
 
 export type WorkflowStepStatus = "pending" | "running" | "waiting" | "passed" | "failed" | "skipped";

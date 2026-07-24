@@ -20,6 +20,7 @@ import {
   type SessionMeta,
   type SessionStats,
 } from "../lib/types";
+import { imageAttachmentsFromContent, imageBlocksForRpc } from "../lib/attachments";
 
 export type View = "chat" | "review" | "library" | "settings";
 
@@ -45,6 +46,9 @@ export type AgentMode = "ask" | "accept-edits" | "plan" | "auto" | "bypass";
 
 export interface WorkspaceChat {
   chat: ChatState;
+  /** Stable identity for an unsaved session. Store updates replace `chat`, so
+   * component-local drafts must never use that object as their identity. */
+  draftScope: object;
   agentId: string | null;
   alive: boolean;
   agentState: AgentState | null;
@@ -106,6 +110,7 @@ export function workspaceHasActiveWork(ws: WorkspaceChat): boolean {
 export function emptyWorkspaceChat(): WorkspaceChat {
   return {
     chat: emptyChatState(),
+    draftScope: {},
     agentId: null,
     alive: false,
     agentState: null,
@@ -139,11 +144,23 @@ export function emptyPiDefaults(): PiDefaults {
 
 /** Модель, которую покажет UI для workspace: живая → выбранная до старта → дефолт pi. */
 export function effectiveModel(ws: WorkspaceChat, defaults: PiDefaults): ModelInfo | null {
-  if (ws.agentState?.model) return ws.agentState.model;
+  const findKnown = (id: string, provider: string) => (
+    ws.models.find((model) => model.id === id && model.provider === provider)
+    ?? defaults.catalog.find((model) => model.id === id && model.provider === provider)
+  );
+  if (ws.agentState?.model) {
+    const live = ws.agentState.model;
+    const known = findKnown(live.id, live.provider);
+    if (!known) return live;
+    const merged = { ...known, ...live };
+    // get_state may identify the model without repeating its capabilities.
+    // Enrich only an exact provider/id match; an unlisted custom model remains
+    // capability-unknown and therefore cannot silently become vision-enabled.
+    if (live.input == null && known.input != null) merged.input = known.input;
+    return merged;
+  }
   if (ws.pendingModel) {
-    const known = defaults.catalog.find(
-      (m) => m.id === ws.pendingModel!.id && m.provider === ws.pendingModel!.provider,
-    );
+    const known = findKnown(ws.pendingModel.id, ws.pendingModel.provider);
     return known ?? { id: ws.pendingModel.id, provider: ws.pendingModel.provider };
   }
   if (defaults.model) {
@@ -758,9 +775,9 @@ export async function loadModelsAndCommands(cwd: string): Promise<void> {
 
 // ---------- chat actions ----------
 
-export async function sendPrompt(cwd: string, text: string, images?: { data: string; mimeType: string }[]): Promise<void> {
+export async function sendPrompt(cwd: string, text: string, images?: ComposerAttachment[]): Promise<void> {
   const trimmed = text.trim();
-  if (!trimmed) return;
+  if (!trimmed && !images?.length) return;
 
   // отправка в просматриваемую сессию, отличную от той, где занят агент
   const before = getChat(cwd);
@@ -784,19 +801,22 @@ export async function sendPrompt(cwd: string, text: string, images?: { data: str
     const checkpoint = await makeCheckpoint(cwd, "turn");
     updateChat(cwd, (w) => ({ ...w, pendingCheckpoint: checkpoint }));
     const cmd: Record<string, unknown> = { type: "prompt", message: trimmed };
-    if (images?.length) cmd.images = images.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType }));
+    const payloadImages = imageBlocksForRpc(images);
+    if (payloadImages) cmd.images = payloadImages;
     await rpcSend(cwd, cmd);
   } else {
     updateChat(cwd, (w) => ({ ...w, chat: addUserMessage({ ...w.chat }, trimmed, images) }));
-    await rpcSend(cwd, { type: "steer", message: trimmed });
+    const payloadImages = imageBlocksForRpc(images);
+    await rpcSend(cwd, { type: "steer", message: trimmed, ...(payloadImages ? { images: payloadImages } : {}) });
   }
 }
 
-export async function sendFollowUp(cwd: string, text: string): Promise<void> {
+export async function sendFollowUp(cwd: string, text: string, images?: ComposerAttachment[]): Promise<void> {
   const trimmed = text.trim();
-  if (!trimmed) return;
-  updateChat(cwd, (w) => ({ ...w, chat: addUserMessage({ ...w.chat }, trimmed) }));
-  await rpcSend(cwd, { type: "follow_up", message: trimmed });
+  if (!trimmed && !images?.length) return;
+  updateChat(cwd, (w) => ({ ...w, chat: addUserMessage({ ...w.chat }, trimmed, images) }));
+  const payloadImages = imageBlocksForRpc(images);
+  await rpcSend(cwd, { type: "follow_up", message: trimmed, ...(payloadImages ? { images: payloadImages } : {}) });
 }
 
 export async function abortAgent(cwd: string): Promise<void> {
@@ -883,10 +903,10 @@ export async function newSession(cwd: string): Promise<void> {
   discardQueuedEvents(cwd);
   if (ws.alive && ws.agentId) {
     await rpcRequest(cwd, { type: "new_session" }).catch(() => {});
-    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, checkpoints: [], pendingCheckpoint: null, stats: null }));
+    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), draftScope: {}, sessionPath: null, liveSessionPath: null, checkpoints: [], pendingCheckpoint: null, stats: null }));
     await refreshAgentMeta(cwd);
   } else {
-    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, checkpoints: [], pendingCheckpoint: null, stats: null }));
+    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), draftScope: {}, sessionPath: null, liveSessionPath: null, checkpoints: [], pendingCheckpoint: null, stats: null }));
     await ensureAgent(cwd, null);
   }
   void loadModelsAndCommands(cwd);
@@ -918,6 +938,7 @@ export async function closeCurrentSession(cwd: string): Promise<void> {
   updateChat(cwd, (w) => ({
     ...w,
     chat: emptyChatState(),
+    draftScope: {},
     sessionPath: null,
     liveSessionPath: null,
     liveStreaming: false,
@@ -1259,7 +1280,7 @@ export async function deleteSessionAction(cwd: string, path: string): Promise<vo
       agentToCwd.delete(ws.agentId);
     }
     discardQueuedEvents(cwd);
-    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), sessionPath: null, liveSessionPath: null, liveStreaming: false, agentId: null, alive: false, checkpoints: [], pendingCheckpoint: null, stats: null }));
+    updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), draftScope: {}, sessionPath: null, liveSessionPath: null, liveStreaming: false, agentId: null, alive: false, checkpoints: [], pendingCheckpoint: null, stats: null }));
   }
   await be.invoke("delete_session", { path });
   // подчистить флаги
@@ -1391,13 +1412,7 @@ function pickForkEntry(
  * no longer the active conversation. The selected prompt goes to the composer
  * for editing and re-submission. Rewind never creates another session. */
 function messageAttachments(msg: ChatMessage): ComposerAttachment[] {
-  if (!Array.isArray(msg.content)) return [];
-  let index = 0;
-  return msg.content.flatMap((block) => {
-    if (block.type !== "image" || typeof block.data !== "string" || typeof block.mimeType !== "string") return [];
-    index++;
-    return [{ data: block.data, mimeType: block.mimeType, name: `attachment-${index}.${block.mimeType.split("/")[1] ?? "image"}` }];
-  });
+  return imageAttachmentsFromContent(msg.content);
 }
 
 async function waitForAgentIdle(cwd: string, timeoutMs = 20_000): Promise<void> {

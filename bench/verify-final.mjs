@@ -281,6 +281,11 @@ function reusableCompaction(stage, record) {
 	if (stage.id !== "live-compaction" || record?.status !== "passed" || record.model !== model || !record.log) return null;
 	if (record.inputFingerprint && record.inputFingerprint !== stage.inputFingerprint) return null;
 	const result = readJson(record.log);
+	const sourceStillInspectable = result?.sourceGenerated === true || (
+		result?.sourceSession
+		&& existsSync(result.sourceSession)
+		&& createHash("sha256").update(readFileSync(result.sourceSession)).digest("hex") === result.sourceHashAfter
+	);
 	if (!result
 		|| result.passed !== true
 		|| result.mode !== "full-compaction"
@@ -288,10 +293,10 @@ function reusableCompaction(stage, record) {
 		|| result.exitCode !== 0
 		|| result.sourceUnchanged !== true
 		|| !result.sourceSession
-		|| !existsSync(result.sourceSession)
+		|| (result.sourceGenerated !== true && !existsSync(result.sourceSession))
 		|| !result.sourceHashBefore
 		|| result.sourceHashBefore !== result.sourceHashAfter
-		|| createHash("sha256").update(readFileSync(result.sourceSession)).digest("hex") !== result.sourceHashAfter
+		|| !sourceStillInspectable
 		|| !(Number(result.tokensBefore) > 0)
 		|| !result.firstKeptEntryId
 		|| !(Number(result.estimatedTokensAfter) > 0)
@@ -464,6 +469,9 @@ async function runStage(stage) {
 	if (reusable) {
 		state.stages[stage.id] = {
 			...existingRecord,
+			status: "passed",
+			exitCode: 0,
+			error: null,
 			sourceFingerprint,
 			model,
 			inputFingerprint: reusable.inputFingerprint ?? existingRecord.inputFingerprint ?? null,

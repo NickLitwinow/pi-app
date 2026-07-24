@@ -63,7 +63,15 @@ function latestWorkflow(path) {
 
 function harnessHash() {
 	const hash = createHash("sha256");
-	for (const file of ["index.ts", "policy.ts", "workflow.ts", "workspace.ts"]) hash.update(readFileSync(join(repoRoot, "harness-extension", file)));
+	for (const file of [
+		"index.ts",
+		"policy.ts",
+		"semantic-router.ts",
+		"semantic-router-policy.ts",
+		"workflow.ts",
+		"workspace.ts",
+		"tasks.ts",
+	]) hash.update(readFileSync(join(repoRoot, "harness-extension", file)));
 	return hash.digest("hex");
 }
 

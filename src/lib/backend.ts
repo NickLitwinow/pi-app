@@ -54,7 +54,8 @@ class MockBackend implements Backend {
   private agentSeq = 1;
   private uiSeq = 1;
   private pendingUi = new Map<string, (resp: Record<string, unknown>) => void>();
-  private steerQueue: string[] = [];
+  private steerQueue: { text: string; images: Record<string, unknown>[] }[] = [];
+  private followUpQueue: { text: string; images: Record<string, unknown>[] }[] = [];
   private flags: Record<string, unknown> = { pinned: [], archived: [], groups: [], groupOf: {}, pinnedMessages: {}, hiddenProjects: [] };
   private deleted = new Set<string>();
   private renamed = new Map<string, string>();
@@ -103,7 +104,7 @@ class MockBackend implements Backend {
           baseUrl: "http://127.0.0.1:8099/v1",
           api: "openai-completions",
           models: [
-            { id: "qwen-local", reasoning: true, contextWindow: 128000, maxTokens: 16384 },
+            { id: "qwen-local", reasoning: true, input: ["text", "image"], contextWindow: 128000, maxTokens: 16384 },
             { id: "qwen-coder-30b", reasoning: false, contextWindow: 262144, maxTokens: 16384 },
           ],
         },
@@ -391,12 +392,15 @@ class MockBackend implements Backend {
     // обработать steer, если пользователь вмешался во время рана
     if (this.steerQueue.length > 0) {
       const steer = this.steerQueue.splice(0);
-      this.emitAgent(agentId, { type: "queue_update", steering: [], followUp: [] });
-      for (const s of steer) {
-        this.emitAgent(agentId, { type: "message_end", message: { role: "user", content: [{ type: "text", text: s }] } });
+      this.emitAgent(agentId, { type: "queue_update", steering: [], followUp: this.followUpQueue.map((item) => item.text) });
+      for (const item of steer) {
+        this.emitAgent(agentId, {
+          type: "message_end",
+          message: { role: "user", content: [{ type: "text", text: item.text }, ...item.images] },
+        });
       }
       this.emitAgent(agentId, { type: "message_start" });
-      const ack = `Принял поправку: «${steer[steer.length - 1].slice(0, 80)}» — учитываю.`;
+      const ack = `Принял поправку: «${steer[steer.length - 1].text.slice(0, 80)}» — учитываю.`;
       for (const ch of chunks(ack, 14)) {
         this.emitAgent(agentId, { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: ch, partial: { role: "assistant", content: [{ type: "text", text: ack }] } } });
         await sleep(30);
@@ -433,6 +437,40 @@ class MockBackend implements Backend {
       },
     });
     this.emitAgent(agentId, { type: "turn_end" });
+
+    // Pi drains follow_up only after the current turn. Keep the mock lifecycle
+    // honest so queued image blocks are echoed from the same payload rather
+    // than appearing to succeed only because the UI added an optimistic row.
+    const followUps = this.followUpQueue.splice(0);
+    if (followUps.length > 0) {
+      this.emitAgent(agentId, {
+        type: "queue_update",
+        steering: this.steerQueue.map((item) => item.text),
+        followUp: [],
+      });
+      for (const item of followUps) {
+        this.emitAgent(agentId, { type: "turn_start" });
+        this.emitAgent(agentId, {
+          type: "message_end",
+          message: { role: "user", content: [{ type: "text", text: item.text }, ...item.images] },
+        });
+        const summary = item.text.trim()
+          ? `Выполняю следующий запрос: «${item.text.slice(0, 80)}».`
+          : `Выполняю следующий запрос с изображениями (${item.images.length}).`;
+        this.emitAgent(agentId, { type: "message_start" });
+        this.emitAgent(agentId, {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: summary }],
+            model: "qwen-local",
+            provider: "ollama",
+          },
+        });
+        this.emitAgent(agentId, { type: "turn_end" });
+      }
+    }
+
     this.emitAgent(agentId, { type: "agent_end" });
     this.emitAgent(agentId, { type: "extension_ui_request", method: "notify", notificationType: "success", message: "Ран завершён" });
   }
@@ -817,8 +855,25 @@ class MockBackend implements Backend {
             void this.runScript(agentId, prompt);
           }
         } else if (line.type === "steer") {
-          this.steerQueue.push(String(line.message ?? ""));
-          this.emitAgent(agentId, { type: "queue_update", steering: [...this.steerQueue], followUp: [] });
+          this.steerQueue.push({
+            text: String(line.message ?? ""),
+            images: Array.isArray(line.images) ? line.images as Record<string, unknown>[] : [],
+          });
+          this.emitAgent(agentId, {
+            type: "queue_update",
+            steering: this.steerQueue.map((item) => item.text),
+            followUp: this.followUpQueue.map((item) => item.text),
+          });
+        } else if (line.type === "follow_up") {
+          this.followUpQueue.push({
+            text: String(line.message ?? ""),
+            images: Array.isArray(line.images) ? line.images as Record<string, unknown>[] : [],
+          });
+          this.emitAgent(agentId, {
+            type: "queue_update",
+            steering: this.steerQueue.map((item) => item.text),
+            followUp: this.followUpQueue.map((item) => item.text),
+          });
         } else if (line.type === "extension_ui_response") {
           this.pendingUi.get(String(line.id))?.(line as Record<string, unknown>);
         } else if (line.type === "switch_session" && line.id) {
@@ -980,7 +1035,7 @@ class MockBackend implements Backend {
       case "read_permission_mode":
         return (this.permMode ?? null) as T;
       case "read_file_base64":
-        return { data: "iVBORw0KGgo=", mimeType: "image/png" } as T;
+        return { data: "iVBORw0KGgo=", mimeType: "image/png", sizeBytes: 8 } as T;
       case "git_checkpoint":
         return "abc1234" as T;
       case "git_status":

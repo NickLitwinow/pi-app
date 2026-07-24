@@ -2,6 +2,7 @@ import { createContext, memo, useContext, useEffect, useMemo, useState, type Rea
 import { getBackend } from "../lib/backend";
 import { confirmDialog, messageDialog } from "../lib/dialog";
 import { pluralRu } from "../lib/i18n";
+import { imageAttachmentsFromContent } from "../lib/attachments";
 import { stripAnsi } from "../lib/markdown";
 import { modelAliasKey, modelIdDisplayName } from "../lib/models";
 import { contentText } from "../lib/reducer";
@@ -37,6 +38,7 @@ import {
   WarnIcon,
 } from "./icons";
 import { Markdown } from "./Markdown";
+import ImageAttachments from "./ImageAttachments";
 
 // ---------- expand state shared across virtual scrolling ----------
 
@@ -643,6 +645,7 @@ const MessageViewImpl = function MessageView({
 }) {
   const pinId = useMemo(() => msgPinId(msg), [msg]);
   const aliases = useStore((s) => s.appConfig.modelAliases ?? {});
+  const imageAttachments = useMemo(() => imageAttachmentsFromContent(msg.content), [msg.content]);
 
   if (msg.role === "user") {
     if (workflowContinuationMeta(msg, viaExtension)) {
@@ -655,9 +658,10 @@ const MessageViewImpl = function MessageView({
         )}
         <div className="bubble">
           {viaExtension && <div className="via-ext">⚙ отправлено расширением</div>}
+          <ImageAttachments attachments={imageAttachments} variant="message" />
           {/* ввод пользователя — плоский текст, НЕ markdown: «# заметка» не должна
               превращаться в заголовок (паритет с Claude Code) */}
-          <div className="user-plain">{contentText(msg.content)}</div>
+          {contentText(msg.content) && <div className="user-plain">{contentText(msg.content)}</div>}
         </div>
       </div>
     );
@@ -693,6 +697,7 @@ const MessageViewImpl = function MessageView({
 
   const hasVisibleContent =
     Boolean(fullText.trim()) ||
+    imageAttachments.length > 0 ||
     hasToolCalls ||
     blocks.some((b) => b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim());
 
@@ -708,12 +713,13 @@ const MessageViewImpl = function MessageView({
           <span>{modelName}</span>
         </div>
       )}
-      {!streaming && fullText.trim() && (
+      {!streaming && (fullText.trim() || imageAttachments.length > 0) && (
         <div className="msg-tools">
           {cwd != null && <PinMessageButton cwd={cwd} msg={msg} />}
-          <CopyMessageButton text={stripAnsi(fullText)} />
+          {fullText.trim() && <CopyMessageButton text={stripAnsi(fullText)} />}
         </div>
       )}
+      <ImageAttachments attachments={imageAttachments} variant="message" />
       {displayBlocks.map((b, i) => {
         if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim()) {
           // в "answer" мысли уже в свёрнутой сводке хода

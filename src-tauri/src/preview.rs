@@ -159,7 +159,7 @@ fn launch_json_path(cwd: &str) -> PathBuf {
 }
 
 fn configured_preview_configs(cwd: &str) -> Vec<LaunchConfig> {
-    let Ok(text) = std::fs::read_to_string(launch_json_path(&cwd)) else {
+    let Ok(text) = std::fs::read_to_string(launch_json_path(cwd)) else {
         return Vec::new();
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
@@ -189,16 +189,12 @@ fn script_port(script: &str, fallback: u16) -> u16 {
             }
         }
         if matches!(cleaned, "--port" | "-p" | "http.server") {
-            if let Some(value) = tokens
-                .get(index + 1)
-                .map(|value| {
-                    value
-                        .trim_matches(|c: char| !c.is_ascii_digit())
-                        .parse::<u16>()
-                        .ok()
-                })
-                .flatten()
-            {
+            if let Some(value) = tokens.get(index + 1).and_then(|value| {
+                value
+                    .trim_matches(|c: char| !c.is_ascii_digit())
+                    .parse::<u16>()
+                    .ok()
+            }) {
                 if value > 0 {
                     return value;
                 }
@@ -447,12 +443,9 @@ pub async fn preview_status(
     let Some(mut status) = status_snapshot(&cwd, server_id.as_deref()) else {
         return Ok(None);
     };
-    match crate::pi_cli::probe_url(status.url.clone()).await {
-        Ok(code) => {
-            status.ready = true;
-            status.http_status = Some(code);
-        }
-        Err(_) => {}
+    if let Ok(code) = crate::pi_cli::probe_url(status.url.clone()).await {
+        status.ready = true;
+        status.http_status = Some(code);
     }
     Ok(Some(status))
 }
@@ -676,8 +669,7 @@ fn local_url_from_output(line: &str) -> Option<(String, u16)> {
             let end = candidate
                 .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
                 .unwrap_or(candidate.len());
-            let candidate = candidate[..end]
-                .trim_end_matches(|c: char| matches!(c, '/' | ',' | ';' | ')' | ']' | '.'));
+            let candidate = candidate[..end].trim_end_matches(['/', ',', ';', ')', ']', '.']);
             let authority = candidate
                 .strip_prefix(scheme)
                 .and_then(|value| value.split('/').next())

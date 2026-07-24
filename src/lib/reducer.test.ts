@@ -151,6 +151,25 @@ describe("applyAgentEvent — streaming lifecycle", () => {
     expect(chat.items.every((it) => !it.optimistic && !it.viaExtension)).toBe(true);
   });
 
+  it("reconciles consecutive image-only echoes in FIFO order", () => {
+    let chat = addUserMessage(emptyChatState(), "", [{ data: "first", mimeType: "image/png" }]);
+    chat = addUserMessage(chat, "", [{ data: "second", mimeType: "image/png" }]);
+    for (const data of ["first", "second"]) {
+      chat = applyAgentEvent({ ...chat }, {
+        type: "message_end",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "" }, { type: "image", data, mimeType: "image/png" }],
+        },
+      });
+    }
+    const imageData = chat.items.map((item) => (
+      Array.isArray(item.msg.content) ? item.msg.content.find((block) => block.type === "image")?.data : undefined
+    ));
+    expect(imageData).toEqual(["first", "second"]);
+    expect(chat.items.every((item) => !item.optimistic)).toBe(true);
+  });
+
   it("extension-rewritten echo replaces the pending optimistic item (pi-goal scenario)", () => {
     let chat = emptyChatState();
     chat = addUserMessage({ ...chat }, "/goal ship the feature");

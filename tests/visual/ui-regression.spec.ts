@@ -331,6 +331,104 @@ test("Same-session rewind restores text and image, then resends without creating
   await page.getByRole("button", { name: "Заблокировать" }).click();
 });
 
+test("Image attachment is a square preview in composer and the sent chat message", async ({ page }) => {
+  await boot(page);
+  await expect(page.getByRole("button", { name: "Прикрепить файлы или изображения" })).toBeEnabled();
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nUwAAAAASUVORK5CYII=",
+    "base64",
+  );
+  await page.locator(".composer input[type=file]").setInputFiles({
+    name: "reference.png",
+    mimeType: "image/png",
+    buffer: png,
+  });
+
+  const composerTile = page.locator(".composer .image-attachment-preview");
+  await expect(composerTile).toBeVisible();
+  const box = await composerTile.boundingBox();
+  expect(box).not.toBeNull();
+  expect(Math.abs((box?.width ?? 0) - (box?.height ?? 1))).toBeLessThanOrEqual(1);
+
+  const send = page.getByTitle(/^Отправить/);
+  await expect(send).toBeEnabled();
+  await send.click();
+  await expect(composerTile).toHaveCount(0);
+
+  const sent = page.locator(".msg.user").last();
+  const sentPreview = sent.getByRole("button", { name: "Открыть preview изображения reference.png" });
+  await expect(sentPreview).toBeVisible();
+  await sentPreview.click();
+  const dialog = page.getByRole("dialog", { name: "Preview изображения reference.png" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("reference.png");
+  await expect(dialog).toContainText("image/png");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(sentPreview).toBeFocused();
+
+  const deny = page.getByRole("button", { name: "Заблокировать" });
+  if (await deny.isVisible({ timeout: 3_000 }).catch(() => false)) await deny.click();
+});
+
+test("Image draft survives screen switches but stays isolated by session", async ({ page }) => {
+  await boot(page);
+  await page.getByRole("button", { name: "Открыть сессию «Fix supervisor race»" }).click();
+  await expect(page.getByRole("button", { name: "Прикрепить файлы или изображения" })).toBeEnabled();
+  const input = page.locator(".composer input[type=file]");
+  await input.setInputFiles({
+    name: "session-draft.png",
+    mimeType: "image/png",
+    buffer: Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nUwAAAAASUVORK5CYII=",
+      "base64",
+    ),
+  });
+  await expect(page.locator(".composer .image-attachment-preview")).toHaveCount(1);
+
+  await page.getByRole("button", { name: "Настройки" }).click();
+  await page.getByRole("button", { name: "Чат" }).click();
+  await expect(page.locator(".composer img[alt='session-draft.png']")).toBeVisible();
+
+  await page.getByRole("button", { name: "Открыть сессию «Rewind transaction»" }).click();
+  await expect(page.locator(".composer .image-attachment-preview")).toHaveCount(0);
+  await page.getByRole("button", { name: "Открыть сессию «Fix supervisor race»" }).click();
+  await expect(page.locator(".composer img[alt='session-draft.png']")).toBeVisible();
+});
+
+test("Persisted Pi image blocks render in history instead of disappearing", async ({ page }) => {
+  await boot(page);
+  await page.locator(".sess-row", { hasText: "Rewind transaction" }).click();
+  const message = page.locator(".msg.user").filter({ hasText: "Второй запрос с изображением" });
+  await expect(message).toBeVisible();
+  await expect(message.getByRole("button", { name: "Открыть preview изображения attachment-1.png" })).toBeVisible();
+  await expect(message.locator("img[alt='attachment-1.png']")).toHaveAttribute("src", /^data:image\/png;base64,/);
+  await expect(message.locator(".bubble")).toHaveScreenshot("persisted-image-message.png");
+});
+
+test("Pi image privacy policy is editable and enforced by the composer", async ({ page }) => {
+  await boot(page);
+  await page.getByRole("button", { name: "Настройки" }).click();
+  await page.getByRole("button", { name: /^Основные/ }).click();
+  const blockImages = page.getByRole("switch", { name: "Не отправлять изображения провайдерам" });
+  await expect(blockImages).toHaveAttribute("aria-checked", "false");
+  await blockImages.click();
+  await expect(blockImages).toHaveAttribute("aria-checked", "true");
+
+  await page.getByRole("button", { name: "Чат" }).click();
+  await expect(page.getByRole("button", { name: "Прикрепить файлы или изображения" })).toHaveAttribute(
+    "title",
+    /Изображения заблокированы/,
+  );
+  await page.locator(".composer input[type=file]").setInputFiles({
+    name: "private.png",
+    mimeType: "image/png",
+    buffer: Buffer.from("iVBORw0KGgo=", "base64"),
+  });
+  await expect(page.locator(".composer .image-attachment-preview")).toHaveCount(0);
+  await expect(page.getByText("Изображения отключены в Settings → Основные → Изображения", { exact: true })).toBeVisible();
+});
+
 test("Live turn shows the process, then folds it into Worked for (Codex flow)", async ({ page }) => {
   await boot(page);
   const composer = page.locator(".composer textarea");

@@ -367,6 +367,7 @@ function RawJsonEditor({
 
 type PiSettings = Record<string, unknown> & {
   compaction?: { enabled?: boolean; reserveTokens?: number; keepRecentTokens?: number };
+  images?: { autoResize?: boolean; blockImages?: boolean; [key: string]: unknown };
   packages?: string[];
 };
 
@@ -424,6 +425,7 @@ function GeneralTab() {
   const [parsed, update, reload, saveError] = useSettingsJson();
   const [modelCatalog, setModelCatalog] = useState<ModelCatalog>({});
   const compaction = parsed?.compaction ?? {};
+  const images = parsed?.images ?? {};
   const compactionEnabled = compaction.enabled !== false;
   const prov = String(parsed?.defaultProvider ?? "");
   const model = String(parsed?.defaultModel ?? "");
@@ -501,6 +503,29 @@ function GeneralTab() {
                 <option key={themeName} value={themeName}>{themeName}</option>
               ))}
             </select>
+          </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Изображения" description="Единая политика Pi для composer, read tool и провайдеров">
+          <div className="form-row">
+            <label>Авто-уменьшение <small>До 2000×2000 перед отправкой провайдеру</small></label>
+            <GlassSwitch
+              label="Автоматически уменьшать большие изображения"
+              checked={images.autoResize !== false}
+              onChange={(autoResize) => void update({ images: { ...images, autoResize } })}
+            />
+          </div>
+          <div className="form-row">
+            <label>Блокировать изображения <small>Ни composer, ни read tool не передадут пиксели модели</small></label>
+            <GlassSwitch
+              label="Не отправлять изображения провайдерам"
+              checked={images.blockImages === true}
+              onChange={(blockImages) => void update({ images: { ...images, blockImages } })}
+            />
+          </div>
+          <div className="hint">
+            Поддерживаются PNG, JPEG, GIF и WebP до 10 МБ. При блокировке или text-only модели локальный
+            drag &amp; drop сохраняет файл как явный path-контекст вместо скрытой отправки base64.
           </div>
           </SettingsGroup>
 

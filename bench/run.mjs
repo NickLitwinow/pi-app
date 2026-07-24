@@ -146,7 +146,15 @@ function provenance() {
 	const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 	const modelConfigText = readOptional(join(agentDir, "models.json"));
 	const settingsText = readOptional(join(agentDir, "settings.json"));
-	const harnessText = ["index.ts", "policy.ts", "workflow.ts", "workspace.ts"].map((file) => readOptional(join(repoRoot, "harness-extension", file))).join("\n---\n");
+	const harnessText = [
+		"index.ts",
+		"policy.ts",
+		"semantic-router.ts",
+		"semantic-router-policy.ts",
+		"workflow.ts",
+		"workspace.ts",
+		"tasks.ts",
+	].map((file) => readOptional(join(repoRoot, "harness-extension", file))).join("\n---\n");
 	const benchmarkText = ["run.mjs", "verify-final.mjs", "fixture-git.mjs", "task-verifiers.mjs", "regrade-report.mjs", "resume-workflow.mjs", "workflow-recovery.mjs", "workflow-resume-smoke.mjs", "schedule.mjs", "skill-resource.mjs", "macos-sandbox.mjs", "long-tasks.mjs", "advanced-tasks.mjs"]
 		.map((file) => readOptional(join(benchDir, file))).join("\n---\n");
 	let serverModels = null;

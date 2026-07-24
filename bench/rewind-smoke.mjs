@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { copyFileSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { spawn } from "node:child_process";
@@ -18,10 +18,15 @@ if (!header?.cwd || sourceUsers.length < 2) throw new Error("session must contai
 
 const dir = mkdtempSync(join(tmpdir(), "pi-rewind-smoke-"));
 const copy = join(dir, basename(source));
-copyFileSync(source, copy);
+// Never run rewind controls in the historical session's real workspace. It
+// may no longer exist (Node misleadingly reports that as `spawn pi ENOENT`),
+// and a smoke test must not be able to touch a still-existing user checkout.
+writeFileSync(copy, `${entries.map((entry) => JSON.stringify(
+  entry === header ? { ...entry, cwd: dir } : entry,
+)).join("\n")}\n`);
 
 const child = spawn("pi", ["--mode", "rpc", "--session", copy, "--offline", "-a"], {
-  cwd: header.cwd,
+  cwd: dir,
   stdio: ["pipe", "pipe", "pipe"],
 });
 const pending = new Map();

@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { getBackend } from "../lib/backend";
+import {
+  attachmentValidationError,
+  detectedImageMimeType,
+  imageMimeTypeForFile,
+  isSupportedImageMimeType,
+  MAX_IMAGE_ATTACHMENTS,
+  MAX_TOTAL_IMAGE_ATTACHMENT_BYTES,
+  mergeImageAttachments,
+  type MergeAttachmentResult,
+} from "../lib/attachments";
 import { confirmDialog, messageDialog } from "../lib/dialog";
 import { stripAnsi } from "../lib/markdown";
 import { contentText } from "../lib/reducer";
@@ -44,7 +54,8 @@ import { buildTranscript } from "../lib/transcript";
 import StartScreen from "./StartScreen";
 import PreviewPane from "./PreviewView";
 import { ModelAvatar, ModelAvatarPicker } from "./AgentAvatar";
-import { ChevronIcon, EditIcon, ImageIcon, MinusIcon, ModelIcon, PaperclipIcon, PinIcon, PlusIcon, PreviewIcon, SendIcon, ShieldIcon, SteerIcon, StopIcon, TasksIcon } from "./icons";
+import ImageAttachments from "./ImageAttachments";
+import { ChevronIcon, EditIcon, MinusIcon, ModelIcon, PaperclipIcon, PinIcon, PlusIcon, PreviewIcon, SendIcon, ShieldIcon, SteerIcon, StopIcon, TasksIcon } from "./icons";
 
 // ---------- agent mode selector ----------
 
@@ -185,6 +196,7 @@ function ModeSelector({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
 function GitBar({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const [sum, setSum] = useState<GitSummary | null>(null);
   const [prOpen, setPrOpen] = useState(false);
+  const mountedCwdRef = useRef<string | null>(null);
   const streaming = ws.chat.isStreaming;
 
   const refresh = useCallback(async () => {
@@ -194,8 +206,13 @@ function GitBar({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   }, [cwd]);
 
   useEffect(() => {
-    if (!streaming) void refresh();
-  }, [refresh, streaming]);
+    const cwdChanged = mountedCwdRef.current !== cwd;
+    mountedCwdRef.current = cwd;
+    // A Composer can mount while the agent is already streaming (workspace
+    // switch / screen return). It still needs one authoritative Git snapshot;
+    // after that, avoid polling churn until the run finishes.
+    if (cwdChanged || !streaming) void refresh();
+  }, [cwd, refresh, streaming]);
 
   if (!sum?.isRepo || (sum.insertions === 0 && sum.deletions === 0)) return null;
 
@@ -544,6 +561,69 @@ function ExtensionUIDock({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
 
 type Attachment = ComposerAttachment;
 
+interface ComposerDraft {
+  text: string;
+  attachments: Attachment[];
+  contextFiles: string[];
+}
+
+// ChatView is intentionally unmounted on Settings/Library/Review. Drafts stay
+// isolated by session in memory so screen switching neither loses work nor
+// leaks an image from one project/session into another composer.
+const sessionComposerDrafts = new Map<string, ComposerDraft>();
+const unsavedComposerDrafts = new WeakMap<object, ComposerDraft>();
+const unsavedDraftIds = new WeakMap<object, number>();
+let unsavedDraftSequence = 0;
+
+function composerComponentKey(cwd: string, ws: WorkspaceChat): string {
+  if (ws.sessionPath) return `${cwd}\u0000${ws.sessionPath}`;
+  let id = unsavedDraftIds.get(ws.draftScope);
+  if (id == null) {
+    id = ++unsavedDraftSequence;
+    unsavedDraftIds.set(ws.draftScope, id);
+  }
+  return `${cwd}\u0000unsaved-${id}`;
+}
+
+function readComposerDraft(cwd: string, ws: WorkspaceChat): ComposerDraft | undefined {
+  return ws.sessionPath
+    ? sessionComposerDrafts.get(`${cwd}\u0000${ws.sessionPath}`)
+    : unsavedComposerDrafts.get(ws.draftScope);
+}
+
+function writeComposerDraft(cwd: string, ws: WorkspaceChat, draft: ComposerDraft | null): void {
+  if (ws.sessionPath) {
+    const key = `${cwd}\u0000${ws.sessionPath}`;
+    if (draft) sessionComposerDrafts.set(key, draft);
+    else sessionComposerDrafts.delete(key);
+    return;
+  }
+  if (draft) unsavedComposerDrafts.set(ws.draftScope, draft);
+  else unsavedComposerDrafts.delete(ws.draftScope);
+}
+
+async function readBrowserImage(file: File): Promise<Attachment> {
+  const header = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+  const mimeType = detectedImageMimeType(header);
+  if (!mimeType) throw new Error(`${file.name}: содержимое не является PNG, JPEG, GIF или WebP`);
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`${file.name}: не удалось прочитать файл`));
+    reader.onabort = () => reject(new Error(`${file.name}: чтение отменено`));
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === "string" ? reader.result : "";
+      const comma = dataUrl.indexOf(",");
+      const data = comma >= 0 ? dataUrl.slice(comma + 1) : "";
+      if (!data) {
+        reject(new Error(`${file.name}: файл не содержит данных изображения`));
+        return;
+      }
+      resolve({ data, mimeType, name: file.name, sizeBytes: file.size });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 type WorkflowTab = "tasks" | "plan" | "workflow" | "context" | "branches";
 
 type LocatedBackgroundTask = { cwd: string; task: BackgroundTaskView; alive: boolean };
@@ -847,10 +927,13 @@ function WorkflowDock({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
 
 function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const piDefaults = useStore((s) => s.piDefaults);
-  const [text, setText] = useState("");
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [contextFiles, setContextFiles] = useState<string[]>([]);
-  const [previewAttachment, setPreviewAttachment] = useState<Attachment | null>(null);
+  const draftKey = composerComponentKey(cwd, ws);
+  const initialDraft = readComposerDraft(cwd, ws);
+  const [text, setText] = useState(initialDraft?.text ?? "");
+  const [attachments, setAttachments] = useState<Attachment[]>(initialDraft?.attachments ?? []);
+  const [contextFiles, setContextFiles] = useState<string[]>(initialDraft?.contextFiles ?? []);
+  const [attachmentReads, setAttachmentReads] = useState(0);
+  const [imagePolicy, setImagePolicy] = useState<{ cwd: string; blocked: boolean } | null>(null);
   const [palIdx, setPalIdx] = useState(0);
   // Esc скрывает палитру команд, НЕ стирая ввод; следующее изменение текста показывает снова
   const [palHidden, setPalHidden] = useState(false);
@@ -861,12 +944,108 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const pendingInsert = useStore((s) => s.pendingInsert);
   const pendingFiles = useStore((s) => s.pendingFiles);
   const sendKeyBehavior = useStore((s) => s.appConfig.sendKeyBehavior ?? "enter");
-  const canSendImages = ws.agentState?.model?.input?.includes("image") ?? true;
+  const composerModel = effectiveModel(ws, piDefaults);
+  // Unknown/custom model metadata is not permission to send pixels. Once Pi
+  // exposes an explicit image capability the same file can become a vision
+  // block; until then native files remain path context.
+  const modelCanSendImages = composerModel?.input?.includes("image") === true;
+  const imagePolicyReady = imagePolicy?.cwd === cwd;
+  const imagesBlocked = imagePolicyReady ? imagePolicy.blocked : false;
+  const canSendImages = imagePolicyReady && modelCanSendImages && !imagesBlocked;
+  const isAttaching = attachmentReads > 0;
+  const hasDraft = Boolean(text.trim() || attachments.length > 0 || contextFiles.length > 0);
+  const attachmentModeHint = !imagePolicyReady
+    ? "Проверяем политику изображений Pi…"
+    : imagesBlocked
+      ? "Изображения заблокированы в Pi Settings; локальные файлы будут добавлены как пути"
+      : modelCanSendImages
+        ? "Изображения уйдут vision-блоками; остальные файлы — путями"
+        : "Текущая модель text-only; файлы будут добавлены как пути";
+
+  const reportAttachmentMerge = useCallback((result: MergeAttachmentResult) => {
+    if (
+      !result.duplicateCount
+      && !result.overflowCount
+      && !result.individualSizeOverflowCount
+      && !result.totalSizeOverflowCount
+    ) return;
+    queueMicrotask(() => {
+      const parts = [
+        result.duplicateCount ? `пропущено дубликатов: ${result.duplicateCount}` : "",
+        result.overflowCount ? `сверх лимита ${MAX_IMAGE_ATTACHMENTS}: ${result.overflowCount}` : "",
+        result.individualSizeOverflowCount ? `больше 10 МБ: ${result.individualSizeOverflowCount}` : "",
+        result.totalSizeOverflowCount
+          ? `сверх общего лимита ${Math.round(MAX_TOTAL_IMAGE_ATTACHMENT_BYTES / 1_000_000)} МБ: ${result.totalSizeOverflowCount}`
+          : "",
+      ].filter(Boolean);
+      notifyChat(cwd, "warning", `Вложения: ${parts.join(" · ")}`);
+    });
+  }, [cwd]);
+
+  const mergeAttachments = useCallback((incoming: readonly Attachment[]) => {
+    setAttachments((current) => {
+      const result = mergeImageAttachments(current, incoming, MAX_IMAGE_ATTACHMENTS);
+      reportAttachmentMerge(result);
+      return result.attachments;
+    });
+  }, [reportAttachmentMerge]);
+
+  const addContextFiles = useCallback((paths: readonly string[]) => {
+    if (!paths.length) return;
+    setContextFiles((current) => [...new Set([...current, ...paths.filter(Boolean)])]);
+  }, []);
+
+  // Pi exposes two provider-bound image policies that the previous UI ignored.
+  // Project settings override the global value just as they do in Pi itself.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const be = await getBackend();
+      const [globalFile, projectFile] = await Promise.all([
+        be.invoke<{ content: string }>("read_pi_config", { name: "settings" }).catch(() => null),
+        be.invoke<{ content: string }>("read_project_pi_config", { cwd, name: "settings" }).catch(() => null),
+      ]);
+      const parseImages = (content: string | undefined): { valid: boolean; blockImages?: boolean } => {
+        try {
+          const parsed = JSON.parse(content ?? "{}") as { images?: { blockImages?: unknown } };
+          return typeof parsed.images?.blockImages === "boolean"
+            ? { valid: true, blockImages: parsed.images.blockImages }
+            : { valid: true };
+        } catch {
+          return { valid: false };
+        }
+      };
+      const globalImages = parseImages(globalFile?.content);
+      const projectImages = parseImages(projectFile?.content);
+      if (!cancelled) {
+        const readFailed = globalFile == null
+          || projectFile == null
+          || !globalImages.valid
+          || !projectImages.valid;
+        setImagePolicy({
+          cwd,
+          blocked: readFailed || (projectImages.blockImages ?? globalImages.blockImages ?? false),
+        });
+        if (readFailed) {
+          notifyChat(cwd, "warning", "Не удалось проверить Pi image policy — отправка пикселей заблокирована");
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [cwd]);
 
   // автофокус при смене workspace / открытии чата
   useEffect(() => {
     taRef.current?.focus();
   }, [cwd]);
+
+  useEffect(() => {
+    if (!text && attachments.length === 0 && contextFiles.length === 0) {
+      writeComposerDraft(cwd, ws, null);
+      return;
+    }
+    writeComposerDraft(cwd, ws, { text, attachments, contextFiles });
+  }, [cwd, ws, draftKey, text, attachments, contextFiles]);
 
   // вставка из drag&drop (пути файлов)
   useEffect(() => {
@@ -880,39 +1059,57 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   // Finder drop: vision models receive image blocks; everything else stays as
   // an explicit path-context chip instead of leaking base64 into the prompt.
   useEffect(() => {
-    if (!pendingFiles?.length) return;
+    if (!pendingFiles?.length || !imagePolicyReady) return;
     useStore.getState().set({ pendingFiles: null });
+    let cancelled = false;
+    setAttachmentReads((count) => count + 1);
     void (async () => {
       const be = await getBackend();
-      const imageExtensions = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
       const paths: string[] = [];
+      const nextAttachments: Attachment[] = [];
       for (const path of pendingFiles) {
-        const extension = path.split(".").pop()?.toLowerCase() ?? "";
-        if (canSendImages && imageExtensions.has(extension)) {
-          const file = await be.invoke<{ data: string; mimeType: string }>("read_file_base64", { path }).catch(() => null);
-          if (file) {
-            setAttachments((current) => [...current, { ...file, name: path.split("/").pop() ?? path }]);
+        const name = path.split("/").pop() ?? path;
+        if (canSendImages && imageMimeTypeForFile(name)) {
+          try {
+            const file = await be.invoke<{ data: string; mimeType: string; sizeBytes?: number }>("read_file_base64", { path });
+            if (file.data && isSupportedImageMimeType(file.mimeType)) {
+              nextAttachments.push({ ...file, name });
+              continue;
+            }
+            notifyChat(cwd, "warning", `${name}: неподдерживаемый формат изображения`);
+          } catch (error) {
+            notifyChat(cwd, "warning", `${name}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          if (cancelled) {
             continue;
           }
         }
         paths.push(path);
       }
-      if (paths.length) setContextFiles((current) => [...new Set([...current, ...paths])]);
-      taRef.current?.focus();
-    })();
-  }, [pendingFiles, canSendImages]);
+      if (!cancelled) {
+        mergeAttachments(nextAttachments);
+        addContextFiles(paths);
+        taRef.current?.focus();
+      }
+    })().finally(() => setAttachmentReads((count) => Math.max(0, count - 1)));
+    return () => { cancelled = true; };
+  }, [pendingFiles, canSendImages, cwd, imagePolicyReady, mergeAttachments, addContextFiles]);
 
   // extension prefill (set_editor_text)
   useEffect(() => {
     if (ws.chat.editorPrefill != null) {
       setText(ws.chat.editorPrefill);
-      if (ws.chat.editorAttachments != null) setAttachments(ws.chat.editorAttachments);
+      if (ws.chat.editorAttachments != null) {
+        const result = mergeImageAttachments([], ws.chat.editorAttachments);
+        setAttachments(result.attachments);
+        reportAttachmentMerge(result);
+      }
       if (ws.chat.editorContextFiles != null) setContextFiles(ws.chat.editorContextFiles);
       const s = useStore.getState();
       const w = s.chats[cwd];
       if (w) s.set({ chats: { ...s.chats, [cwd]: { ...w, chat: { ...w.chat, editorPrefill: null, editorAttachments: null, editorContextFiles: null } } } });
     }
-  }, [ws.chat.editorPrefill, ws.chat.editorAttachments, ws.chat.editorContextFiles, cwd]);
+  }, [ws.chat.editorPrefill, ws.chat.editorAttachments, ws.chat.editorContextFiles, cwd, reportAttachmentMerge]);
 
   useEffect(() => {
     const ta = taRef.current;
@@ -974,17 +1171,20 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
 
   const submit = async (followUp = false) => {
     const t = text.trim();
-    if (!t) return;
-    const prompt = contextFiles.length > 0
-      ? `${t}\n\n${contextFiles.map((path) => path.includes(" ") ? `"${path}"` : path).join("\n")}`
-      : t;
+    if (isAttaching) {
+      notifyChat(cwd, "info", "Дождитесь завершения чтения вложений");
+      return;
+    }
+    const context = contextFiles.map((path) => path.includes(" ") ? `"${path}"` : path).join("\n");
+    const prompt = [t, context].filter(Boolean).join("\n\n");
+    if (!prompt && attachments.length === 0) return;
     setText("");
     const imgs = attachments;
     setAttachments([]);
     const files = contextFiles;
     setContextFiles([]);
     try {
-      if (followUp) await sendFollowUp(cwd, prompt);
+      if (followUp) await sendFollowUp(cwd, prompt, imgs.length ? imgs : undefined);
       else await sendPrompt(cwd, prompt, imgs.length ? imgs : undefined);
     } catch (e) {
       // вернуть текст и attachments, показать причину (напр. агент занят другой сессией)
@@ -1068,19 +1268,52 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
     }
   };
 
-  const addFiles = (files: FileList | null) => {
-    if (!files) return;
-    for (const f of Array.from(files)) {
-      if (!f.type.startsWith("image/")) continue;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const url = String(reader.result ?? "");
-        const b64 = url.split(",")[1] ?? "";
-        setAttachments((a) => [...a, { data: b64, mimeType: f.type, name: f.name }]);
-      };
-      reader.readAsDataURL(f);
+  const addFiles = useCallback(async (files: readonly File[]) => {
+    if (!files.length) return;
+    if (!imagePolicyReady) {
+      notifyChat(cwd, "info", "Дождитесь проверки Pi image policy");
+      return;
     }
-  };
+    if (!canSendImages) {
+      notifyChat(cwd, "warning", imagesBlocked
+        ? "Изображения отключены в Settings → Основные → Изображения"
+        : "Текущая модель не поддерживает vision-вложения");
+      return;
+    }
+    const valid: File[] = [];
+    const errors: string[] = [];
+    for (const file of files) {
+      const error = attachmentValidationError(file);
+      const mimeType = imageMimeTypeForFile(file.name, file.type);
+      if (error || !mimeType) errors.push(error ?? `${file.name}: неподдерживаемый формат`);
+      else valid.push(file);
+    }
+    if (errors.length) notifyChat(cwd, "warning", errors.slice(0, 3).join(" · "));
+    if (!valid.length) return;
+    setAttachmentReads((count) => count + 1);
+    try {
+      const settled = await Promise.allSettled(valid.map((file) => readBrowserImage(file)));
+      const next: Attachment[] = [];
+      for (const result of settled) {
+        if (result.status === "fulfilled") next.push(result.value);
+        else notifyChat(cwd, "warning", result.reason instanceof Error ? result.reason.message : String(result.reason));
+      }
+      mergeAttachments(next);
+    } finally {
+      setAttachmentReads((count) => Math.max(0, count - 1));
+      if (fileRef.current) fileRef.current.value = "";
+      taRef.current?.focus();
+    }
+  }, [canSendImages, cwd, imagePolicyReady, imagesBlocked, mergeAttachments]);
+
+  useEffect(() => {
+    const onBrowserFiles = (event: Event) => {
+      const files = (event as CustomEvent<readonly File[]>).detail;
+      if (Array.isArray(files) && files.length) void addFiles(files);
+    };
+    window.addEventListener("pi:browser-files", onBrowserFiles);
+    return () => window.removeEventListener("pi:browser-files", onBrowserFiles);
+  }, [addFiles]);
 
   // прикрепление: изображения → base64 (для vision-моделей), остальное → путь в тексте (pi прочитает сам)
   const attachViaDialog = async () => {
@@ -1092,20 +1325,31 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const sel = await open({ multiple: true, title: "Прикрепить файлы" }).catch(() => null);
     const paths = Array.isArray(sel) ? sel : typeof sel === "string" ? [sel] : [];
-    const imgExts = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
     const textParts: string[] = [];
-    for (const p of paths) {
-      const ext = p.split(".").pop()?.toLowerCase() ?? "";
-      if (imgExts.has(ext) && canSendImages) {
-        const f = await be.invoke<{ data: string; mimeType: string }>("read_file_base64", { path: p }).catch(() => null);
-        if (f) setAttachments((a) => [...a, { ...f, name: p.split("/").pop() ?? p }]);
-      } else {
+    const nextAttachments: Attachment[] = [];
+    setAttachmentReads((count) => count + 1);
+    try {
+      for (const p of paths) {
+        const name = p.split("/").pop() ?? p;
+        if (imageMimeTypeForFile(name) && canSendImages) {
+          try {
+            const file = await be.invoke<{ data: string; mimeType: string; sizeBytes?: number }>("read_file_base64", { path: p });
+            if (file.data && isSupportedImageMimeType(file.mimeType)) {
+              nextAttachments.push({ ...file, name });
+              continue;
+            }
+            notifyChat(cwd, "warning", `${name}: неподдерживаемый формат изображения`);
+          } catch (error) {
+            notifyChat(cwd, "warning", `${name}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
         textParts.push(p);
       }
-    }
-    if (textParts.length) {
-      setContextFiles((current) => [...new Set([...current, ...textParts])]);
+      mergeAttachments(nextAttachments);
+      addContextFiles(textParts);
       taRef.current?.focus();
+    } finally {
+      setAttachmentReads((count) => Math.max(0, count - 1));
     }
   };
 
@@ -1178,30 +1422,31 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
-          onPaste={(e) => addFiles(e.clipboardData.files)}
+          onPaste={(event) => {
+            const itemFiles = Array.from(event.clipboardData.items)
+              .filter((item) => item.kind === "file")
+              .flatMap((item) => item.getAsFile() ?? []);
+            const files = itemFiles.length ? itemFiles : Array.from(event.clipboardData.files);
+            if (files.length) {
+              event.preventDefault();
+              void addFiles(files);
+            }
+          }}
         />
-        {attachments.length > 0 && (
-          <div className="row" style={{ flexWrap: "wrap", marginTop: 4 }}>
-            {attachments.map((a, i) => (
-              <span key={i} className="chip attachment-chip image" style={{ background: "var(--accent-soft)" }}>
-                <button className="attachment-open" title={`Открыть ${a.name}`} onClick={() => setPreviewAttachment(a)}><ImageIcon size={12} /> {a.name}</button>
-                <small className="attachment-mode">vision</small>
-                <button onClick={() => setAttachments(attachments.filter((_, j) => j !== i))}>×</button>
-              </span>
-            ))}
+        {(attachments.length > 0 || contextFiles.length > 0 || isAttaching) && (
+          <div className="attachment-tray">
+            <ImageAttachments
+              attachments={attachments}
+              variant="composer"
+              onRemove={(index) => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+            />
             {contextFiles.map((path) => (
               <span key={path} className="chip attachment-chip">
                 <PaperclipIcon size={11} /> <span title={path}>{path.split("/").pop()}</span><small className="attachment-mode">path</small>
-                <button onClick={() => setContextFiles(contextFiles.filter((item) => item !== path))}>×</button>
+                <button type="button" aria-label={`Убрать файл ${path.split("/").pop()}`} onClick={() => setContextFiles(contextFiles.filter((item) => item !== path))}>×</button>
               </span>
             ))}
-          </div>
-        )}
-        {attachments.length === 0 && contextFiles.length > 0 && (
-          <div className="row context-file-row">
-            {contextFiles.map((path) => (
-              <span key={path} className="chip attachment-chip"><PaperclipIcon size={11} /><span title={path}>{path.split("/").pop()}</span><small className="attachment-mode">path</small><button onClick={() => setContextFiles(contextFiles.filter((item) => item !== path))}>×</button></span>
-            ))}
+            {isAttaching && <span className="attachment-loading" role="status"><span className="spinner" /> Чтение…</span>}
           </div>
         )}
         <div className="c-row">
@@ -1214,9 +1459,19 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
             options={THINKING_LEVELS.map((level) => ({ value: level, label: `thinking: ${level}` }))}
             onChange={(level) => void setThinkingLevel(cwd, level).catch(() => {})}
           />
-          <input ref={fileRef} type="file" accept="image/*" multiple hidden onChange={(e) => addFiles(e.target.files)} />
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".png,.jpg,.jpeg,.gif,.webp,image/png,image/jpeg,image/gif,image/webp"
+            multiple
+            hidden
+            onChange={(event) => void addFiles(Array.from(event.target.files ?? []))}
+          />
           <button
-            title={canSendImages ? "Прикрепить файлы или изображения" : "Прикрепить файлы (пути — модель text-only)"}
+            type="button"
+            title={attachmentModeHint}
+            aria-label="Прикрепить файлы или изображения"
+            disabled={isAttaching || !imagePolicyReady}
             onClick={() => void attachViaDialog()}
           >
             <PaperclipIcon size={14} />
@@ -1229,14 +1484,14 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
               <button
                 className="steer-action"
                 title={`Вмешаться в текущий ход (${sendKeyBehavior === "mod-enter" ? "⌘Enter" : "Enter"})`}
-                disabled={!text.trim()}
+                disabled={!hasDraft || isAttaching}
                 onClick={() => void submit(false)}
               >
                 <SteerIcon size={14} motion="lift" /> Steer
               </button>
               <button
                 title="Поставить сообщение после текущего хода (⌥Enter)"
-                disabled={!text.trim()}
+                disabled={!hasDraft || isAttaching}
                 onClick={() => void submit(true)}
               >
                 Затем
@@ -1258,19 +1513,12 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
               <StopIcon size={15} />
             </button>
           ) : (
-            <button className="primary" title={`Отправить (${sendKeyBehavior === "mod-enter" ? "⌘Enter" : "Enter"})`} disabled={!text.trim()} onClick={() => void submit()}>
-              <SendIcon size={14} motion={text.trim() ? "lift" : undefined} />
+            <button className="primary" title={`Отправить (${sendKeyBehavior === "mod-enter" ? "⌘Enter" : "Enter"})`} disabled={!hasDraft || isAttaching} onClick={() => void submit()}>
+              <SendIcon size={14} motion={hasDraft && !isAttaching ? "lift" : undefined} />
             </button>
           )}
         </div>
       </div>
-      {previewAttachment && (
-        <div className="attachment-lightbox" role="dialog" aria-modal="true" aria-label={previewAttachment.name} onClick={() => setPreviewAttachment(null)}>
-          <button className="attachment-lightbox-close" title="Закрыть" onClick={() => setPreviewAttachment(null)}>×</button>
-          <img src={`data:${previewAttachment.mimeType};base64,${previewAttachment.data}`} alt={previewAttachment.name} onClick={(event) => event.stopPropagation()} />
-          <span>{previewAttachment.name}</span>
-        </div>
-      )}
       <StatusLine ws={ws} cwd={cwd} />
     </div>
   );
@@ -1910,6 +2158,7 @@ export default function ChatView() {
   const set = useStore((s) => s.set);
   const uiScale = useStore((s) => s.appConfig.uiScale || 1);
   const [previewWidth, setPreviewWidth] = useState(560);
+  const [dragActive, setDragActive] = useState(false);
   const backgroundTasks = useMemo(
     () => Object.entries(chats).flatMap(([taskCwd, workspace]) =>
       workspace.chat.backgroundTasks.map((task) => ({ cwd: taskCwd, task, alive: workspace.alive }))),
@@ -1956,7 +2205,12 @@ export default function ChatView() {
       try {
         const { getCurrentWebview } = await import("@tauri-apps/api/webview");
         const un = await getCurrentWebview().onDragDropEvent((event) => {
+          if (event.payload.type === "enter" || event.payload.type === "over") {
+            setDragActive(true);
+          }
+          if (event.payload.type === "leave") setDragActive(false);
           if (event.payload.type === "drop") {
+            setDragActive(false);
             const paths = event.payload.paths ?? [];
             if (paths.length > 0) {
               useStore.getState().set({ pendingFiles: paths, view: "chat" });
@@ -2018,9 +2272,39 @@ export default function ChatView() {
         </div>
       )}
       <div className="chat-body">
-        <div className="chat-pane">
+        <div
+          className="chat-pane"
+          onDragEnter={(event) => {
+            if (event.dataTransfer.types.includes("Files")) {
+              event.preventDefault();
+              setDragActive(true);
+            }
+          }}
+          onDragOver={(event) => {
+            if (event.dataTransfer.types.includes("Files")) {
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "copy";
+            }
+          }}
+          onDragLeave={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragActive(false);
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            setDragActive(false);
+            const files = Array.from(event.dataTransfer.files);
+            if (files.length) window.dispatchEvent(new CustomEvent("pi:browser-files", { detail: files }));
+          }}
+        >
+          {dragActive && (
+            <div className="attachment-drop-overlay" role="status">
+              <span><PaperclipIcon size={22} /></span>
+              <strong>Добавить в сообщение</strong>
+              <small>Формат, vision-поддержка и Pi image policy будут проверены перед добавлением</small>
+            </div>
+          )}
           <MessageList cwd={cwd} ws={ws} />
-          <Composer cwd={cwd} ws={ws} />
+          <Composer key={composerComponentKey(cwd, ws)} cwd={cwd} ws={ws} />
           <Toasts cwd={cwd} />
         </div>
         {previewOpen && (
