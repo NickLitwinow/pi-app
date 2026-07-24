@@ -1006,7 +1006,13 @@ fn list_skills_in(
     home: &Path,
 ) -> Result<Vec<SkillInfo>, String> {
     let global_settings = read_settings(&agent_root.join("settings.json"))?;
-    let project_root = cwd.map(|cwd| cwd.join(".pi"));
+    let project_trusted = cwd
+        .map(|cwd| {
+            crate::resources::project_is_trusted(agent_root, cwd, home, global_settings.as_ref())
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let project_root = cwd.filter(|_| project_trusted).map(|cwd| cwd.join(".pi"));
     let project_settings = project_root
         .as_deref()
         .map(|root| read_settings(&root.join("settings.json")))
@@ -1123,6 +1129,19 @@ mod tests {
         .unwrap();
     }
 
+    fn trust_project(agent: &Path, project: &Path) {
+        let project = project.canonicalize().unwrap();
+        fs::create_dir_all(agent).unwrap();
+        fs::write(
+            agent.join("trust.json"),
+            format!(
+                "{{{}:true}}",
+                serde_json::to_string(&project.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
     fn by_name<'a>(skills: &'a [SkillInfo], name: &str) -> &'a SkillInfo {
         skills.iter().find(|skill| skill.name == name).unwrap()
     }
@@ -1178,6 +1197,7 @@ mod tests {
             r#"{"skills":["manual","-skills/project-auto"]}"#,
         )
         .unwrap();
+        trust_project(&agent, &nested);
 
         let skills = list_skills_in(&agent, Some(&nested), &home).unwrap();
         assert_eq!(skills.len(), 6);
@@ -1291,6 +1311,7 @@ mod tests {
             r#"{"packages":[{"source":"npm:delta-skills","autoload":false,"skills":["-skills/off"]}]}"#,
         )
         .unwrap();
+        trust_project(&agent, &project);
 
         let skills = list_skills_in(&agent, Some(&project), &home).unwrap();
         assert_eq!(skills.len(), 2);

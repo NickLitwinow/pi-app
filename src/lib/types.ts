@@ -648,6 +648,22 @@ export interface SkillInfo {
   shadowedBy?: string | null;
 }
 
+export interface PiResourceInfo {
+  kind: "extension" | "prompt" | string;
+  name: string;
+  description: string;
+  path: string;
+  sourceDir: string;
+  scope: "global" | "project" | string;
+  origin: "configured" | "auto" | "package" | string;
+  packageName?: string | null;
+  enabled: boolean;
+  valid: boolean;
+  warning?: string | null;
+  argumentHint?: string | null;
+  shadowedBy?: string | null;
+}
+
 export interface ConfigFile {
   path: string;
   content: string;

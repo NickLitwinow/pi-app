@@ -11,6 +11,7 @@ import type {
   PackageDetails,
   PiInfo,
   PiPackage,
+  PiResourceInfo,
   PiUpdateInfo,
   PreviewHandle,
   PreviewStatus,
@@ -984,6 +985,72 @@ export class MockBackend implements Backend {
             shadowedBy: null,
           },
         ] satisfies SkillInfo[] as T;
+      case "list_pi_resources": {
+        if (String(args.kind) === "prompt") {
+          return [] satisfies PiResourceInfo[] as T;
+        }
+        const extensionEntries = [
+          ["pi-mcp-adapter", "/mock/packages/pi-mcp-adapter/index.ts", "pi-mcp-adapter"],
+          ["todo", "/mock/packages/rpiv-todo/index.ts", "@juicesharp/rpiv-todo"],
+          ["ask-user-question", "/mock/packages/rpiv-ask-user-question/index.ts", "@juicesharp/rpiv-ask-user-question"],
+          ["pi-permission-system", "/mock/packages/pi-permission-system/src/index.ts", "@gotgenes/pi-permission-system"],
+          ["pi-claude-style-tools", "/mock/packages/pi-claude-style-tools/extensions/index.ts", "pi-claude-style-tools"],
+          ["spinner", "/mock/packages/pi-claude-style-tools/extensions/spinner.ts", "pi-claude-style-tools"],
+          ["retry", "/mock/packages/pi-retry/src/retry.ts", "@narumitw/pi-retry"],
+          ["statusline", "/mock/packages/pi-statusline/src/statusline.ts", "@narumitw/pi-statusline"],
+          ["pi-extension", "/mock/packages/plannotator", "@plannotator/pi-extension"],
+          ["harness-extension", "/mock/harness-extension/index.ts", "harness-extension"],
+          ["pi-web-access", "/mock/packages/pi-web-access/index.ts", "pi-web-access"],
+          ["pi-subagents", "/mock/packages/pi-subagents/src/index.ts", "@tintinweb/pi-subagents"],
+          ["pi-extension", "/mock/packages/ponytail/pi-extension/index.js", "ponytail"],
+          ["chrome-profile-bridge", "/mock/packages/pi-chrome/extensions/chrome-profile-bridge/index.ts", "pi-chrome"],
+          ["agent-browser", "/mock/packages/pi-agent-browser-native/dist/extensions/agent-browser/index.js", "pi-agent-browser-native"],
+        ] as const;
+        const configuredPackages = (JSON.parse(this.settings) as { packages?: unknown[] }).packages ?? [];
+        const packageEnabled = (packageName: string) => {
+          const entry = configuredPackages.find((candidate) => {
+            const source = typeof candidate === "string"
+              ? candidate
+              : candidate && typeof candidate === "object" && "source" in candidate
+                ? String(candidate.source)
+                : "";
+            return packageNameFromSpec(source) === packageName || source === packageName;
+          });
+          return !(entry && typeof entry === "object" && "extensions" in entry
+            && Array.isArray(entry.extensions) && entry.extensions.length === 0);
+        };
+        const resources: PiResourceInfo[] = extensionEntries.map(([name, path, packageName]) => ({
+          kind: "extension",
+          name,
+          description: "Extension entry point",
+          path,
+          sourceDir: `npm:${packageName}`,
+          scope: "global",
+          origin: "package",
+          packageName,
+          enabled: packageEnabled(packageName),
+          valid: true,
+          warning: null,
+          argumentHint: null,
+          shadowedBy: null,
+        }));
+        resources.push({
+          kind: "extension",
+          name: "project-tools",
+          description: "Extension entry point",
+          path: "/Users/dev/pi-app/.pi/extensions/project-tools/index.ts",
+          sourceDir: "/Users/dev/pi-app/.pi/extensions",
+          scope: "project",
+          origin: "auto",
+          packageName: null,
+          enabled: true,
+          valid: true,
+          warning: null,
+          argumentHint: null,
+          shadowedBy: null,
+        });
+        return resources as T;
+      }
       case "list_workspace_files":
         return [
           "src/App.tsx",

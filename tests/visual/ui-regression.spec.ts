@@ -147,6 +147,8 @@ test("Library ignores stale catalogs and covers the installed browser extensions
   await expect(page.getByText("Пакеты с ресурсом «расширения»: 14", { exact: true })).toBeVisible();
   await expect(page.getByText("pi-chrome", { exact: true })).toBeVisible();
   await expect(page.getByText("pi-agent-browser-native", { exact: true })).toBeVisible();
+  await expect(page.getByText("Resolved extensions · 15", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Открыть extension spinner" })).toContainText("package · pi-claude-style-tools");
 });
 
 test("Library installed view only lists packages that declare the selected resource", async ({ page }) => {
@@ -169,9 +171,17 @@ test("Library installed view only lists packages that declare the selected resou
 
   await page.getByRole("button", { name: /^Prompts/ }).click();
   await expect(page.getByText("Пакеты с ресурсом «prompts и AGENTS.md»: 0", { exact: true })).toBeVisible();
+  await expect(page.getByText("Resolved prompts · 0", { exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: /^Расширения/ }).click();
   await expect(page.getByText("Пакеты с ресурсом «расширения»: 14", { exact: true })).toBeVisible();
+  await expect(page.getByText("Resolved extensions · 15", { exact: true })).toBeVisible();
+  const claudeTools = page.locator(".mk-card").filter({ hasText: "pi-claude-style-tools" });
+  await claudeTools.getByRole("button", { name: "Активно" }).click();
+  await expect(page.getByRole("button", { name: "Открыть extension spinner" })).toContainText("Выключен");
+  await expect(page.getByRole("button", { name: "Открыть extension pi-claude-style-tools" })).toContainText("Выключен");
+  await claudeTools.getByRole("button", { name: "Выключено" }).click();
+  await expect(page.getByRole("button", { name: "Открыть extension spinner" })).not.toContainText("Выключен");
 
   await page.getByRole("button", { name: /^Skills/ }).click();
   await page.getByRole("button", { name: "Текущий проект" }).click();

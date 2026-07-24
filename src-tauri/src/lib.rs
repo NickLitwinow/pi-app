@@ -10,6 +10,7 @@ pub mod packages;
 pub mod perf;
 pub mod pi_cli;
 pub mod preview;
+pub mod resources;
 pub mod sessions;
 pub mod skills;
 pub mod supervisor;
@@ -162,6 +163,7 @@ pub fn run() {
             config::read_permission_mode,
             config::migrate_permission_configs,
             skills::list_skills,
+            resources::list_pi_resources,
             pi_cli::pi_cli_run,
             extension_lifecycle::set_extension_resource_enabled,
             pi_cli::check_pi_update,

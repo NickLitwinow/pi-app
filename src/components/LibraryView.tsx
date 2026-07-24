@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useInstalledPackages, useRunPi } from "../hooks/usePiPackages";
 import { getBackend } from "../lib/backend";
-import type { ConfigFile, PackageKind, SkillInfo } from "../lib/types";
+import type { ConfigFile, PackageKind, PiResourceInfo, SkillInfo } from "../lib/types";
 import { updateAppConfig, useStore } from "../state/store";
 import Marketplace from "./Marketplace";
 import { CheckIcon, PackageIcon } from "./icons";
@@ -272,8 +272,9 @@ function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | n
   );
 }
 
-function LocalSkills({ scope, cwd }: { scope: "global" | "project"; cwd: string | null }) {
+function LocalSkills({ scope, cwd, refreshVersion }: { scope: "global" | "project"; cwd: string | null; refreshVersion: number }) {
   const editor = useStore((state) => state.appConfig.editor);
+  const configVersion = useStore((state) => state.configVersion);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -297,7 +298,7 @@ function LocalSkills({ scope, cwd }: { scope: "global" | "project"; cwd: string 
     return () => {
       cancelled = true;
     };
-  }, [cwd, scope]);
+  }, [configVersion, cwd, refreshVersion, scope]);
 
   const open = async (skill: SkillInfo) => {
     try {
@@ -346,11 +347,101 @@ function LocalSkills({ scope, cwd }: { scope: "global" | "project"; cwd: string 
   );
 }
 
+function LocalResources({
+  kind,
+  scope,
+  cwd,
+  refreshVersion,
+}: {
+  kind: "extension" | "prompt";
+  scope: "global" | "project";
+  cwd: string | null;
+  refreshVersion: number;
+}) {
+  const editor = useStore((state) => state.appConfig.editor);
+  const configVersion = useStore((state) => state.configVersion);
+  const [resources, setResources] = useState<PiResourceInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setResources([]);
+    setLoading(true);
+    setError(null);
+    void (async () => {
+      try {
+        const be = await getBackend();
+        const loaded = await be.invoke<PiResourceInfo[]>("list_pi_resources", { kind, cwd });
+        if (cancelled) return;
+        setResources(loaded.filter((resource) => resource.scope === scope));
+      } catch (loadError) {
+        if (!cancelled) setError(`Не удалось вычислить ${kind === "extension" ? "extensions" : "prompts"} Pi: ${String(loadError)}`);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [configVersion, cwd, kind, refreshVersion, scope]);
+
+  const open = async (resource: PiResourceInfo) => {
+    try {
+      const be = await getBackend();
+      await be.invoke("open_in_editor", { editor, path: resource.path, line: null });
+      setError(null);
+    } catch (openError) {
+      setError(`Не удалось открыть ${resource.name}: ${String(openError)}`);
+    }
+  };
+
+  const label = kind === "extension" ? "extensions" : "prompts";
+  return (
+    <section className="local-skills" aria-label={`Эффективные ${label} Pi`}>
+      <div className="section-title" style={{ padding: "18px 2px 8px" }}>
+        Resolved {label} · {resources.length}
+      </div>
+      <div className="hint" style={{ marginBottom: 10 }}>
+        {kind === "extension"
+          ? "Фактические entry points Pi из settings.json, package manifests и extensions/. Один пакет может загружать несколько файлов; просмотр не исполняет сторонний код."
+          : "Фактические slash-command templates Pi из settings.json, package manifests и prompts/. Нажмите карточку, чтобы проверить шаблон и аргументы."}
+      </div>
+      {error && <div className="card" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>{error}</div>}
+      {resources.map((resource) => (
+        <button
+          key={resource.path}
+          className={`card click local-skill-card${!resource.enabled || resource.shadowedBy ? " disabled" : ""}${!resource.valid ? " invalid" : ""}`}
+          aria-label={`Открыть ${kind === "extension" ? "extension" : "prompt"} ${resource.name}`}
+          onClick={() => void open(resource)}
+        >
+          <span className="local-skill-title">
+            <span className="c-title">{kind === "prompt" ? `/${resource.name}` : resource.name}</span>
+            {!resource.enabled && <span className="badge">Выключен</span>}
+            {!resource.valid && <span className="badge red">Pi не загрузит</span>}
+            {resource.shadowedBy && <span className="badge red">Конфликт имени</span>}
+            {resource.argumentHint && <span className="badge">{resource.argumentHint}</span>}
+          </span>
+          {resource.description && <span className="c-sub">{resource.description}</span>}
+          <span className="local-skill-origin">
+            {resource.origin === "package" ? `package · ${resource.packageName ?? resource.sourceDir}` : resource.origin === "auto" ? "auto-discovery" : "settings.json"}
+          </span>
+          {resource.warning && <span className="local-skill-warning">{resource.warning}</span>}
+          <code title={resource.path}>{resource.path}</code>
+        </button>
+      ))}
+      {loading && <div className="muted">Вычисляем эффективный набор Pi…</div>}
+      {!loading && resources.length === 0 && !error && <div className="muted">В этом scope Pi не обнаружил {label}.</div>}
+    </section>
+  );
+}
+
 export default function LibraryView() {
   const cwd = useStore((state) => state.currentCwd);
   const onboardingSeen = useStore((state) => state.appConfig.libraryOnboardingSeen === true);
   const [tab, setTab] = useState<LibraryTab>("extension");
   const [scope, setScope] = useState<"global" | "project">("global");
+  const [resourceVersion, setResourceVersion] = useState(0);
   const current = COLLECTIONS.find((item) => item.id === tab) ?? COLLECTIONS[0];
 
   return (
@@ -386,13 +477,14 @@ export default function LibraryView() {
           <div className="library-content-title"><div><h2>{current.label}</h2><p>{current.desc} · {scope === "project" ? cwd?.split("/").pop() : "глобально"}</p></div><span className="realtime-pill"><span className="dot live" /> Live</span></div>
           {tab === "profiles" ? <Profiles scope={scope} cwd={cwd} /> : (
             <>
-              <Marketplace kind={tab} scope={scope} cwd={cwd} installHint={
+              <Marketplace kind={tab} scope={scope} cwd={cwd} onResourcesChanged={() => setResourceVersion((version) => version + 1)} installHint={
                 tab === "extension" ? "Расширения получают полный доступ к системе. Карточки с repo позволяют проверить исходники до установки."
                   : tab === "skill" ? "Описание skill добавляется в стартовый контекст; держите активным только нужный набор."
                     : tab === "theme" ? "Темы устанавливаются в выбранный scope; редактор и экспорт доступны в Settings → Темы."
                       : "Prompt templates и AGENTS.md-пресеты для повторяемых рабочих процессов."
               } />
-              {tab === "skill" && <LocalSkills scope={scope} cwd={cwd} />}
+              {tab === "skill" && <LocalSkills scope={scope} cwd={cwd} refreshVersion={resourceVersion} />}
+              {(tab === "extension" || tab === "prompt") && <LocalResources kind={tab} scope={scope} cwd={cwd} refreshVersion={resourceVersion} />}
             </>
           )}
         </main>

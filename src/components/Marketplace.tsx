@@ -61,12 +61,14 @@ export default function Marketplace({
   installHint,
   scope = "global",
   cwd = null,
+  onResourcesChanged,
 }: {
   kind: PackageKind;
   recommended?: Recommended[];
   installHint?: string;
   scope?: "global" | "project";
   cwd?: string | null;
+  onResourcesChanged?: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [debounced, setDebounced] = useState("");
@@ -95,6 +97,7 @@ export default function Marketplace({
   const { log, running, runPi, logRef } = useRunPi(() => {
     reload();
     setInstalledRefresh((value) => value + 1);
+    onResourcesChanged?.();
   });
 
   // Полный список установленных пакетов (из settings.json) с метаданными — чтобы
@@ -209,6 +212,7 @@ export default function Marketplace({
     setError(null);
     try {
       await setResourceEnabled(name, kind, enabled);
+      onResourcesChanged?.();
     } catch (toggleError) {
       setError(`Не удалось изменить ресурс: ${String(toggleError)}`);
     } finally {
