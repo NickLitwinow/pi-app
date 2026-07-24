@@ -639,6 +639,13 @@ export interface SkillInfo {
   path: string;
   sourceDir: string;
   scope: "global" | "project" | string;
+  origin: "configured" | "auto" | "package" | string;
+  packageName?: string | null;
+  enabled: boolean;
+  valid: boolean;
+  warning?: string | null;
+  disableModelInvocation: boolean;
+  shadowedBy?: string | null;
 }
 
 export interface ConfigFile {

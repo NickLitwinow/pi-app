@@ -571,73 +571,6 @@ fn add_auto_themes(
     }
 }
 
-#[derive(Clone)]
-struct ConfiguredPackage {
-    spec: Value,
-    source: String,
-    root: PathBuf,
-    project: bool,
-}
-
-impl ConfiguredPackage {
-    fn autoload_disabled(&self) -> bool {
-        self.spec
-            .get("autoload")
-            .and_then(Value::as_bool)
-            .is_some_and(|autoload| !autoload)
-    }
-}
-
-fn configured_packages(
-    root: &Path,
-    settings: Option<&Value>,
-    project: bool,
-) -> Vec<ConfiguredPackage> {
-    settings
-        .and_then(|settings| settings.get("packages"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|spec| {
-            let source = spec
-                .as_str()
-                .or_else(|| spec.get("source").and_then(Value::as_str))?
-                .to_string();
-            Some(ConfiguredPackage {
-                spec: spec.clone(),
-                source,
-                root: root.to_path_buf(),
-                project,
-            })
-        })
-        .collect()
-}
-
-fn dedupe_packages(
-    project: Vec<ConfiguredPackage>,
-    global: &[ConfiguredPackage],
-) -> Vec<ConfiguredPackage> {
-    let mut out = Vec::new();
-    let mut indexes = HashMap::new();
-    for package in project.into_iter().chain(global.iter().cloned()) {
-        let Some(identity) =
-            crate::packages::package_identity_for_root(&package.root, &package.source)
-        else {
-            continue;
-        };
-        if let Some(index) = indexes.get(&identity).copied() {
-            let existing: &ConfiguredPackage = &out[index];
-            if existing.project && !package.project && existing.autoload_disabled() {
-                out.push(package);
-            }
-            continue;
-        }
-        indexes.insert(identity, out.len());
-        out.push(package);
-    }
-    out
-}
-
 fn delta_pattern_states(
     paths: &[PathBuf],
     patterns: &[String],
@@ -667,11 +600,11 @@ fn add_package_themes(
     candidates: &mut Vec<ThemeCandidate>,
     indexes: &mut HashMap<PathBuf, usize>,
 ) {
-    let global = configured_packages(global_root, global_settings, false);
+    let global = crate::packages::configured_packages(global_root, global_settings, false);
     let project = project_root
-        .map(|root| configured_packages(root, project_settings, true))
+        .map(|root| crate::packages::configured_packages(root, project_settings, true))
         .unwrap_or_default();
-    let packages = dedupe_packages(project, &global);
+    let packages = crate::packages::dedupe_configured_packages(project, &global);
 
     for package in packages {
         let identity = crate::packages::package_identity_for_root(&package.root, &package.source);

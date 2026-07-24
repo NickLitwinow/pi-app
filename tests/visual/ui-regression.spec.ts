@@ -158,7 +158,10 @@ test("Library installed view only lists packages that declare the selected resou
   await expect(page.getByText("pi-web-access", { exact: true })).toBeVisible();
   await expect(page.getByText("ponytail", { exact: true })).toBeVisible();
   await expect(page.getByText("pi-mcp-adapter", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Resolved skills · 3", { exact: false })).toBeVisible();
   await expect(page.getByRole("button", { name: "Открыть skill code-review" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Открыть skill librarian" })).toContainText("package · pi-web-access");
+  await expect(page.getByRole("button", { name: "Открыть skill ship" })).toContainText("Только /skill");
 
   await page.getByRole("button", { name: /^Темы/ }).click();
   await expect(page.getByText("Пакеты с ресурсом «темы»: 0", { exact: true })).toBeVisible();
@@ -173,6 +176,7 @@ test("Library installed view only lists packages that declare the selected resou
   await page.getByRole("button", { name: /^Skills/ }).click();
   await page.getByRole("button", { name: "Текущий проект" }).click();
   await expect(page.getByText("Пакеты с ресурсом «skills»: 1", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Открыть skill project-audit" })).toContainText("auto-discovery");
   const projectSkill = page.locator(".mk-card").filter({ hasText: "pi-skill-code-review" });
   await expect(projectSkill.getByRole("button", { name: "Активно" })).toBeVisible();
   await projectSkill.getByRole("button", { name: "Активно" }).click();

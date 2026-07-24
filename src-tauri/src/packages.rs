@@ -6,6 +6,7 @@
 
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -471,6 +472,77 @@ pub(crate) fn package_identity_for_root(root: &Path, spec: &str) -> Option<Strin
     let path = package_dir_for_root(root, spec)?;
     let resolved = path.canonicalize().unwrap_or(path);
     Some(format!("local:{}", resolved.to_string_lossy()))
+}
+
+/// A package entry together with the settings root that gives relative local
+/// sources their meaning. Resource resolvers share this because Pi applies the
+/// same project-over-user package precedence to extensions, skills, prompts,
+/// and themes.
+#[derive(Clone)]
+pub(crate) struct ConfiguredPackage {
+    pub(crate) spec: Value,
+    pub(crate) source: String,
+    pub(crate) root: PathBuf,
+    pub(crate) project: bool,
+}
+
+impl ConfiguredPackage {
+    pub(crate) fn autoload_disabled(&self) -> bool {
+        self.spec
+            .get("autoload")
+            .and_then(Value::as_bool)
+            .is_some_and(|autoload| !autoload)
+    }
+}
+
+pub(crate) fn configured_packages(
+    root: &Path,
+    settings: Option<&Value>,
+    project: bool,
+) -> Vec<ConfiguredPackage> {
+    settings
+        .and_then(|settings| settings.get("packages"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|spec| {
+            let source = spec
+                .as_str()
+                .or_else(|| spec.get("source").and_then(Value::as_str))?
+                .to_string();
+            Some(ConfiguredPackage {
+                spec: spec.clone(),
+                source,
+                root: root.to_path_buf(),
+                project,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn dedupe_configured_packages(
+    project: Vec<ConfiguredPackage>,
+    global: &[ConfiguredPackage],
+) -> Vec<ConfiguredPackage> {
+    let mut out = Vec::new();
+    let mut indexes = HashMap::new();
+    for package in project.into_iter().chain(global.iter().cloned()) {
+        let Some(identity) = package_identity_for_root(&package.root, &package.source) else {
+            continue;
+        };
+        if let Some(index) = indexes.get(&identity).copied() {
+            let existing: &ConfiguredPackage = &out[index];
+            // A project autoload:false entry is a delta over the matching user
+            // package, so both entries must survive resolution.
+            if existing.project && !package.project && existing.autoload_disabled() {
+                out.push(package);
+            }
+            continue;
+        }
+        indexes.insert(identity, out.len());
+        out.push(package);
+    }
+    out
 }
 
 fn read_json_limited(path: &Path) -> Option<Value> {

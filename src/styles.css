@@ -1574,6 +1574,11 @@ html[data-effects="on"] .ss-card { backdrop-filter: blur(24px); -webkit-backdrop
 .local-skill-card { width: 100%; display: flex; flex-direction: column; align-items: flex-start; text-align: left; color: var(--text); font: inherit; }
 .local-skill-card .c-sub { white-space: normal; }
 .local-skill-card code { margin-top: 7px; max-width: 100%; color: var(--text-dim); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.local-skill-card.disabled { opacity: 0.72; }
+.local-skill-card.invalid { border-color: color-mix(in srgb, var(--danger) 42%, var(--border)); }
+.local-skill-title { width: 100%; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.local-skill-origin { margin-top: 6px; color: var(--accent); font-size: 10px; }
+.local-skill-warning { margin-top: 6px; color: var(--danger); font-size: 10px; white-space: normal; }
 @container (max-width: 880px) {
   .library-hero { align-items: flex-start; flex-direction: column; }
   .library-onboarding { grid-template-columns: auto minmax(0, 1fr); }

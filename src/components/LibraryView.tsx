@@ -291,7 +291,7 @@ function LocalSkills({ scope, cwd }: { scope: "global" | "project"; cwd: string 
       } catch (loadError) {
         if (cancelled) return;
         setSkills([]);
-        setError(`Не удалось прочитать configured skills: ${String(loadError)}`);
+        setError(`Не удалось вычислить skills Pi: ${String(loadError)}`);
       }
     })();
     return () => {
@@ -311,22 +311,37 @@ function LocalSkills({ scope, cwd }: { scope: "global" | "project"; cwd: string 
 
   const contextTokens = skills.reduce((total, skill) => total + Math.max(1, Math.round((skill.name.length + skill.description.length) / 4)), 0);
   return (
-    <section className="local-skills" aria-label="Настроенные standalone skills">
+    <section className="local-skills" aria-label="Эффективные skills Pi">
       <div className="section-title" style={{ padding: "18px 2px 8px" }}>
-        Standalone skills · {skills.length}{skills.length > 0 ? ` · описания ≈${contextTokens} ток.` : ""}
+        Resolved skills · {skills.length}{skills.length > 0 ? ` · описания ≈${contextTokens} ток.` : ""}
       </div>
       <div className="hint" style={{ marginBottom: 10 }}>
-        Прямые SKILL.md и каталоги из settings.json → skills. Нажмите карточку, чтобы проверить инструкции в редакторе.
+        Эффективный набор Pi: settings.json, package manifests, .pi/skills и .agents/skills. Нажмите карточку, чтобы проверить инструкции.
       </div>
       {error && <div className="card" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>{error}</div>}
       {skills.map((skill) => (
-        <button key={skill.path} className="card click local-skill-card" aria-label={`Открыть skill ${skill.name}`} onClick={() => void open(skill)}>
-          <span className="c-title">{skill.name}</span>
+        <button
+          key={skill.path}
+          className={`card click local-skill-card${!skill.enabled || skill.shadowedBy ? " disabled" : ""}${!skill.valid ? " invalid" : ""}`}
+          aria-label={`Открыть skill ${skill.name}`}
+          onClick={() => void open(skill)}
+        >
+          <span className="local-skill-title">
+            <span className="c-title">{skill.name}</span>
+            {!skill.enabled && <span className="badge">Выключен</span>}
+            {!skill.valid && <span className="badge red">Pi не загрузит</span>}
+            {skill.shadowedBy && <span className="badge red">Конфликт имени</span>}
+            {skill.disableModelInvocation && <span className="badge">Только /skill</span>}
+          </span>
           {skill.description && <span className="c-sub">{skill.description}</span>}
+          <span className="local-skill-origin">
+            {skill.origin === "package" ? `package · ${skill.packageName ?? skill.sourceDir}` : skill.origin === "auto" ? "auto-discovery" : "settings.json"}
+          </span>
+          {skill.warning && <span className="local-skill-warning">{skill.warning}</span>}
           <code>{skill.sourceDir}</code>
         </button>
       ))}
-      {skills.length === 0 && !error && <div className="muted">В этом scope standalone skills не настроены.</div>}
+      {skills.length === 0 && !error && <div className="muted">В этом scope Pi не обнаружил skills.</div>}
     </section>
   );
 }
