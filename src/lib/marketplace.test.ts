@@ -3,6 +3,7 @@ import {
   isPackageResourceEnabled,
   packageCliSource,
   packageNameFromSpec,
+  packageProvidesResource,
   packageRisk,
   setPackageResourceEnabled,
 } from "../components/Marketplace";
@@ -46,6 +47,14 @@ describe("packageCliSource", () => {
 });
 
 describe("package resource filters", () => {
+  it("shows only installed packages that actually declare the selected resource", () => {
+    expect(packageProvidesResource({ resourceKinds: ["extension", "skill"] }, "skill")).toBe(true);
+    expect(packageProvidesResource({ resourceKinds: ["extension"] }, "theme")).toBe(false);
+    expect(packageProvidesResource({ resourceKinds: [] }, "extension")).toBe(false);
+    expect(packageProvidesResource({}, "prompt")).toBe(true);
+    expect(packageProvidesResource({ resourceKinds: null }, "prompt")).toBe(true);
+  });
+
   it("disables one resource kind without affecting the others", () => {
     const [next] = setPackageResourceEnabled(["npm:multi-tool"], "multi-tool", "skill", false);
     expect(next).toEqual({ source: "npm:multi-tool", skills: [] });

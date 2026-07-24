@@ -6,6 +6,9 @@
 
 use serde::Serialize;
 use serde_json::Value;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::task::JoinSet;
@@ -32,6 +35,11 @@ pub struct PiPackage {
     pub installed_version: Option<String>,
     pub update_available: bool,
     pub pinned: bool,
+    /// Resource kinds exposed by the installed manifest or conventional
+    /// resource directories. None means discovery was inconclusive; Some([])
+    /// is a known package that exposes no Pi resources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_kinds: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -173,6 +181,7 @@ fn parse_object(o: &Value) -> Option<PiPackage> {
         installed_version: None,
         update_available: false,
         pinned: false,
+        resource_kinds: None,
     })
 }
 
@@ -325,6 +334,7 @@ async fn fetch_one(spec: String) -> Option<PiPackage> {
         installed_version: None,
         update_available: false,
         pinned: false,
+        resource_kinds: None,
     })
 }
 
@@ -356,18 +366,170 @@ fn npm_name_and_pin(spec: &str) -> Option<(String, bool)> {
     Some((name.to_string(), pinned))
 }
 
-fn installed_version(name: &str) -> Option<String> {
-    let package_json = crate::sessions::agent_dir()
-        .join("npm")
-        .join("node_modules")
-        .join(name)
-        .join("package.json");
+fn installed_version(root: &Path, name: &str) -> Option<String> {
+    let package_json = package_dir_for_root(root, &format!("npm:{name}"))?.join("package.json");
     let text = std::fs::read_to_string(package_json).ok()?;
     serde_json::from_str::<Value>(&text)
         .ok()?
         .get("version")?
         .as_str()
         .map(str::to_string)
+}
+
+fn clean_package_spec_path(raw: &str) -> &str {
+    raw.split(['?', '#']).next().unwrap_or_default()
+}
+
+fn package_dir_for_root(root: &Path, spec: &str) -> Option<PathBuf> {
+    if let Some(raw) = spec.strip_prefix("npm:") {
+        let (name, _) = npm_name_and_pin(raw)?;
+        return Some(root.join("npm").join("node_modules").join(name));
+    }
+    if let Some(raw) = spec.strip_prefix("git:") {
+        let clean = clean_package_spec_path(raw).trim_end_matches(['/', '\\']);
+        let relative = if clean.starts_with("github.com/") {
+            clean
+        } else if let Some((_, tail)) = clean.split_once("://") {
+            tail.trim_start_matches("git@")
+        } else if let Some(tail) = clean.strip_prefix("git@github.com:") {
+            return Some(
+                root.join("git")
+                    .join("github.com")
+                    .join(tail.trim_end_matches(".git")),
+            );
+        } else {
+            clean
+        };
+        return Some(root.join("git").join(relative.trim_end_matches(".git")));
+    }
+    let raw = clean_package_spec_path(spec.strip_prefix("file:").unwrap_or(spec));
+    let expanded = if let Some(relative) = raw.strip_prefix("~/") {
+        dirs::home_dir()?.join(relative)
+    } else {
+        PathBuf::from(raw)
+    };
+    Some(if expanded.is_absolute() {
+        expanded
+    } else {
+        root.join(expanded)
+    })
+}
+
+fn read_json_limited(path: &Path) -> Option<Value> {
+    let mut file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(256 * 1024)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn convention_has_resources(package_dir: &Path, key: &str) -> Option<bool> {
+    let directory = package_dir.join(key);
+    if !directory.is_dir() {
+        return Some(false);
+    }
+    let entries = std::fs::read_dir(&directory).ok()?;
+    if key == "prompts" || key == "themes" {
+        let extension = if key == "prompts" { "md" } else { "json" };
+        return Some(entries.flatten().any(|entry| {
+            entry.path().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+        }));
+    }
+    if key == "extensions" {
+        return Some(entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.is_file() {
+                return path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| matches!(value, "ts" | "js"));
+            }
+            path.is_dir()
+                && (path.join("index.ts").is_file()
+                    || path.join("index.js").is_file()
+                    || read_json_limited(&path.join("package.json"))
+                        .and_then(|manifest| {
+                            manifest.get("pi")?.get("extensions")?.as_array().cloned()
+                        })
+                        .is_some_and(|entries| !entries.is_empty()))
+        }));
+    }
+
+    // Skills recurse in Pi. Bound the metadata probe so a hostile package
+    // cannot turn opening Library into an unbounded filesystem walk.
+    let mut pending = vec![(directory, 0usize)];
+    let mut visited = 0usize;
+    while let Some((directory, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > 1_000 {
+                return None;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            if path.is_file()
+                && (name == "SKILL.md"
+                    || (depth == 0
+                        && path
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            .is_some_and(|value| value.eq_ignore_ascii_case("md"))))
+            {
+                return Some(true);
+            }
+            if path.is_dir() && depth < 16 {
+                pending.push((path, depth + 1));
+            }
+        }
+    }
+    Some(false)
+}
+
+fn resource_kinds_from_package(package_dir: &Path) -> Option<Vec<String>> {
+    let manifest: Value = read_json_limited(&package_dir.join("package.json"))?;
+    let config = manifest
+        .get("pi")
+        .or_else(|| manifest.get("pi-package"))
+        .and_then(Value::as_object);
+    let mut kinds = Vec::new();
+    for (key, kind) in [
+        ("extensions", "extension"),
+        ("skills", "skill"),
+        ("themes", "theme"),
+        ("prompts", "prompt"),
+    ] {
+        let configured = config.and_then(|config| config.get(key));
+        let declared = configured
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty())
+            || configured
+                .and_then(Value::as_str)
+                .is_some_and(|entry| !entry.trim().is_empty())
+            || (configured.is_none() && convention_has_resources(package_dir, key)?);
+        if declared {
+            kinds.push(kind.to_string());
+        }
+    }
+    Some(kinds)
+}
+
+fn installed_resource_kinds(root: &Path, spec: &str) -> Option<Vec<String>> {
+    let directory = package_dir_for_root(root, spec)?;
+    resource_kinds_from_package(&directory)
 }
 
 fn installed_display_name(spec: &str) -> String {
@@ -393,7 +555,7 @@ fn installed_display_name(spec: &str) -> String {
         .to_string()
 }
 
-fn installed_fallback(spec: &str) -> PiPackage {
+fn installed_fallback(root: &Path, spec: &str) -> PiPackage {
     let name = installed_display_name(spec);
     let npm_name = spec
         .strip_prefix("npm:")
@@ -431,23 +593,27 @@ fn installed_fallback(spec: &str) -> PiPackage {
         keywords: Vec::new(),
         updated: None,
         popularity: 0.0,
-        installed_version: npm_name.as_deref().and_then(installed_version),
+        installed_version: npm_name
+            .as_deref()
+            .and_then(|name| installed_version(root, name)),
         update_available: false,
         pinned: false,
+        resource_kinds: installed_resource_kinds(root, spec),
     }
 }
 
-async fn resolve_installed_package(spec: String) -> Option<PiPackage> {
+async fn resolve_installed_package(root: PathBuf, spec: String) -> Option<PiPackage> {
     let Some(raw_npm) = spec.strip_prefix("npm:") else {
-        return Some(installed_fallback(&spec));
+        return Some(installed_fallback(&root, &spec));
     };
     let Some((name, pinned)) = npm_name_and_pin(raw_npm) else {
-        return Some(installed_fallback(&spec));
+        return Some(installed_fallback(&root, &spec));
     };
-    let local = installed_version(&name);
+    let local = installed_version(&root, &name);
     let mut package = fetch_one(spec.clone())
         .await
-        .unwrap_or_else(|| installed_fallback(&spec));
+        .unwrap_or_else(|| installed_fallback(&root, &spec));
+    package.resource_kinds = installed_resource_kinds(&root, &spec);
     package.source = Some(spec);
     package.installed_version = local.clone();
     package.pinned = pinned;
@@ -462,13 +628,19 @@ async fn resolve_installed_package(spec: String) -> Option<PiPackage> {
 /// `packages`) — used by the "Installed" view so it lists every installed
 /// package, not just those surfaced by a catalog search. Fetched concurrently.
 #[tauri::command]
-pub async fn pi_packages_meta(names: Vec<String>) -> Vec<PiPackage> {
+pub async fn pi_packages_meta(names: Vec<String>, cwd: Option<String>) -> Vec<PiPackage> {
     const MAX_PACKAGES: usize = 80;
     const MAX_CONCURRENT_FETCHES: usize = 8;
+    // Pi resolves project-scoped npm/git/local package sources relative to
+    // <cwd>/.pi; user-scoped packages use the agent directory.
+    let root = cwd
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| PathBuf::from(value).join(".pi"))
+        .unwrap_or_else(crate::sessions::agent_dir);
     let mut pending = names.into_iter().take(MAX_PACKAGES);
     let mut set = JoinSet::new();
     for spec in pending.by_ref().take(MAX_CONCURRENT_FETCHES) {
-        set.spawn(resolve_installed_package(spec));
+        set.spawn(resolve_installed_package(root.clone(), spec));
     }
     let mut out = Vec::new();
     while let Some(res) = set.join_next().await {
@@ -476,7 +648,7 @@ pub async fn pi_packages_meta(names: Vec<String>) -> Vec<PiPackage> {
             out.push(p);
         }
         if let Some(spec) = pending.next() {
-            set.spawn(resolve_installed_package(spec));
+            set.spawn(resolve_installed_package(root.clone(), spec));
         }
     }
     out.sort_by_key(|a| a.name.to_lowercase());
@@ -548,24 +720,120 @@ mod tests {
 
     #[test]
     fn installed_fallback_preserves_npm_git_and_local_sources() {
-        let npm = installed_fallback("npm:@scope/pkg@2.0.0");
+        let root = Path::new("/agent");
+        let npm = installed_fallback(root, "npm:@scope/pkg@2.0.0");
         assert_eq!(npm.name, "@scope/pkg");
         assert_eq!(npm.source.as_deref(), Some("npm:@scope/pkg@2.0.0"));
         assert_eq!(npm.npm_url, "https://www.npmjs.com/package/@scope/pkg");
 
-        let git = installed_fallback("git:github.com/DietrichGebert/ponytail.git");
+        let git = installed_fallback(root, "git:github.com/DietrichGebert/ponytail.git");
         assert_eq!(git.name, "ponytail");
         assert_eq!(
             git.repo_url.as_deref(),
             Some("https://github.com/DietrichGebert/ponytail")
         );
 
-        let local = installed_fallback("../../GithubControl/pi-app/harness-extension/");
+        let local = installed_fallback(root, "../../GithubControl/pi-app/harness-extension/");
         assert_eq!(local.name, "harness-extension");
         assert_eq!(
             local.source.as_deref(),
             Some("../../GithubControl/pi-app/harness-extension/")
         );
         assert!(local.npm_url.is_empty());
+    }
+
+    #[test]
+    fn resolves_npm_git_and_local_manifest_directories() {
+        let root = Path::new("/agent");
+        assert_eq!(
+            package_dir_for_root(root, "npm:@scope/pkg@2.0.0"),
+            Some(PathBuf::from("/agent/npm/node_modules/@scope/pkg"))
+        );
+        assert_eq!(
+            package_dir_for_root(root, "git:github.com/owner/repo.git#main"),
+            Some(PathBuf::from("/agent/git/github.com/owner/repo"))
+        );
+        assert_eq!(
+            package_dir_for_root(root, "../../workspace/custom-package"),
+            Some(PathBuf::from("/agent/../../workspace/custom-package"))
+        );
+    }
+
+    #[test]
+    fn discovers_project_scoped_packages_from_the_project_pi_root() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().join(".pi");
+        let package = root.join("npm/node_modules/project-skill");
+        std::fs::create_dir_all(package.join("skills/review")).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"name":"project-skill"}"#).unwrap();
+        std::fs::write(package.join("skills/review/SKILL.md"), "# Review").unwrap();
+
+        assert_eq!(
+            installed_resource_kinds(&root, "npm:project-skill"),
+            Some(vec!["skill".to_string()])
+        );
+    }
+
+    #[test]
+    fn reads_declared_resource_kinds_from_package_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("package.json");
+        std::fs::write(
+            &manifest,
+            r#"{
+                "name": "multi",
+                "pi": {
+                    "extensions": ["./index.ts"],
+                    "skills": ["./skills"],
+                    "themes": [],
+                    "prompts": "./prompts"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resource_kinds_from_package(temp.path()),
+            Some(vec![
+                "extension".to_string(),
+                "skill".to_string(),
+                "prompt".to_string()
+            ])
+        );
+
+        std::fs::write(&manifest, r#"{"name":"plain"}"#).unwrap();
+        assert_eq!(resource_kinds_from_package(temp.path()), Some(Vec::new()));
+        std::fs::write(&manifest, "{invalid").unwrap();
+        assert_eq!(resource_kinds_from_package(temp.path()), None);
+    }
+
+    #[test]
+    fn discovers_convention_resources_but_respects_explicit_empty_filters() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("extensions")).unwrap();
+        std::fs::create_dir_all(temp.path().join("skills/review")).unwrap();
+        std::fs::create_dir(temp.path().join("themes")).unwrap();
+        std::fs::write(temp.path().join("extensions/index.ts"), "export default {}").unwrap();
+        std::fs::write(
+            temp.path().join("skills/review/SKILL.md"),
+            "---\nname: review\n---",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("themes/quiet.json"), "{}").unwrap();
+        std::fs::write(temp.path().join("package.json"), r#"{"name":"convention"}"#).unwrap();
+        assert_eq!(
+            resource_kinds_from_package(temp.path()),
+            Some(vec![
+                "extension".to_string(),
+                "skill".to_string(),
+                "theme".to_string()
+            ])
+        );
+
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"name":"filtered","pi":{"extensions":[],"skills":[],"themes":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(resource_kinds_from_package(temp.path()), Some(Vec::new()));
     }
 }

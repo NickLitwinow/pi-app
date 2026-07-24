@@ -1317,17 +1317,26 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    static TEST_AGENT_ENV_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+        LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
     struct AgentDirEnv {
+        _lock: tokio::sync::OwnedMutexGuard<()>,
         app: Option<std::ffi::OsString>,
         pi: Option<std::ffi::OsString>,
     }
 
     impl AgentDirEnv {
-        fn set(path: &Path) -> Self {
-            let previous = Self {
+        async fn current() -> Self {
+            Self {
+                _lock: TEST_AGENT_ENV_LOCK.clone().lock_owned().await,
                 app: std::env::var_os("PI_APP_AGENT_DIR"),
                 pi: std::env::var_os("PI_CODING_AGENT_DIR"),
-            };
+            }
+        }
+
+        async fn set(path: &Path) -> Self {
+            let previous = Self::current().await;
             std::env::set_var("PI_APP_AGENT_DIR", path);
             std::env::set_var("PI_CODING_AGENT_DIR", path);
             previous
@@ -1509,6 +1518,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the user's installed Pi runtime and extensions"]
     async fn live_extension_health_gate_loads_the_real_harness_surface() {
+        let _env = AgentDirEnv::current().await;
         let workspace = tempdir().unwrap();
         let scratch = tempdir().unwrap();
         let report = validate_extension_runtime(&agent_dir(), workspace.path(), scratch.path())
@@ -1531,7 +1541,7 @@ mod tests {
             "export default function(pi){pi.registerCommand('fixture-ok',{description:'fixture',handler:async()=>{}});}\n",
         )
         .unwrap();
-        let _env = AgentDirEnv::set(&agent);
+        let _env = AgentDirEnv::set(&agent).await;
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
@@ -1610,7 +1620,7 @@ mod tests {
             "export default function(pi){pi.registerCommand('fixture-rollback',{description:'fixture',handler:async()=>{}});}\n",
         )
         .unwrap();
-        let _env = AgentDirEnv::set(&agent);
+        let _env = AgentDirEnv::set(&agent).await;
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
@@ -1651,7 +1661,7 @@ mod tests {
             "export default function(pi){pi.registerCommand('project-fixture',{description:'fixture',handler:async()=>{}});}\n",
         )
         .unwrap();
-        let _env = AgentDirEnv::set(&agent);
+        let _env = AgentDirEnv::set(&agent).await;
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
@@ -1714,7 +1724,7 @@ mod tests {
                 + "\n",
         )
         .unwrap();
-        let _env = AgentDirEnv::set(&agent);
+        let _env = AgentDirEnv::set(&agent).await;
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();

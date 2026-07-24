@@ -582,6 +582,9 @@ export interface PiPackage {
   installedVersion?: string | null;
   updateAvailable?: boolean;
   pinned?: boolean;
+  /** Resource kinds exposed by the installed manifest or conventional resource
+   * directories. Missing means discovery was inconclusive, so keep it visible. */
+  resourceKinds?: PackageKind[] | null;
 }
 
 export interface PiUpdateInfo {

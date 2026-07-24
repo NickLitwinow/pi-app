@@ -73,6 +73,15 @@ export function packageCliSource(pkg: Pick<PiPackage, "name" | "source">): strin
   return pkg.source || `npm:${pkg.name}`;
 }
 
+/** Unknown manifests remain visible so custom package layouts are manageable;
+ * a successfully inspected manifest with no matching resource is filtered. */
+export function packageProvidesResource(
+  pkg: Pick<PiPackage, "resourceKinds">,
+  kind: PackageKind,
+): boolean {
+  return !Array.isArray(pkg.resourceKinds) || pkg.resourceKinds.includes(kind);
+}
+
 function isHarnessCorePackage(pkg: Pick<PiPackage, "name" | "source">): boolean {
   return pkg.name === "harness-extension" && Boolean(pkg.source && !pkg.source.startsWith("npm:"));
 }
@@ -285,14 +294,17 @@ export default function Marketplace({
     setLoadingInstalled(true);
     try {
       const be = await getBackend();
-      setInstalledMeta(await be.invoke<PiPackage[]>("pi_packages_meta", { names: specs }));
+      setInstalledMeta(await be.invoke<PiPackage[]>("pi_packages_meta", {
+        names: specs,
+        cwd: scope === "project" ? cwd : null,
+      }));
     } catch {
       setInstalledMeta([]);
     } finally {
       setLoadingInstalled(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [specsKey]);
+  }, [specsKey, scope, cwd]);
 
   useEffect(() => {
     void loadInstalledMeta();
@@ -335,7 +347,8 @@ export default function Marketplace({
   }, [fetchPage]);
 
   const missingRec = (recommended ?? []).filter((r) => !installed.has(r.pkg.replace(/^npm:/, "")));
-  const shown = onlyInstalled ? sortPackages(installedMeta, sort) : sortPackages(results, sort);
+  const installedForKind = installedMeta.filter((pkg) => packageProvidesResource(pkg, kind));
+  const shown = onlyInstalled ? sortPackages(installedForKind, sort) : sortPackages(results, sort);
   const canLoadMore = !onlyInstalled && results.length < total;
 
   const install = (name: string) => void runPi(["install", ...(scope === "project" ? ["-l"] : []), `npm:${name}`], scope === "project" ? cwd : null);
@@ -556,7 +569,7 @@ export default function Marketplace({
         {onlyInstalled
           ? loadingInstalled
             ? "загрузка установленных…"
-            : `${specs.length} установленных пакетов`
+            : `Пакеты с ресурсом «${KIND_LABEL[kind]}»: ${installedForKind.length}`
           : loading && results.length === 0
             ? "загрузка каталога…"
             : `${total.toLocaleString("ru-RU")} пакетов в каталоге pi.dev`}
@@ -567,7 +580,7 @@ export default function Marketplace({
       {shown.map(renderCard)}
 
       {shown.length === 0 && !loading && !loadingInstalled && (
-        <div className="muted">{onlyInstalled ? "Установленных пакетов нет" : "Ничего не найдено"}</div>
+        <div className="muted">{onlyInstalled ? "Пакетов с ресурсами этого типа нет" : "Ничего не найдено"}</div>
       )}
 
       {canLoadMore && (

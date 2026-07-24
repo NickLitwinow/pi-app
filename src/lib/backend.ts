@@ -65,6 +65,13 @@ class MockBackend implements Backend {
   private rewindTargetBySession = new Map<string, string>();
   private permMode: string | null = null;
   private previewRuntime: PreviewStatus | null = null;
+  private projectSettings = JSON.stringify(
+    { packages: ["npm:pi-skill-code-review"] },
+    null,
+    2,
+  );
+  private projectMcp = "{}";
+  private projectMcpExists = false;
   private settings = JSON.stringify(
     {
       defaultProvider: "ollama",
@@ -690,6 +697,11 @@ class MockBackend implements Backend {
               ? raw.slice(0, raw.indexOf("@", raw.indexOf("/") + 1) > 0 ? raw.indexOf("@", raw.indexOf("/") + 1) : undefined)
               : raw.split("@", 1)[0];
             const name = npm ? unpinned : raw.replace(/[\\/]+$/, "").split(/[\\/]/).pop()?.replace(/\.git$/, "") || raw;
+            const resourceKinds = name === "pi-web-access" || name === "ponytail"
+              ? ["extension", "skill"] as const
+              : name === "pi-skill-code-review"
+                ? ["skill"] as const
+                : ["extension"] as const;
             return {
             source,
             name,
@@ -706,6 +718,7 @@ class MockBackend implements Backend {
             keywords: [],
             updated: null,
             popularity: 0,
+            resourceKinds: [...resourceKinds],
           }}) satisfies PiPackage[] as T;
       }
       case "pi_package_details":
@@ -779,13 +792,27 @@ class MockBackend implements Backend {
         return { path: `~/.pi/agent/${name}.json`, content, exists: true } satisfies ConfigFile as T;
       }
       case "read_project_settings":
-        return { path: `/Users/dev/pi-app/.pi/settings.json`, content: JSON.stringify({ packages: ["npm:pi-skill-code-review"] }, null, 2), exists: true } satisfies ConfigFile as T;
-      case "write_project_settings":
+        return { path: `/Users/dev/pi-app/.pi/settings.json`, content: this.projectSettings, exists: true } satisfies ConfigFile as T;
+      case "write_project_settings": {
+        this.projectSettings = String(args.content);
         return undefined as T;
-      case "read_project_pi_config":
-        return { path: `/Users/dev/pi-app/.pi/${String(args.name)}.json`, content: "{}", exists: false } satisfies ConfigFile as T;
-      case "write_project_pi_config":
+      }
+      case "read_project_pi_config": {
+        const name = String(args.name);
+        return {
+          path: `/Users/dev/pi-app/.pi/${name}.json`,
+          content: name === "settings" ? this.projectSettings : this.projectMcp,
+          exists: name === "settings" || this.projectMcpExists,
+        } satisfies ConfigFile as T;
+      }
+      case "write_project_pi_config": {
+        if (String(args.name) === "settings") this.projectSettings = String(args.content);
+        else {
+          this.projectMcp = String(args.content);
+          this.projectMcpExists = true;
+        }
         return undefined as T;
+      }
       case "write_pi_config": {
         const name = String(args.name);
         const content = String(args.content);
@@ -795,10 +822,8 @@ class MockBackend implements Backend {
         return undefined as T;
       }
       case "set_extension_resource_enabled": {
-        if (String(args.scope) !== "global") {
-          return JSON.stringify({ packages: ["npm:pi-skill-code-review"] }, null, 2) as T;
-        }
-        const parsed = JSON.parse(this.settings) as Record<string, unknown>;
+        const projectScope = String(args.scope) === "project";
+        const parsed = JSON.parse(projectScope ? this.projectSettings : this.settings) as Record<string, unknown>;
         const key = ({ extension: "extensions", skill: "skills", theme: "themes", prompt: "prompts" } as const)[String(args.kind) as "extension" | "skill" | "theme" | "prompt"];
         const identifier = String(args.packageIdentifier);
         const packages = Array.isArray(parsed.packages) ? parsed.packages.map((raw) => {
@@ -809,8 +834,10 @@ class MockBackend implements Backend {
           else next[key] = [];
           return Object.keys(next).length === 1 ? source : next;
         }) : [];
-        this.settings = JSON.stringify({ ...parsed, packages }, null, 2) + "\n";
-        return this.settings as T;
+        const content = JSON.stringify({ ...parsed, packages }, null, 2) + "\n";
+        if (projectScope) this.projectSettings = content;
+        else this.settings = content;
+        return content as T;
       }
       case "list_skills":
         return [
