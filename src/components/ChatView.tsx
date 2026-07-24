@@ -9,6 +9,8 @@ import {
   MAX_IMAGE_ATTACHMENTS,
   MAX_TOTAL_IMAGE_ATTACHMENT_BYTES,
   mergeImageAttachments,
+  resolveImagePolicy,
+  type ImagePolicyIssue,
   type MergeAttachmentResult,
 } from "../lib/attachments";
 import { confirmDialog, messageDialog } from "../lib/dialog";
@@ -933,7 +935,12 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const [attachments, setAttachments] = useState<Attachment[]>(initialDraft?.attachments ?? []);
   const [contextFiles, setContextFiles] = useState<string[]>(initialDraft?.contextFiles ?? []);
   const [attachmentReads, setAttachmentReads] = useState(0);
-  const [imagePolicy, setImagePolicy] = useState<{ cwd: string; blocked: boolean } | null>(null);
+  const [imagePolicy, setImagePolicy] = useState<{
+    cwd: string;
+    blocked: boolean;
+    explicitlyBlocked: boolean;
+    issue: ImagePolicyIssue | null;
+  } | null>(null);
   const [palIdx, setPalIdx] = useState(0);
   // Esc скрывает палитру команд, НЕ стирая ввод; следующее изменение текста показывает снова
   const [palHidden, setPalHidden] = useState(false);
@@ -951,16 +958,20 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const modelCanSendImages = composerModel?.input?.includes("image") === true;
   const imagePolicyReady = imagePolicy?.cwd === cwd;
   const imagesBlocked = imagePolicyReady ? imagePolicy.blocked : false;
+  const imagesExplicitlyBlocked = imagePolicyReady ? imagePolicy.explicitlyBlocked : false;
+  const imagePolicyIssue = imagePolicyReady ? imagePolicy.issue : null;
   const canSendImages = imagePolicyReady && modelCanSendImages && !imagesBlocked;
   const isAttaching = attachmentReads > 0;
   const hasDraft = Boolean(text.trim() || attachments.length > 0 || contextFiles.length > 0);
   const attachmentModeHint = !imagePolicyReady
     ? "Проверяем политику изображений Pi…"
-    : imagesBlocked
-      ? "Изображения заблокированы в Pi Settings; локальные файлы будут добавлены как пути"
-      : modelCanSendImages
-        ? "Изображения уйдут vision-блоками; остальные файлы — путями"
-        : "Текущая модель text-only; файлы будут добавлены как пути";
+    : imagePolicyIssue
+      ? "Pi image policy недоступна; пиксели не отправятся, локальные файлы будут добавлены как пути"
+      : imagesExplicitlyBlocked
+        ? "Изображения заблокированы в Pi Settings; локальные файлы будут добавлены как пути"
+        : modelCanSendImages
+          ? "Изображения уйдут vision-блоками; остальные файлы — путями"
+          : "Текущая модель text-only; файлы будут добавлены как пути";
 
   const reportAttachmentMerge = useCallback((result: MergeAttachmentResult) => {
     if (
@@ -1001,34 +1012,16 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
     let cancelled = false;
     void (async () => {
       const be = await getBackend();
-      const [globalFile, projectFile] = await Promise.all([
-        be.invoke<{ content: string }>("read_pi_config", { name: "settings" }).catch(() => null),
-        be.invoke<{ content: string }>("read_project_pi_config", { cwd, name: "settings" }).catch(() => null),
+      const [globalResult, projectResult] = await Promise.allSettled([
+        be.invoke<{ content: string }>("read_pi_config", { name: "settings" }),
+        be.invoke<{ content: string }>("read_project_pi_config", { cwd, name: "settings" }),
       ]);
-      const parseImages = (content: string | undefined): { valid: boolean; blockImages?: boolean } => {
-        try {
-          const parsed = JSON.parse(content ?? "{}") as { images?: { blockImages?: unknown } };
-          return typeof parsed.images?.blockImages === "boolean"
-            ? { valid: true, blockImages: parsed.images.blockImages }
-            : { valid: true };
-        } catch {
-          return { valid: false };
-        }
-      };
-      const globalImages = parseImages(globalFile?.content);
-      const projectImages = parseImages(projectFile?.content);
+      const policy = resolveImagePolicy(
+        globalResult.status === "fulfilled" ? globalResult.value : null,
+        projectResult.status === "fulfilled" ? projectResult.value : null,
+      );
       if (!cancelled) {
-        const readFailed = globalFile == null
-          || projectFile == null
-          || !globalImages.valid
-          || !projectImages.valid;
-        setImagePolicy({
-          cwd,
-          blocked: readFailed || (projectImages.blockImages ?? globalImages.blockImages ?? false),
-        });
-        if (readFailed) {
-          notifyChat(cwd, "warning", "Не удалось проверить Pi image policy — отправка пикселей заблокирована");
-        }
+        setImagePolicy({ cwd, ...policy });
       }
     })();
     return () => { cancelled = true; };
@@ -1275,9 +1268,11 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
       return;
     }
     if (!canSendImages) {
-      notifyChat(cwd, "warning", imagesBlocked
-        ? "Изображения отключены в Settings → Основные → Изображения"
-        : "Текущая модель не поддерживает vision-вложения");
+      notifyChat(cwd, "warning", imagePolicyIssue
+        ? "Не удалось проверить Pi image policy — файл не отправлен"
+        : imagesExplicitlyBlocked
+          ? "Изображения отключены в Settings → Основные → Изображения"
+          : "Текущая модель не поддерживает vision-вложения");
       return;
     }
     const valid: File[] = [];
@@ -1304,7 +1299,7 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
       if (fileRef.current) fileRef.current.value = "";
       taRef.current?.focus();
     }
-  }, [canSendImages, cwd, imagePolicyReady, imagesBlocked, mergeAttachments]);
+  }, [canSendImages, cwd, imagePolicyIssue, imagePolicyReady, imagesExplicitlyBlocked, mergeAttachments]);
 
   useEffect(() => {
     const onBrowserFiles = (event: Event) => {

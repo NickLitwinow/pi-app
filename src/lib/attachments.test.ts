@@ -8,6 +8,7 @@ import {
   imageMimeTypeForFile,
   MAX_TOTAL_IMAGE_ATTACHMENT_BYTES,
   mergeImageAttachments,
+  resolveImagePolicy,
 } from "./attachments";
 
 describe("image attachment contract", () => {
@@ -106,5 +107,34 @@ describe("image attachment contract", () => {
     expect(estimateBase64Bytes("YQ==")).toBe(1);
     expect(estimateBase64Bytes("YWI=")).toBe(2);
     expect(estimateBase64Bytes("YWJj")).toBe(3);
+  });
+
+  it("resolves project image policy over the global setting", () => {
+    expect(resolveImagePolicy(
+      { content: JSON.stringify({ images: { blockImages: true } }) },
+      { content: JSON.stringify({ images: { blockImages: false } }) },
+    )).toEqual({
+      blocked: false,
+      explicitlyBlocked: false,
+      issue: null,
+    });
+  });
+
+  it("keeps unavailable and malformed policies fail-closed without calling them user blocks", () => {
+    expect(resolveImagePolicy({ content: "{}" }, null)).toEqual({
+      blocked: true,
+      explicitlyBlocked: false,
+      issue: "project-unavailable",
+    });
+    expect(resolveImagePolicy(
+      { content: JSON.stringify({ images: { blockImages: "yes" } }) },
+      { content: "{}" },
+    )).toEqual({
+      blocked: true,
+      explicitlyBlocked: false,
+      issue: "global-invalid",
+    });
+    expect(resolveImagePolicy(null, { content: "{}" }).issue).toBe("global-unavailable");
+    expect(resolveImagePolicy({ content: "{}" }, { content: "{\"images\":null}" }).issue).toBe("project-invalid");
   });
 });

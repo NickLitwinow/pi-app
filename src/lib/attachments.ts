@@ -1,4 +1,4 @@
-import type { ComposerAttachment, ContentBlock } from "./types";
+import type { ComposerAttachment, ConfigFile, ContentBlock } from "./types";
 
 export const SUPPORTED_IMAGE_MIME_TYPES = [
   "image/png",
@@ -12,6 +12,18 @@ export type SupportedImageMimeType = (typeof SUPPORTED_IMAGE_MIME_TYPES)[number]
 export const MAX_IMAGE_ATTACHMENT_BYTES = 10_000_000;
 export const MAX_TOTAL_IMAGE_ATTACHMENT_BYTES = 40_000_000;
 export const MAX_IMAGE_ATTACHMENTS = 20;
+
+export type ImagePolicyIssue =
+  | "global-unavailable"
+  | "global-invalid"
+  | "project-unavailable"
+  | "project-invalid";
+
+export interface ResolvedImagePolicy {
+  blocked: boolean;
+  explicitlyBlocked: boolean;
+  issue: ImagePolicyIssue | null;
+}
 
 const MIME_FROM_EXTENSION: Record<string, SupportedImageMimeType> = {
   png: "image/png",
@@ -65,6 +77,51 @@ export function estimateBase64Bytes(data: string): number {
   if (!data) return 0;
   const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
   return Math.max(0, Math.floor((data.length * 3) / 4) - padding);
+}
+
+function parseImagePolicy(
+  file: Pick<ConfigFile, "content"> | null,
+  scope: "global" | "project",
+): { blockImages?: boolean; issue: ImagePolicyIssue | null } {
+  if (!file) return { issue: `${scope}-unavailable` };
+  try {
+    const parsed = JSON.parse(file.content) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { issue: `${scope}-invalid` };
+    }
+    const images = (parsed as Record<string, unknown>).images;
+    if (images === undefined) return { issue: null };
+    if (typeof images !== "object" || Array.isArray(images)) {
+      return { issue: `${scope}-invalid` };
+    }
+    const blockImages = (images as Record<string, unknown>).blockImages;
+    if (blockImages === undefined) return { issue: null };
+    return typeof blockImages === "boolean"
+      ? { blockImages, issue: null }
+      : { issue: `${scope}-invalid` };
+  } catch {
+    return { issue: `${scope}-invalid` };
+  }
+}
+
+/**
+ * Resolves Pi's project-over-global image policy. Any unreadable or malformed
+ * policy stays fail-closed for provider-bound pixels, but is kept distinct from
+ * an explicit user setting so the UI can explain the correct recovery path.
+ */
+export function resolveImagePolicy(
+  globalFile: Pick<ConfigFile, "content"> | null,
+  projectFile: Pick<ConfigFile, "content"> | null,
+): ResolvedImagePolicy {
+  const globalPolicy = parseImagePolicy(globalFile, "global");
+  const projectPolicy = parseImagePolicy(projectFile, "project");
+  const issue = globalPolicy.issue ?? projectPolicy.issue;
+  const explicitlyBlocked = projectPolicy.blockImages ?? globalPolicy.blockImages ?? false;
+  return {
+    blocked: issue != null || explicitlyBlocked,
+    explicitlyBlocked,
+    issue,
+  };
 }
 
 export function attachmentDataUrl(attachment: Pick<ComposerAttachment, "data" | "mimeType">): string {
