@@ -585,19 +585,31 @@ function ThemesTab() {
   const [scope, setScope] = useState<"global" | "project">("global");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadGeneration = useRef(0);
 
   const load = useCallback(async () => {
+    const generation = ++loadGeneration.current;
     try {
       const be = await getBackend();
-      setThemes(await be.invoke<PiThemeInfo[]>("list_pi_themes", { cwd }));
+      const next = await be.invoke<PiThemeInfo[]>("list_pi_themes", { cwd });
+      if (generation !== loadGeneration.current) return;
+      setThemes(next);
       setError(null);
     } catch (loadError) {
+      if (generation !== loadGeneration.current) return;
       setThemes([]);
       setError(`Не удалось загрузить темы: ${String(loadError)}`);
     }
   }, [cwd]);
 
-  useEffect(() => void load(), [load]);
+  useEffect(() => {
+    setThemes([]);
+    setError(null);
+    void load();
+    return () => {
+      loadGeneration.current++;
+    };
+  }, [load]);
 
   const draftResolved = useMemo(
     () => Object.fromEntries(Object.entries(draft?.colors ?? {}).map(([key, value]) => [key, typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value) ? value : "#8b8b92"])),

@@ -292,29 +292,7 @@ fn source_from_mutation(args: &[String]) -> Option<&str> {
 }
 
 fn source_name(source: &str) -> String {
-    let source = source.trim();
-    if let Some(npm) = source.strip_prefix("npm:") {
-        if npm.starts_with('@') {
-            let separator = npm
-                .find('/')
-                .and_then(|slash| npm[slash + 1..].find('@').map(|at| slash + 1 + at));
-            return separator.map_or(npm, |index| &npm[..index]).to_string();
-        }
-        return npm.split('@').next().unwrap_or(npm).to_string();
-    }
-    let clean = source
-        .strip_prefix("file:")
-        .unwrap_or(source)
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(source)
-        .trim_end_matches(['/', '\\']);
-    clean
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(clean)
-        .trim_end_matches(".git")
-        .to_string()
+    crate::packages::installed_display_name(source)
 }
 
 fn is_harness_core(source: &str) -> bool {
@@ -1405,6 +1383,17 @@ mod tests {
             set_resource_filter(input, "harness-extension", "extension", false)
                 .unwrap_err()
                 .contains("ядром")
+        );
+    }
+
+    #[test]
+    fn resource_filters_match_protocol_and_pinned_git_packages_by_name() {
+        let input = r#"{"packages":["https://github.com/owner/browser-kit.git@stable"]}"#;
+        let disabled = set_resource_filter(input, "browser-kit", "extension", false).unwrap();
+        let value: Value = serde_json::from_str(&disabled).unwrap();
+        assert_eq!(
+            value.pointer("/packages/0/extensions"),
+            Some(&Value::Array(Vec::new()))
         );
     }
 

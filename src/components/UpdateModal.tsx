@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useInstalledPackages, useRunPi } from "../hooks/usePiPackages";
 import { getBackend } from "../lib/backend";
 import { messageDialog } from "../lib/dialog";
 import type { AppUpdateInfo, PiPackage, PiUpdateInfo } from "../lib/types";
 import { openExternalUrl, updateAppConfig, useStore } from "../state/store";
 import { CheckIcon, ExternalIcon, FolderIcon, PackageIcon, RefreshIcon } from "./icons";
-import { useInstalledPackages, useRunPi } from "./Marketplace";
 
 export default function UpdateModal({ onClose }: { onClose: () => void }) {
   const configuredRepo = useStore((s) => s.appConfig.sourceRepoPath ?? null);
@@ -19,23 +19,29 @@ export default function UpdateModal({ onClose }: { onClose: () => void }) {
   const [appOk, setAppOk] = useState(false);
   const [appLog, setAppLog] = useState<string[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
+  const checkGeneration = useRef(0);
   const { specs, reload: reloadInstalled } = useInstalledPackages();
   const specsKey = specs.join("\u0000");
 
   const check = useCallback(async () => {
+    const generation = ++checkGeneration.current;
     setChecking(true);
-    const be = await getBackend();
-    const [app, pi, packages] = await Promise.all([
-      be.invoke<AppUpdateInfo>("check_app_update", { sourceRepo: configuredRepo }).catch(() => null),
-      be.invoke<PiUpdateInfo>("check_pi_update").catch(() => null),
-      specs.length > 0
-        ? be.invoke<PiPackage[]>("pi_packages_meta", { names: specs }).catch(() => [])
-        : Promise.resolve([] as PiPackage[]),
-    ]);
-    setAppInfo(app);
-    setPiInfo(pi);
-    setPackageInfo(packages);
-    setChecking(false);
+    try {
+      const be = await getBackend();
+      const [app, pi, packages] = await Promise.all([
+        be.invoke<AppUpdateInfo>("check_app_update", { sourceRepo: configuredRepo }).catch(() => null),
+        be.invoke<PiUpdateInfo>("check_pi_update").catch(() => null),
+        specs.length > 0
+          ? be.invoke<PiPackage[]>("pi_packages_meta", { names: specs }).catch(() => [])
+          : Promise.resolve([] as PiPackage[]),
+      ]);
+      if (generation !== checkGeneration.current) return;
+      setAppInfo(app);
+      setPiInfo(pi);
+      setPackageInfo(packages);
+    } finally {
+      if (generation === checkGeneration.current) setChecking(false);
+    }
     // specsKey intentionally makes installed package changes retrigger the check.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [configuredRepo, specsKey]);
@@ -45,7 +51,12 @@ export default function UpdateModal({ onClose }: { onClose: () => void }) {
     void check();
   });
 
-  useEffect(() => void check(), [check]);
+  useEffect(() => {
+    void check();
+    return () => {
+      checkGeneration.current++;
+    };
+  }, [check]);
   useEffect(() => logRef.current?.scrollTo({ top: logRef.current.scrollHeight }), [appLog]);
 
   const repoPath = appInfo?.sourceRepo ?? configuredRepo ?? null;

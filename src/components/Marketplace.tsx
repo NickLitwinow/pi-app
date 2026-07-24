@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useInstalledPackages, useRunPi } from "../hooks/usePiPackages";
 import { getBackend } from "../lib/backend";
 import { confirmDialog } from "../lib/dialog";
 import {
@@ -9,129 +10,13 @@ import {
   packageRisk,
   packageSource,
 } from "../lib/marketplace";
-import type { ConfigFile, PackageDetails, PackageKind, PackageSearch, PackageSetting, PiPackage } from "../lib/types";
+import type { PackageDetails, PackageKind, PackageSearch, PiPackage } from "../lib/types";
 import { openExternalUrl } from "../state/store";
 import { CheckIcon, ExternalIcon, PackageIcon, RefreshIcon } from "./icons";
 import { Markdown } from "./Markdown";
 
-// ---------- installed packages (settings.json → packages[]) ----------
-
 function isHarnessCorePackage(pkg: Pick<PiPackage, "name" | "source">): boolean {
   return pkg.name === "harness-extension" && Boolean(pkg.source && !pkg.source.startsWith("npm:"));
-}
-
-/** Installed packages plus scoped, atomic resource controls. */
-export function useInstalledPackages(scope: "global" | "project" = "global", cwd?: string | null): {
-  installed: Set<string>;
-  specs: string[];
-  entries: PackageSetting[];
-  reload: () => void;
-  setResourceEnabled: (packageName: string, kind: PackageKind, enabled: boolean) => Promise<void>;
-} {
-  const [entries, setEntries] = useState<PackageSetting[]>([]);
-  const reloadGeneration = useRef(0);
-  const reload = useCallback(() => {
-    const generation = ++reloadGeneration.current;
-    void (async () => {
-      const be = await getBackend();
-      const f = scope === "project" && cwd
-        ? await be.invoke<ConfigFile>("read_project_settings", { cwd }).catch(() => null)
-        : await be.invoke<ConfigFile>("read_pi_config", { name: "settings" }).catch(() => null);
-      try {
-        const parsed = f ? (JSON.parse(f.content) as Record<string, unknown>) : {};
-        const packages = Array.isArray(parsed.packages)
-          ? parsed.packages.filter((item): item is PackageSetting =>
-            typeof item === "string" || Boolean(item && typeof item === "object" && "source" in item && typeof item.source === "string"))
-          : [];
-        if (generation === reloadGeneration.current) setEntries(packages);
-      } catch {
-        if (generation === reloadGeneration.current) setEntries([]);
-      }
-    })();
-  }, [scope, cwd]);
-  useEffect(() => {
-    setEntries([]);
-    reload();
-  }, [reload]);
-  const installed = new Set(entries.map(packageNameFromSpec).filter((name): name is string => Boolean(name)));
-  const specs = entries.map(packageSource);
-  const setResourceEnabled = useCallback(async (packageName: string, kind: PackageKind, enabled: boolean) => {
-    const generation = ++reloadGeneration.current;
-    try {
-      const be = await getBackend();
-      if (scope === "project" && !cwd) throw new Error("Сначала откройте проект");
-      const content = await be.invoke<string>("set_extension_resource_enabled", {
-        scope,
-        cwd: cwd ?? null,
-        packageIdentifier: packageName,
-        kind,
-        enabled,
-      });
-      const parsed = JSON.parse(content) as Record<string, unknown>;
-      const packages = Array.isArray(parsed.packages)
-        ? parsed.packages.filter((item): item is PackageSetting =>
-          typeof item === "string" || Boolean(item && typeof item === "object" && "source" in item && typeof item.source === "string"))
-        : [];
-      if (generation === reloadGeneration.current) setEntries(packages);
-    } catch (error) {
-      if (generation === reloadGeneration.current) reload();
-      throw error;
-    }
-  }, [cwd, reload, scope]);
-  return { installed, specs, entries, reload, setResourceEnabled };
-}
-
-// ---------- pi CLI run (install / remove / update) with streamed log ----------
-
-export function useRunPi(onDone?: () => void) {
-  const [log, setLog] = useState<string[]>([]);
-  const [running, setRunning] = useState(false);
-  const logRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-  }, [log]);
-
-  const runPi = async (args: string[], cwd?: string | null) => {
-    setRunning(true);
-    setLog((l) => [...l, `$ pi ${args.join(" ")}`]);
-    const be = await getBackend();
-    let un: (() => void) | null = null;
-    let succeeded = false;
-    try {
-      let runId: string | null = null;
-      const buffered: Record<string, unknown>[] = [];
-      let finish: () => void = () => {};
-      const donePromise = new Promise<void>((resolve) => (finish = resolve));
-      const handle = (p: Record<string, unknown>) => {
-        if (runId == null) {
-          buffered.push(p);
-          return;
-        }
-        if (p.runId !== runId) return;
-        if (p.done) {
-          setLog((l) => [...l, `— завершено (код ${String(p.code ?? "?")})`]);
-          succeeded = Number(p.code ?? 1) === 0;
-          finish();
-        } else if (p.line) {
-          setLog((l) => [...l.slice(-400), String(p.line)]);
-        }
-      };
-      un = await be.listen("pi-cli-output", handle);
-      runId = await be.invoke<string>("pi_cli_run", { args, cwd: cwd ?? null });
-      for (const p of buffered.splice(0)) handle(p);
-      await donePromise;
-    } catch (e) {
-      setLog((l) => [...l, `ошибка: ${String(e)}`]);
-    } finally {
-      un?.();
-      setRunning(false);
-      onDone?.();
-    }
-    return succeeded;
-  };
-
-  return { log, running, runPi, logRef, clearLog: () => setLog([]) };
 }
 
 // ---------- marketplace ----------
@@ -195,6 +80,8 @@ export default function Marketplace({
   const [installedRefresh, setInstalledRefresh] = useState(0);
   const [expandedPackage, setExpandedPackage] = useState<string | null>(null);
   const [packageDetails, setPackageDetails] = useState<Record<string, PackageDetails | null>>({});
+  const catalogLoadGeneration = useRef(0);
+  const detailsLoadGeneration = useRef(0);
 
   const { installed, specs, entries, reload, setResourceEnabled } = useInstalledPackages(scope, cwd);
   const { log, running, runPi, logRef } = useRunPi(() => {
@@ -246,6 +133,7 @@ export default function Marketplace({
 
   const fetchPage = useCallback(
     async (nextFrom: number, append: boolean) => {
+      const generation = ++catalogLoadGeneration.current;
       setLoading(true);
       setError(null);
       try {
@@ -256,22 +144,37 @@ export default function Marketplace({
           from: nextFrom,
           size: PAGE,
         });
+        if (generation !== catalogLoadGeneration.current) return;
         setTotal(res.total);
         setResults((prev) => (append ? [...prev, ...res.objects] : res.objects));
         setFrom(nextFrom);
       } catch (e) {
-        setError(String(e));
-        if (!append) setResults([]);
+        if (generation === catalogLoadGeneration.current) {
+          setError(String(e));
+          if (!append) setResults([]);
+        }
       } finally {
-        setLoading(false);
+        if (generation === catalogLoadGeneration.current) setLoading(false);
       }
     },
     [kind, debounced],
   );
 
   useEffect(() => {
+    setResults([]);
+    setTotal(0);
+    setFrom(0);
     void fetchPage(0, false);
+    return () => {
+      catalogLoadGeneration.current++;
+    };
   }, [fetchPage]);
+
+  useEffect(() => {
+    detailsLoadGeneration.current++;
+    setExpandedPackage(null);
+    setPackageDetails({});
+  }, [cwd, kind, scope]);
 
   const missingRec = (recommended ?? []).filter((r) => !installed.has(r.pkg.replace(/^npm:/, "")));
   const installedForKind = installedMeta.filter((pkg) => packageProvidesResource(pkg, kind));
@@ -306,24 +209,33 @@ export default function Marketplace({
   const toggleDetails = async (p: PiPackage) => {
     const identifier = p.source ?? p.name;
     if (expandedPackage === identifier) {
+      detailsLoadGeneration.current++;
       setExpandedPackage(null);
       return;
     }
+    const generation = ++detailsLoadGeneration.current;
     setExpandedPackage(identifier);
-    if (Object.prototype.hasOwnProperty.call(packageDetails, identifier)) return;
+    if (
+      Object.prototype.hasOwnProperty.call(packageDetails, identifier)
+      && packageDetails[identifier] !== null
+    ) return;
     setPackageDetails((current) => ({ ...current, [identifier]: null }));
     try {
       const be = await getBackend();
       const details = await be.invoke<PackageDetails>("pi_package_details", { name: p.name });
-      setPackageDetails((current) => ({ ...current, [identifier]: details }));
+      if (generation === detailsLoadGeneration.current) {
+        setPackageDetails((current) => ({ ...current, [identifier]: details }));
+      }
     } catch (detailsError) {
-      setError(`Не удалось загрузить README: ${String(detailsError)}`);
-      setExpandedPackage(null);
-      setPackageDetails((current) => {
-        const next = { ...current };
-        delete next[identifier];
-        return next;
-      });
+      if (generation === detailsLoadGeneration.current) {
+        setError(`Не удалось загрузить README: ${String(detailsError)}`);
+        setExpandedPackage(null);
+        setPackageDetails((current) => {
+          const next = { ...current };
+          delete next[identifier];
+          return next;
+        });
+      }
     }
   };
 

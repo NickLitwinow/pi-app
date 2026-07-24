@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
 import { getBackend } from "../lib/backend";
 import { confirmDialog, messageDialog } from "../lib/dialog";
@@ -59,20 +59,32 @@ function BranchPicker({
   const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadGeneration = useRef(0);
 
   const load = useCallback(async () => {
+    const generation = ++loadGeneration.current;
     try {
       const be = await getBackend();
-      setBranches(await be.invoke<BranchInfo[]>("git_branches", { cwd }));
+      const next = await be.invoke<BranchInfo[]>("git_branches", { cwd });
+      if (generation !== loadGeneration.current) return;
+      setBranches(next);
       setError(null);
     } catch (loadError) {
+      if (generation !== loadGeneration.current) return;
       setBranches([]);
       setError(`Не удалось загрузить ветки: ${String(loadError)}`);
     }
   }, [cwd]);
 
   useEffect(() => {
+    if (open) {
+      setBranches([]);
+      setError(null);
+    }
     if (open) void load();
+    return () => {
+      loadGeneration.current++;
+    };
   }, [open, load]);
 
   const act = async (fn: () => Promise<unknown>) => {
@@ -423,25 +435,34 @@ function ChangesTab({
   const [busy, setBusy] = useState(false);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [diffError, setDiffError] = useState<string | null>(null);
+  const refreshGeneration = useRef(0);
 
   const refresh = useCallback(async () => {
+    const generation = ++refreshGeneration.current;
     try {
       const be = await getBackend();
       const entries = await be.invoke<StatusEntry[]>("git_status", { cwd });
+      if (generation !== refreshGeneration.current) return;
       setRows(parseStatusEntries(entries));
       setStatusError(null);
     } catch (refreshError) {
+      if (generation !== refreshGeneration.current) return;
       setStatusError(`Не удалось прочитать состояние Git: ${String(refreshError)}`);
     }
   }, [cwd]);
 
   useEffect(() => {
     void refresh();
+    return () => {
+      refreshGeneration.current++;
+    };
   }, [refresh]);
 
   useEffect(() => {
+    setRows([]);
     setSelected(null);
     setDiffText("");
+    setStatusError(null);
     setDiffError(null);
   }, [cwd]);
 
@@ -655,18 +676,29 @@ function HistoryTab({ cwd, onComment }: { cwd: string; onComment: (c: ReviewComm
   const [diffError, setDiffError] = useState<string | null>(null);
 
   useEffect(() => {
+    let stale = false;
+    setCommits([]);
+    setSelected(null);
+    setDiffText("");
+    setHistoryError(null);
+    setDiffError(null);
     void (async () => {
       try {
         const be = await getBackend();
         const log = await be.invoke<CommitInfo[]>("git_log", { cwd, limit: 100 });
+        if (stale) return;
         setCommits(log);
         setHistoryError(null);
         setSelected(log[0]?.hash ?? null);
       } catch (loadError) {
+        if (stale) return;
         setCommits([]);
         setHistoryError(`Не удалось загрузить историю Git: ${String(loadError)}`);
       }
     })();
+    return () => {
+      stale = true;
+    };
   }, [cwd]);
 
   useEffect(() => {
@@ -760,29 +792,38 @@ function CheckpointsTab({ cwd, onComment, onChanged, initialBase }: { cwd: strin
   const [loading, setLoading] = useState(false);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const refreshGeneration = useRef(0);
 
   const refresh = useCallback(async () => {
+    const generation = ++refreshGeneration.current;
     setLoading(true);
     try {
       const be = await getBackend();
       const text = await be.invoke<string>("git_review_diff", { cwd, base: base === "HEAD" ? null : base });
+      if (generation !== refreshGeneration.current) return;
       setDiffText(text);
       setError(null);
     } catch (refreshError) {
+      if (generation !== refreshGeneration.current) return;
       setDiffText("");
       setError(`Не удалось загрузить diff чекпоинта: ${String(refreshError)}`);
     } finally {
-      setLoading(false);
+      if (generation === refreshGeneration.current) setLoading(false);
     }
   }, [cwd, base]);
 
   useEffect(() => {
     void refresh();
+    return () => {
+      refreshGeneration.current++;
+    };
   }, [refresh]);
 
   useEffect(() => {
     setBase(initialBase ?? "HEAD");
+    setDiffText("");
     setSelectedFile(null);
+    setError(null);
   }, [cwd, initialBase]);
 
   const files = useMemo(() => parseUnifiedDiff(diffText), [diffText]);
@@ -890,16 +931,22 @@ export default function ReviewView() {
   const [comments, setComments] = useState<ReviewComment[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
   const [reviewError, setReviewError] = useState<string | null>(null);
+  const summaryGeneration = useRef(0);
 
   const refreshSummary = useCallback(async () => {
     if (!cwd) return;
+    const generation = ++summaryGeneration.current;
     try {
       const be = await getBackend();
       const repo = await be.invoke<boolean>("git_is_repo", { cwd });
+      if (generation !== summaryGeneration.current) return;
       setIsRepo(repo);
-      setSummary(repo ? await be.invoke<GitSummary>("git_summary", { cwd }) : null);
+      const nextSummary = repo ? await be.invoke<GitSummary>("git_summary", { cwd }) : null;
+      if (generation !== summaryGeneration.current) return;
+      setSummary(nextSummary);
       setReviewError(null);
     } catch (refreshError) {
+      if (generation !== summaryGeneration.current) return;
       setIsRepo(null);
       setSummary(null);
       setReviewError(`Не удалось прочитать состояние репозитория: ${String(refreshError)}`);
@@ -908,7 +955,17 @@ export default function ReviewView() {
 
   useEffect(() => {
     void refreshSummary();
+    return () => {
+      summaryGeneration.current++;
+    };
   }, [refreshSummary, refreshKey]);
+
+  useEffect(() => {
+    setSummary(null);
+    setIsRepo(null);
+    setComments([]);
+    setReviewError(null);
+  }, [cwd]);
 
   useEffect(() => {
     if (reviewCheckpoint) setTab("checkpoints");

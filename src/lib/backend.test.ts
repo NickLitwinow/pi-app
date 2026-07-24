@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MockBackend } from "./backend";
-import type { ConfigFile, SessionMeta } from "./types";
+import type { ConfigFile, PiPackage, SessionMeta } from "./types";
 
 async function waitForResponses(
   backend: MockBackend,
@@ -30,6 +30,26 @@ async function waitForResponses(
 }
 
 describe("MockBackend session isolation", () => {
+  it("mirrors the installed browser extensions and normalizes arbitrary Git specs", async () => {
+    const backend = new MockBackend();
+    const settings = await backend.invoke<ConfigFile>("read_pi_config", { name: "settings" });
+    const packages = (JSON.parse(settings.content) as { packages: string[] }).packages;
+    expect(packages).toHaveLength(14);
+    expect(packages).toContain("npm:pi-chrome");
+    expect(packages).toContain("npm:pi-agent-browser-native");
+
+    const metadata = await backend.invoke<PiPackage[]>("pi_packages_meta", {
+      names: [
+        "https://github.com/owner/protocol-extension.git@release",
+        "git:git@github.com:owner/scp-extension.git#main",
+      ],
+    });
+    expect(metadata.map((item) => item.name)).toEqual([
+      "protocol-extension",
+      "scp-extension",
+    ]);
+  });
+
   it("lists only sessions belonging to the requested workspace", async () => {
     const backend = new MockBackend();
     const pi = await backend.invoke<SessionMeta[]>("list_sessions_for_cwd", { cwd: "/Users/dev/pi-app" });

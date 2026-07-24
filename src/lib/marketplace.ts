@@ -11,6 +11,35 @@ export function packageSource(spec: PackageSetting): string {
   return typeof spec === "string" ? spec : spec.source;
 }
 
+function gitPackagePath(source: string): string | null {
+  const trimmed = source.trim();
+  const hasGitPrefix = trimmed.startsWith("git:");
+  const raw = hasGitPrefix ? trimmed.slice(4).trim() : trimmed;
+  const protocol = /^(?:https?|ssh|git):\/\//i.test(raw);
+  if (!hasGitPrefix && !protocol) return null;
+
+  let repositoryPath = "";
+  const scp = raw.match(/^git@([^:]+):(.+)$/);
+  if (scp) {
+    repositoryPath = scp[2] ?? "";
+  } else if (protocol) {
+    try {
+      repositoryPath = new URL(raw).pathname.replace(/^\/+/, "");
+    } catch {
+      return null;
+    }
+  } else {
+    const slash = raw.indexOf("/");
+    if (slash < 0) return null;
+    repositoryPath = raw.slice(slash + 1);
+  }
+
+  repositoryPath = repositoryPath.split(/[?#]/, 1)[0];
+  const refAt = repositoryPath.indexOf("@");
+  if (refAt >= 0) repositoryPath = repositoryPath.slice(0, refAt);
+  return repositoryPath.replace(/[\\/]+$/, "").replace(/\.git$/i, "") || null;
+}
+
 /** Convert package specs into the stable display/resource-filter name. */
 export function packageNameFromSpec(spec: PackageSetting | unknown): string | null {
   const sourceSpec = typeof spec === "string"
@@ -18,9 +47,9 @@ export function packageNameFromSpec(spec: PackageSetting | unknown): string | nu
     : spec && typeof spec === "object" && "source" in spec && typeof spec.source === "string"
       ? spec.source
       : "";
-  if (sourceSpec.startsWith("git:")) {
-    const clean = sourceSpec.slice(4).split(/[?#]/, 1)[0].replace(/\/$/, "");
-    const name = clean.slice(clean.lastIndexOf("/") + 1).replace(/\.git$/, "");
+  const gitPath = gitPackagePath(sourceSpec);
+  if (gitPath) {
+    const name = gitPath.slice(gitPath.lastIndexOf("/") + 1);
     return name || null;
   }
   if (sourceSpec.startsWith("npm:")) {

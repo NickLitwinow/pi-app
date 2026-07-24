@@ -24,7 +24,12 @@ describe("packageNameFromSpec", () => {
     ["npm:@gotgenes/pi-permission-system@0.5.0", "@gotgenes/pi-permission-system"],
     ["git:https://example.com/package.git", "package"],
     ["git:github.com/DietrichGebert/ponytail", "ponytail"],
+    ["git:github.com/owner/pinned-extension.git@v2", "pinned-extension"],
+    ["git:git@github.com:owner/scp-extension.git@main", "scp-extension"],
+    ["https://github.com/owner/protocol-extension.git#release", "protocol-extension"],
+    ["ssh://git@gitlab.com/owner/ssh-extension.git@stable", "ssh-extension"],
     ["../../GithubControl/pi-app/harness-extension", "harness-extension"],
+    ["../packages/local@preview", "local@preview"],
     ["/Users/example/My Packages/custom-theme/", "custom-theme"],
     ["file:../shared/custom-skill", "custom-skill"],
   ])("normalizes %s", (source, expected) => {

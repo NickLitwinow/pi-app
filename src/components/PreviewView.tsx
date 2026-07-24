@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useInstalledPackages, useRunPi } from "../hooks/usePiPackages";
 import { getBackend } from "../lib/backend";
 import { messageDialog } from "../lib/dialog";
 import type { LaunchConfig, PreviewHandle, PreviewStatus } from "../lib/types";
 import { openExternalUrl, setSessionPreviewRuntime, useStore } from "../state/store";
-import { useInstalledPackages, useRunPi } from "./Marketplace";
 import { ExternalIcon, MinusIcon, MobileIcon, PreviewIcon, RefreshIcon, StopIcon, TabletIcon } from "./icons";
 
 type Device = "desktop" | "tablet" | "mobile";
@@ -48,6 +48,7 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   // зеркалим serverId в ref, чтобы гасить процесс из cleanup/при смене проекта
   const serverRef = useRef<string | null>(null);
+  const workspaceGeneration = useRef(0);
 
   const killServer = useCallback(async (id: string) => {
     const be = await getBackend();
@@ -66,16 +67,24 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
   // visible workspace detaches this pane but does not kill another session's
   // leased QA server; each workspace is managed independently by the backend.
   useEffect(() => {
-    if (!cwd) return;
+    const generation = ++workspaceGeneration.current;
     let cancelled = false;
     applyServer(null);
+    setConfigs([]);
+    setSelected("");
     setReady(false);
+    setStarting(false);
     setUrl("");
+    setAddress("");
     setLogs([]);
+    setShowLogs(false);
+    if (!cwd) return () => {
+      cancelled = true;
+    };
     void (async () => {
       const be = await getBackend();
       const cfgs = await be.invoke<LaunchConfig[]>("preview_configs", { cwd }).catch(() => []);
-      if (cancelled) return;
+      if (cancelled || generation !== workspaceGeneration.current) return;
       setConfigs(cfgs);
       if (cfgs[0]) {
         setSelected(cfgs[0].name);
@@ -85,7 +94,7 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
         setAddress("");
       }
       const active = await be.invoke<PreviewStatus | null>("preview_status", { cwd, serverId: null }).catch(() => null);
-      if (cancelled) return;
+      if (cancelled || generation !== workspaceGeneration.current) return;
       if (active?.running) {
         applyServer({ serverId: active.serverId, url: active.url, port: active.port });
         setUrl(active.url);
@@ -100,9 +109,10 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
   // поток логов dev-сервера
   useEffect(() => {
     let un: (() => void) | undefined;
+    let disposed = false;
     void (async () => {
       const be = await getBackend();
-      un = await be.listen("preview-output", (p) => {
+      const stopListening = await be.listen("preview-output", (p) => {
         const activeId = serverRef.current;
         if (!activeId || p.serverId !== activeId) return;
         if (p.done) {
@@ -121,8 +131,13 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
           setLogs((l) => [...l.slice(-300), String(p.line)]);
         }
       });
+      if (disposed) stopListening();
+      else un = stopListening;
     })();
-    return () => un?.();
+    return () => {
+      disposed = true;
+      un?.();
+    };
   }, [applyServer, cwd]);
 
   useEffect(() => {
@@ -135,13 +150,16 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
 
   const start = useCallback(async () => {
     if (!cwd) return;
+    const generation = workspaceGeneration.current;
     if (serverRef.current) await killServer(serverRef.current); // не плодим процессы
+    if (generation !== workspaceGeneration.current) return;
     setStarting(true);
     setLogs([]);
     setShowLogs(true);
     try {
       const be = await getBackend();
       const handle = await be.invoke<PreviewHandle>("preview_start", { cwd, name: selected || null });
+      if (generation !== workspaceGeneration.current) return;
       applyServer(handle);
       setReady(false);
       setUrl(handle.url);
@@ -150,7 +168,7 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
       // generic scripts can announce their actual URL only after startup.
       void (async () => {
         for (let i = 0; i < 60; i++) {
-          if (serverRef.current !== handle.serverId) return; // сервер сменили/остановили
+          if (generation !== workspaceGeneration.current || serverRef.current !== handle.serverId) return; // сервер сменили/остановили
           const status = await be.invoke<PreviewStatus | null>("preview_status", { cwd, serverId: handle.serverId }).catch(() => null);
           if (!status?.running) return;
           if (status.url && status.url !== handle.url) {
@@ -168,9 +186,11 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
         }
       })();
     } catch (e) {
-      void messageDialog(String(e), { kind: "error" });
+      if (generation === workspaceGeneration.current) {
+        void messageDialog(String(e), { kind: "error" });
+      }
     } finally {
-      setStarting(false);
+      if (generation === workspaceGeneration.current) setStarting(false);
     }
   }, [cwd, selected, killServer, applyServer]);
 
@@ -178,8 +198,10 @@ export default function PreviewPane({ onClose }: { onClose: () => void }) {
     if (!cwd || !serverRef.current) return;
     const stoppedId = serverRef.current;
     await killServer(stoppedId);
-    applyServer(null);
-    setReady(false);
+    if (serverRef.current === stoppedId) {
+      applyServer(null);
+      setReady(false);
+    }
     const prior = useStore.getState().chats[cwd]?.chat.previewRuntime;
     if (prior && prior.serverId === stoppedId) {
       setSessionPreviewRuntime(cwd, { ...prior, source: prior.source ?? "agent", status: "stopped", running: false, ready: false, updatedAt: Date.now() });

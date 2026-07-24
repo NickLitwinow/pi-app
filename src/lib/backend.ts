@@ -18,6 +18,7 @@ import type {
   SessionMeta,
   SkillInfo,
 } from "./types";
+import { packageNameFromSpec } from "./marketplace";
 
 export interface Backend {
   isMock: boolean;
@@ -91,6 +92,8 @@ export class MockBackend implements Backend {
         "npm:@plannotator/pi-extension",
         "../../GithubControl/pi-app/harness-extension",
         "git:github.com/DietrichGebert/ponytail",
+        "npm:pi-chrome",
+        "npm:pi-agent-browser-native",
       ],
       skills: ["~/.claude/skills"],
     },
@@ -144,18 +147,6 @@ export class MockBackend implements Backend {
       queues.set(agentId, queue);
     }
     return queue;
-  }
-
-  private packageNameForSource(source: string): string {
-    if (source.startsWith("npm:")) {
-      const raw = source.slice(4);
-      if (raw.startsWith("@")) {
-        const versionAt = raw.indexOf("@", raw.indexOf("/") + 1);
-        return versionAt > 0 ? raw.slice(0, versionAt) : raw;
-      }
-      return raw.split("@", 1)[0];
-    }
-    return source.replace(/[\\/]+$/, "").split(/[\\/]/).pop()?.replace(/\.git(?:[#?].*)?$/, "") ?? source;
   }
 
   private emit(event: string, payload: Record<string, unknown>) {
@@ -712,8 +703,10 @@ export class MockBackend implements Backend {
         } satisfies AnalyticsOverview as T;
       }
       case "search_pi_packages": {
-        await sleep(250);
         const kind = String(args.kind);
+        // Let an initial Extensions request finish after a quick switch to
+        // Skills so UI tests catch stale catalog responses deterministically.
+        await sleep(kind === "extension" ? 420 : 70);
         const from = Number(args.from ?? 0);
         const ext: PiPackage[] = [
           { name: "pi-web-access", version: "0.13.0", description: "Web search, URL fetching, GitHub repo cloning, PDF extraction, YouTube video understanding.", author: "nicopreme", downloadsMonthly: 126000, npmUrl: "https://www.npmjs.com/package/pi-web-access", repoUrl: "https://github.com/nicobailon/pi-web-access", homepage: null, keywords: ["pi-extension", "web-search"], updated: new Date().toISOString(), popularity: 1 },
@@ -740,11 +733,7 @@ export class MockBackend implements Backend {
         return names
           .map((source, index) => {
             const npm = source.startsWith("npm:");
-            const raw = npm ? source.slice(4) : source.replace(/^git:/, "").replace(/^file:/, "");
-            const unpinned = raw.startsWith("@")
-              ? raw.slice(0, raw.indexOf("@", raw.indexOf("/") + 1) > 0 ? raw.indexOf("@", raw.indexOf("/") + 1) : undefined)
-              : raw.split("@", 1)[0];
-            const name = npm ? unpinned : raw.replace(/[\\/]+$/, "").split(/[\\/]/).pop()?.replace(/\.git$/, "") || raw;
+            const name = packageNameFromSpec(source) ?? source;
             const resourceKinds = name === "pi-web-access" || name === "ponytail"
               ? ["extension", "skill"] as const
               : name === "pi-skill-code-review"
@@ -802,11 +791,16 @@ export class MockBackend implements Backend {
       case "preview_save_config":
         return undefined as T;
       case "preview_start": {
+        const requestedCwd = String(args.cwd ?? "/Users/dev/pi-app");
+        // Keep the original workspace start in flight long enough for the
+        // switching regression test to prove that its response cannot attach
+        // a server to another workspace's Preview pane.
+        await sleep(requestedCwd.endsWith("/pi-app") ? 220 : 30);
         const serverId = `prev-${Date.now()}`;
         this.previewRuntime = {
           serverId,
           configName: String(args.name ?? "pi-app-ui"),
-          cwd: String(args.cwd ?? "/Users/dev/pi-app"),
+          cwd: requestedCwd,
           url: "http://localhost:1420",
           port: 1420,
           running: true,
@@ -896,7 +890,7 @@ export class MockBackend implements Backend {
         let matched = false;
         const packages = Array.isArray(parsed.packages) ? parsed.packages.map((raw) => {
           const source = typeof raw === "string" ? raw : raw && typeof raw === "object" && "source" in raw ? String(raw.source) : "";
-          if (source !== identifier && this.packageNameForSource(source) !== identifier) return raw;
+          if (source !== identifier && packageNameFromSpec(source) !== identifier) return raw;
           if (String(args.kind) === "extension" && args.enabled === false && source.includes("harness-extension")) {
             throw new Error("harness-extension является ядром приложения и не может быть отключён");
           }
@@ -1051,8 +1045,20 @@ export class MockBackend implements Backend {
         return [] as T;
       case "git_is_repo":
         return true as T;
-      case "git_summary":
-        return { isRepo: true, branch: "main", insertions: 14723, deletions: 1, changedFiles: 2, hasRemote: true, ahead: 2, behind: 0 } as T;
+      case "git_summary": {
+        const cwd = String(args.cwd ?? "");
+        await sleep(cwd.endsWith("/pi-app") ? 240 : 30);
+        return {
+          isRepo: true,
+          branch: cwd.endsWith("/website") ? "website-main" : "main",
+          insertions: 14723,
+          deletions: 1,
+          changedFiles: 2,
+          hasRemote: true,
+          ahead: 2,
+          behind: 0,
+        } as T;
+      }
       case "git_open_pr":
         return undefined as T;
       case "git_branches":
@@ -1156,11 +1162,19 @@ export class MockBackend implements Backend {
         return { data: "iVBORw0KGgo=", mimeType: "image/png", sizeBytes: 8 } as T;
       case "git_checkpoint":
         return "abc1234" as T;
-      case "git_status":
-        return [
-          { status: " M", path: "src/lib/reducer.ts" },
-          { status: "??", path: "src/components/NewFile.tsx" },
-        ] as T;
+      case "git_status": {
+        const cwd = String(args.cwd ?? "");
+        await sleep(cwd.endsWith("/pi-app") ? 240 : 30);
+        return (cwd.endsWith("/website")
+          ? [
+              { status: " M", path: "src/site.css" },
+              { status: "??", path: "src/Hero.tsx" },
+            ]
+          : [
+              { status: " M", path: "src/lib/reducer.ts" },
+              { status: "??", path: "src/components/NewFile.tsx" },
+            ]) as T;
+      }
       case "git_review_diff":
         return [
           "diff --git a/src/lib/reducer.ts b/src/lib/reducer.ts",

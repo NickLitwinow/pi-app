@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useInstalledPackages, useRunPi } from "../hooks/usePiPackages";
 import { getBackend } from "../lib/backend";
 import type { ConfigFile, PackageKind, SkillInfo } from "../lib/types";
 import { updateAppConfig, useStore } from "../state/store";
-import Marketplace, { useInstalledPackages, useRunPi } from "./Marketplace";
+import Marketplace from "./Marketplace";
 import { CheckIcon, PackageIcon } from "./icons";
 
 type LibraryTab = PackageKind | "profiles";
@@ -248,17 +249,25 @@ function LocalSkills({ scope, cwd }: { scope: "global" | "project"; cwd: string 
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+    setSkills([]);
+    setError(null);
     void (async () => {
       try {
         const be = await getBackend();
         const loaded = await be.invoke<SkillInfo[]>("list_skills", { cwd });
+        if (cancelled) return;
         setSkills(loaded.filter((skill) => skill.scope === scope));
         setError(null);
       } catch (loadError) {
+        if (cancelled) return;
         setSkills([]);
         setError(`Не удалось прочитать configured skills: ${String(loadError)}`);
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [cwd, scope]);
 
   const open = async (skill: SkillInfo) => {

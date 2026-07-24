@@ -91,6 +91,25 @@ test("Library / Extensions — long scoped package and responsive actions", asyn
   await expect(page).toHaveScreenshot("extensions-responsive.png", { fullPage: true });
 });
 
+test("Library ignores stale catalogs and covers the installed browser extensions", async ({ page }) => {
+  await boot(page);
+  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.getByRole("button", { name: /^Skills/ }).click();
+  await expect(page.getByRole("heading", { name: "Skills", exact: true })).toBeVisible();
+  await expect(page.getByText("mitsupi", { exact: true })).toBeVisible();
+  // The mock Extensions request deliberately resolves later than Skills.
+  // It must not replace the visible Skills catalog after the tab switch.
+  await page.waitForTimeout(500);
+  await expect(page.getByText("mitsupi", { exact: true })).toBeVisible();
+  await expect(page.getByText("pi-lens", { exact: true })).toHaveCount(0);
+
+  await page.getByRole("button", { name: /^Расширения/ }).click();
+  await page.getByRole("button", { name: "Установленные", exact: true }).click();
+  await expect(page.getByText("Пакеты с ресурсом «расширения»: 14", { exact: true })).toBeVisible();
+  await expect(page.getByText("pi-chrome", { exact: true })).toBeVisible();
+  await expect(page.getByText("pi-agent-browser-native", { exact: true })).toBeVisible();
+});
+
 test("Library installed view only lists packages that declare the selected resource", async ({ page }) => {
   await boot(page);
   await page.getByRole("button", { name: "Library" }).click();
@@ -110,7 +129,7 @@ test("Library installed view only lists packages that declare the selected resou
   await expect(page.getByText("Пакеты с ресурсом «prompts и AGENTS.md»: 0", { exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: /^Расширения/ }).click();
-  await expect(page.getByText("Пакеты с ресурсом «расширения»: 12", { exact: true })).toBeVisible();
+  await expect(page.getByText("Пакеты с ресурсом «расширения»: 14", { exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: /^Skills/ }).click();
   await page.getByRole("button", { name: "Текущий проект" }).click();
@@ -238,8 +257,22 @@ test("Code Review — tabs and spacing", async ({ page }) => {
   await boot(page);
   await page.getByRole("button", { name: "Code Review" }).click();
   await expect(page.getByRole("button", { name: /Изменения/ })).toBeVisible();
+  await expect(page.getByText("src/lib/reducer.ts", { exact: true })).toBeVisible();
   await expectNoHorizontalOverflow(page);
   await expect(page).toHaveScreenshot("code-review.png", { fullPage: true });
+});
+
+test("Code Review ignores the previous workspace after a fast project switch", async ({ page }) => {
+  await boot(page);
+  await page.getByRole("button", { name: "Code Review" }).click();
+  await page.getByRole("button", { name: "Выбрать проект «website»" }).click();
+  await expect(page.getByText("src/site.css", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /website-main/ })).toBeVisible();
+  // pi-app deliberately resolves later; its branch and files must stay detached.
+  await page.waitForTimeout(300);
+  await expect(page.getByText("src/site.css", { exact: true })).toBeVisible();
+  await expect(page.getByText("src/lib/reducer.ts", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /website-main/ })).toBeVisible();
 });
 
 test("Compact 150% layout keeps controls inside viewport", async ({ page }) => {
@@ -776,6 +809,7 @@ test("Chat column and composer share the same width", async ({ page }) => {
   await boot(page);
   await page.locator(".sess-row", { hasText: "Fix supervisor race" }).click();
   await expect(page.getByRole("button", { name: /Worked for/ })).toBeVisible();
+  await expect(page.locator(".gitbar")).toBeVisible();
   const widths = await page.evaluate(() => {
     const box = (el: Element | null) => {
       if (!el) return null;
@@ -862,6 +896,19 @@ test("Live preview — shared native server exposes readiness, logs and responsi
   await expectNoHorizontalOverflow(page);
   await preview.getByRole("button", { name: /Стоп/ }).click();
   await expect(preview.locator(".pv-runtime")).toHaveCount(0);
+});
+
+test("Live preview does not attach a late server response to another workspace", async ({ page }) => {
+  await boot(page);
+  await page.keyboard.press("Meta+e");
+  const preview = page.locator(".preview-pane");
+  await expect(preview).toBeVisible();
+  await preview.getByRole("button", { name: /Запустить/ }).click();
+  await page.getByRole("button", { name: "Выбрать проект «website»" }).click();
+  await expect(page.locator(".ws.active")).toContainText("website");
+  await page.waitForTimeout(300);
+  await expect(preview.locator(".pv-runtime")).toHaveCount(0);
+  await expect(preview.getByRole("button", { name: /Запустить/ })).toBeEnabled();
 });
 
 test("Live preview — harness event opens the split and exposes agent inspection evidence", async ({ page }) => {

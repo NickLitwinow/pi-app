@@ -380,27 +380,72 @@ fn clean_package_spec_path(raw: &str) -> &str {
     raw.split(['?', '#']).next().unwrap_or_default()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct GitPackageSource {
+    host: String,
+    path: String,
+    pinned: bool,
+}
+
+/// Parse the Git source forms accepted by Pi's package manager. Settings keep
+/// the original spelling, so this must cover both `git:` shorthand and direct
+/// protocol URLs instead of assuming every checkout starts with `git:`.
+fn git_package_source(spec: &str) -> Option<GitPackageSource> {
+    let spec = spec.trim();
+    let (raw, explicit_git) = spec
+        .strip_prefix("git:")
+        .map_or((spec, false), |raw| (raw.trim(), true));
+    let protocol = ["https://", "http://", "ssh://", "git://"]
+        .into_iter()
+        .find(|prefix| raw.to_ascii_lowercase().starts_with(prefix));
+    if !explicit_git && protocol.is_none() {
+        return None;
+    }
+
+    let (host, raw_path) = if let Some(scp) = raw.strip_prefix("git@") {
+        let (host, path) = scp.split_once(':')?;
+        (host, path)
+    } else if raw.contains("://") {
+        let (_, authority_and_path) = raw.split_once("://")?;
+        let (authority, path) = authority_and_path.split_once('/')?;
+        let authority = authority.rsplit('@').next().unwrap_or(authority);
+        let host = authority.split(':').next().unwrap_or(authority);
+        (host, path)
+    } else {
+        raw.split_once('/')?
+    };
+
+    let fragment_pinned = raw_path
+        .split_once('#')
+        .is_some_and(|(_, reference)| !reference.is_empty());
+    let clean = raw_path.split(['?', '#']).next().unwrap_or_default();
+    let (clean, at_pinned) = clean
+        .split_once('@')
+        .map_or((clean, false), |(path, reference)| {
+            (path, !reference.is_empty())
+        });
+    let path = clean.trim_matches(['/', '\\']).trim_end_matches(".git");
+    let valid_host =
+        !host.is_empty() && host != "." && host != ".." && !host.contains(['/', '\\', '\0']);
+    let components = path.split('/').collect::<Vec<_>>();
+    let valid_path = components.len() >= 2
+        && components.iter().all(|part| {
+            !part.is_empty() && *part != "." && *part != ".." && !part.contains(['\\', '\0'])
+        });
+    (valid_host && valid_path).then(|| GitPackageSource {
+        host: host.to_string(),
+        path: path.to_string(),
+        pinned: fragment_pinned || at_pinned,
+    })
+}
+
 fn package_dir_for_root(root: &Path, spec: &str) -> Option<PathBuf> {
     if let Some(raw) = spec.strip_prefix("npm:") {
         let (name, _) = npm_name_and_pin(raw)?;
         return Some(root.join("npm").join("node_modules").join(name));
     }
-    if let Some(raw) = spec.strip_prefix("git:") {
-        let clean = clean_package_spec_path(raw).trim_end_matches(['/', '\\']);
-        let relative = if clean.starts_with("github.com/") {
-            clean
-        } else if let Some((_, tail)) = clean.split_once("://") {
-            tail.trim_start_matches("git@")
-        } else if let Some(tail) = clean.strip_prefix("git@github.com:") {
-            return Some(
-                root.join("git")
-                    .join("github.com")
-                    .join(tail.trim_end_matches(".git")),
-            );
-        } else {
-            clean
-        };
-        return Some(root.join("git").join(relative.trim_end_matches(".git")));
+    if let Some(git) = git_package_source(spec) {
+        return Some(root.join("git").join(git.host).join(git.path));
     }
     let raw = clean_package_spec_path(spec.strip_prefix("file:").unwrap_or(spec));
     let expanded = if let Some(relative) = raw.strip_prefix("~/") {
@@ -532,16 +577,18 @@ fn installed_resource_kinds(root: &Path, spec: &str) -> Option<Vec<String>> {
     resource_kinds_from_package(&directory)
 }
 
-fn installed_display_name(spec: &str) -> String {
+pub(crate) fn installed_display_name(spec: &str) -> String {
     if let Some(raw) = spec.strip_prefix("npm:") {
         return npm_name_and_pin(raw)
             .map(|(name, _)| name)
             .unwrap_or_else(|| raw.to_string());
     }
+    if let Some(git) = git_package_source(spec) {
+        return git.path.rsplit('/').next().unwrap_or(&git.path).to_string();
+    }
     let raw = spec
         .trim()
-        .strip_prefix("git:")
-        .or_else(|| spec.trim().strip_prefix("file:"))
+        .strip_prefix("file:")
         .unwrap_or(spec.trim())
         .split(['?', '#'])
         .next()
@@ -557,27 +604,20 @@ fn installed_display_name(spec: &str) -> String {
 
 fn installed_fallback(root: &Path, spec: &str) -> PiPackage {
     let name = installed_display_name(spec);
+    let git = git_package_source(spec);
     let npm_name = spec
         .strip_prefix("npm:")
         .and_then(|raw| npm_name_and_pin(raw).map(|(name, _)| name));
-    let repo_url = spec.strip_prefix("git:").and_then(|raw| {
-        if raw.starts_with("github.com/") {
-            Some(
-                format!("https://{raw}")
-                    .trim_end_matches(".git")
-                    .to_string(),
-            )
-        } else {
-            clean_git_url(raw)
-        }
-    });
+    let repo_url = git
+        .as_ref()
+        .map(|source| format!("https://{}/{}", source.host, source.path));
     PiPackage {
         source: Some(spec.to_string()),
         name: name.clone(),
         version: String::new(),
         description: if spec.starts_with("npm:") {
             format!("Установленный npm-пакет {name}; метаданные реестра недоступны.")
-        } else if spec.starts_with("git:") {
+        } else if git.is_some() {
             format!("Установленный Git-пакет: {spec}")
         } else {
             format!("Локальный пакет: {spec}")
@@ -597,7 +637,7 @@ fn installed_fallback(root: &Path, spec: &str) -> PiPackage {
             .as_deref()
             .and_then(|name| installed_version(root, name)),
         update_available: false,
-        pinned: false,
+        pinned: git.as_ref().is_some_and(|source| source.pinned),
         resource_kinds: installed_resource_kinds(root, spec),
     }
 }
@@ -629,7 +669,8 @@ async fn resolve_installed_package(root: PathBuf, spec: String) -> Option<PiPack
 /// package, not just those surfaced by a catalog search. Fetched concurrently.
 #[tauri::command]
 pub async fn pi_packages_meta(names: Vec<String>, cwd: Option<String>) -> Vec<PiPackage> {
-    const MAX_PACKAGES: usize = 80;
+    const MAX_PACKAGES: usize = 500;
+    const MAX_REGISTRY_FETCHES: usize = 80;
     const MAX_CONCURRENT_FETCHES: usize = 8;
     // Pi resolves project-scoped npm/git/local package sources relative to
     // <cwd>/.pi; user-scoped packages use the agent directory.
@@ -637,12 +678,23 @@ pub async fn pi_packages_meta(names: Vec<String>, cwd: Option<String>) -> Vec<Pi
         .filter(|value| !value.trim().is_empty())
         .map(|value| PathBuf::from(value).join(".pi"))
         .unwrap_or_else(crate::sessions::agent_dir);
-    let mut pending = names.into_iter().take(MAX_PACKAGES);
+    // Registry enrichment is bounded, but every accepted installed entry still
+    // receives local fallback metadata. Previously the 81st package vanished
+    // from Library entirely, even though Pi loaded it.
+    let mut remote = Vec::new();
+    let mut out = Vec::new();
+    for spec in names.into_iter().take(MAX_PACKAGES) {
+        if spec.starts_with("npm:") && remote.len() < MAX_REGISTRY_FETCHES {
+            remote.push(spec);
+        } else {
+            out.push(installed_fallback(&root, &spec));
+        }
+    }
+    let mut pending = remote.into_iter();
     let mut set = JoinSet::new();
     for spec in pending.by_ref().take(MAX_CONCURRENT_FETCHES) {
         set.spawn(resolve_installed_package(root.clone(), spec));
     }
-    let mut out = Vec::new();
     while let Some(res) = set.join_next().await {
         if let Ok(Some(p)) = res {
             out.push(p);
@@ -733,6 +785,15 @@ mod tests {
             Some("https://github.com/DietrichGebert/ponytail")
         );
 
+        let protocol =
+            installed_fallback(root, "ssh://git@gitlab.com/owner/browser-kit.git@stable");
+        assert_eq!(protocol.name, "browser-kit");
+        assert_eq!(
+            protocol.repo_url.as_deref(),
+            Some("https://gitlab.com/owner/browser-kit")
+        );
+        assert!(protocol.pinned);
+
         let local = installed_fallback(root, "../../GithubControl/pi-app/harness-extension/");
         assert_eq!(local.name, "harness-extension");
         assert_eq!(
@@ -754,9 +815,52 @@ mod tests {
             Some(PathBuf::from("/agent/git/github.com/owner/repo"))
         );
         assert_eq!(
+            package_dir_for_root(root, "https://github.com/owner/protocol.git@release"),
+            Some(PathBuf::from("/agent/git/github.com/owner/protocol"))
+        );
+        assert_eq!(
+            package_dir_for_root(root, "git:git@gitlab.com:owner/scp.git@main"),
+            Some(PathBuf::from("/agent/git/gitlab.com/owner/scp"))
+        );
+        assert_eq!(
             package_dir_for_root(root, "../../workspace/custom-package"),
             Some(PathBuf::from("/agent/../../workspace/custom-package"))
         );
+    }
+
+    #[test]
+    fn parses_only_safe_pi_git_source_forms() {
+        assert_eq!(
+            git_package_source("git:github.com/owner/repo.git@v2"),
+            Some(GitPackageSource {
+                host: "github.com".into(),
+                path: "owner/repo".into(),
+                pinned: true,
+            })
+        );
+        assert_eq!(
+            git_package_source("ssh://git@gitlab.com/team/repo.git#main"),
+            Some(GitPackageSource {
+                host: "gitlab.com".into(),
+                path: "team/repo".into(),
+                pinned: true,
+            })
+        );
+        assert!(git_package_source("github.com/owner/repo").is_none());
+        assert!(git_package_source("git:github.com/../outside").is_none());
+        assert!(git_package_source("git:../owner/repo").is_none());
+    }
+
+    #[tokio::test]
+    async fn installed_metadata_does_not_drop_packages_after_the_old_limit() {
+        let project = tempfile::tempdir().unwrap();
+        let names = (0..81)
+            .map(|index| format!("./package-{index}"))
+            .collect::<Vec<_>>();
+        let packages =
+            pi_packages_meta(names, Some(project.path().to_string_lossy().into_owned())).await;
+        assert_eq!(packages.len(), 81);
+        assert!(packages.iter().any(|package| package.name == "package-80"));
     }
 
     #[test]

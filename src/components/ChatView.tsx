@@ -1823,13 +1823,19 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const virtRef = useRef<VirtuosoHandle>(null);
   const [pinned, setPinned] = useState(true);
+  const pinnedRef = useRef(true);
   const touchYRef = useRef<number | null>(null);
   const transcriptMode = useStore((s) => s.appConfig.transcriptMode ?? "normal");
+
+  const updatePinned = (next: boolean) => {
+    pinnedRef.current = next;
+    setPinned(next);
+  };
 
   const jumpToPin = (pinId: string) => {
     const index = ws.chat.items.findIndex((it) => msgPinId(it.msg) === pinId);
     if (index < 0) return;
-    setPinned(false);
+    updatePinned(false);
     virtRef.current?.scrollToIndex({ index, align: "center", behavior: "smooth" });
     setTimeout(() => {
       const el = rootRef.current?.querySelector(`[data-pin="${pinId}"]`);
@@ -1927,9 +1933,20 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   // produce that transition. Explicit upward input below is the detach signal.
   useLayoutEffect(() => {
     if (!pinned) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (pinnedRef.current) virtRef.current?.autoscrollToBottom();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [cwd, ws.sessionPath, pinned, displayItems.length, ws.chat.isStreaming, ws.chat.streaming, ws.chat.toolExecs]);
+
+  useLayoutEffect(() => {
+    updatePinned(true);
     const frame = window.requestAnimationFrame(() => virtRef.current?.autoscrollToBottom());
     return () => window.cancelAnimationFrame(frame);
-  }, [pinned, displayItems.length, ws.chat.isStreaming, ws.chat.streaming, ws.chat.toolExecs]);
+    // A newly selected transcript owns its own follow state even when its item
+    // count happens to match the previous session.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cwd, ws.sessionPath]);
   const userIndexes = useMemo(() => {
     let userCounter = 0;
     // Extension follow-ups are implementation details, not user-editable turns.
@@ -1969,7 +1986,7 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
       ref={rootRef}
       style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}
       onWheelCapture={(event) => {
-        if (event.deltaY < 0) setPinned(false);
+        if (event.deltaY < 0) updatePinned(false);
       }}
       onTouchStartCapture={(event) => {
         touchYRef.current = event.touches[0]?.clientY ?? null;
@@ -1977,13 +1994,13 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
       onTouchMoveCapture={(event) => {
         const next = event.touches[0]?.clientY;
         if (next != null && touchYRef.current != null && next > touchYRef.current + 2) {
-          setPinned(false);
+          updatePinned(false);
         }
         touchYRef.current = next ?? null;
       }}
       onKeyDownCapture={(event) => {
-        if (["ArrowUp", "PageUp", "Home"].includes(event.key)) setPinned(false);
-        if (event.key === "End") setPinned(true);
+        if (["ArrowUp", "PageUp", "Home"].includes(event.key)) updatePinned(false);
+        if (event.key === "End") updatePinned(true);
       }}
       onPointerDownCapture={(event) => {
         const target = event.target;
@@ -1993,7 +2010,7 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         const bounds = scroller.getBoundingClientRect();
         // Dragging the scrollbar is another explicit request to leave follow
         // mode. atBottomStateChange reattaches if it is dragged back to bottom.
-        if (event.clientX >= bounds.right - 14) setPinned(false);
+        if (event.clientX >= bounds.right - 14) updatePinned(false);
       }}
     >
       {searchOpen && (
@@ -2042,7 +2059,15 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
           initialTopMostItemIndex={Math.max(0, displayItems.length - 1)}
           followOutput={pinned ? "auto" : false}
           atBottomStateChange={(atBottom) => {
-            if (atBottom) setPinned(true);
+            if (!atBottom) return;
+            const scroller = rootRef.current?.querySelector<HTMLElement>(".msg-scroll");
+            const gap = scroller
+              ? scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
+              : Number.POSITIVE_INFINITY;
+            // Virtuoso may deliver a queued `true` after the user's upward
+            // wheel event. Reattach only if the DOM is still actually at the
+            // bottom, otherwise a late callback steals the user's scroll.
+            if (gap <= 4) updatePinned(true);
           }}
           increaseViewportBy={{ top: 500, bottom: 700 }}
           itemContent={(index, it) => {
@@ -2133,7 +2158,7 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
           className="newmsg-pill"
           onClick={() => {
             virtRef.current?.scrollToIndex({ index: Math.max(0, displayItems.length - 1), align: "end", behavior: "smooth" });
-            setPinned(true);
+            updatePinned(true);
           }}
         >
           ↓ к последним
