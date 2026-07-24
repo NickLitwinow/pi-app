@@ -486,6 +486,7 @@ export interface PiThemeInfo {
   resolvedColors: Record<string, string>;
   valid: boolean;
   error: string | null;
+  enabled: boolean;
 }
 
 export interface AppUpdateInfo {

@@ -3,38 +3,70 @@ import { getBackend } from "../lib/backend";
 import { packageNameFromSpec, packageSource } from "../lib/marketplace";
 import type { ConfigFile, PackageKind, PackageSetting } from "../lib/types";
 
+function parsePackageSettings(content: string): PackageSetting[] {
+  const root = JSON.parse(content) as unknown;
+  if (!root || typeof root !== "object" || Array.isArray(root)) {
+    throw new Error("settings.json: корень должен быть объектом");
+  }
+  const raw = (root as Record<string, unknown>).packages ?? [];
+  if (!Array.isArray(raw)) throw new Error("settings.json: packages должен быть массивом");
+  if (raw.some((item) =>
+    typeof item !== "string"
+    && !(item && typeof item === "object" && "source" in item && typeof item.source === "string")
+  )) {
+    throw new Error("settings.json: каждый package должен быть строкой или объектом с source");
+  }
+  return raw as PackageSetting[];
+}
+
 /** Installed packages plus scoped, atomic resource controls. */
 export function useInstalledPackages(scope: "global" | "project" = "global", cwd?: string | null): {
   installed: Set<string>;
   specs: string[];
   entries: PackageSetting[];
+  loading: boolean;
+  error: string | null;
   reload: () => void;
   setResourceEnabled: (packageName: string, kind: PackageKind, enabled: boolean) => Promise<void>;
 } {
   const [entries, setEntries] = useState<PackageSetting[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const reloadGeneration = useRef(0);
   const reload = useCallback(() => {
     const generation = ++reloadGeneration.current;
+    setLoading(true);
+    setError(null);
     void (async () => {
-      const be = await getBackend();
-      const file = scope === "project" && cwd
-        ? await be.invoke<ConfigFile>("read_project_settings", { cwd }).catch(() => null)
-        : await be.invoke<ConfigFile>("read_pi_config", { name: "settings" }).catch(() => null);
       try {
-        const parsed = file ? (JSON.parse(file.content) as Record<string, unknown>) : {};
-        const packages = Array.isArray(parsed.packages)
-          ? parsed.packages.filter((item): item is PackageSetting =>
-            typeof item === "string" || Boolean(item && typeof item === "object" && "source" in item && typeof item.source === "string"))
-          : [];
-        if (generation === reloadGeneration.current) setEntries(packages);
-      } catch {
-        if (generation === reloadGeneration.current) setEntries([]);
+        if (scope === "project" && !cwd) {
+          if (generation === reloadGeneration.current) setEntries([]);
+          return;
+        }
+        const be = await getBackend();
+        const file = scope === "project"
+          ? await be.invoke<ConfigFile>("read_project_settings", { cwd })
+          : await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
+        const packages = parsePackageSettings(file.content);
+        if (generation === reloadGeneration.current) {
+          setEntries(packages);
+          setError(null);
+        }
+      } catch (loadError) {
+        if (generation === reloadGeneration.current) {
+          setEntries([]);
+          setError(`Не удалось прочитать установленные пакеты: ${String(loadError)}`);
+        }
+      } finally {
+        if (generation === reloadGeneration.current) setLoading(false);
       }
     })();
   }, [scope, cwd]);
 
   useEffect(() => {
     setEntries([]);
+    setLoading(true);
+    setError(null);
     reload();
     return () => {
       reloadGeneration.current++;
@@ -55,19 +87,18 @@ export function useInstalledPackages(scope: "global" | "project" = "global", cwd
         kind,
         enabled,
       });
-      const parsed = JSON.parse(content) as Record<string, unknown>;
-      const packages = Array.isArray(parsed.packages)
-        ? parsed.packages.filter((item): item is PackageSetting =>
-          typeof item === "string" || Boolean(item && typeof item === "object" && "source" in item && typeof item.source === "string"))
-        : [];
-      if (generation === reloadGeneration.current) setEntries(packages);
-    } catch (error) {
+      const packages = parsePackageSettings(content);
+      if (generation === reloadGeneration.current) {
+        setEntries(packages);
+        setError(null);
+      }
+    } catch (mutationError) {
       if (generation === reloadGeneration.current) reload();
-      throw error;
+      throw mutationError;
     }
   }, [cwd, reload, scope]);
 
-  return { installed, specs, entries, reload, setResourceEnabled };
+  return { installed, specs, entries, loading, error, reload, setResourceEnabled };
 }
 
 /** Run a Pi package command and keep its streamed lifecycle output together. */

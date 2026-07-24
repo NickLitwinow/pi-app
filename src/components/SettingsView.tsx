@@ -268,6 +268,12 @@ function parseJsonObject(content: string, label: string): Record<string, unknown
   return parsed as Record<string, unknown>;
 }
 
+function isConfigConflict(error: unknown): boolean {
+  return String(error).includes("CONFIG_CONFLICT:");
+}
+
+const CONFIG_WRITE_RETRIES = 3;
+
 function RawJsonEditor({
   name,
   onSaved,
@@ -280,18 +286,33 @@ function RawJsonEditor({
   const [error, setError] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
+  const loadGeneration = useRef(0);
+  const editRevision = useRef(0);
+  const saveInFlight = useRef(false);
 
   const load = useCallback(async () => {
-    const be = await getBackend();
-    const f = await be.invoke<ConfigFile>("read_pi_config", { name });
-    setFile(f);
-    setText(f.content);
-    setDirty(false);
-    setError(null);
+    const generation = ++loadGeneration.current;
+    try {
+      const be = await getBackend();
+      const f = await be.invoke<ConfigFile>("read_pi_config", { name });
+      if (generation !== loadGeneration.current) return;
+      editRevision.current++;
+      setFile(f);
+      setText(f.content);
+      setDirty(false);
+      setError(null);
+    } catch (loadError) {
+      if (generation !== loadGeneration.current) return;
+      setError(`Не удалось прочитать ${name}.json: ${String(loadError)}`);
+    }
   }, [name]);
 
   useEffect(() => {
     void load();
+    return () => {
+      loadGeneration.current++;
+    };
   }, [load]);
 
   const validate = (t: string): string | null => {
@@ -304,20 +325,40 @@ function RawJsonEditor({
   };
 
   const save = async () => {
+    if (saveInFlight.current) return;
     const err = validate(text);
     if (err) {
       setError(err);
       return;
     }
+    const content = text;
+    const revision = editRevision.current;
+    loadGeneration.current++;
+    saveInFlight.current = true;
+    setSaving(true);
     try {
       const be = await getBackend();
-      await be.invoke("write_pi_config", { name, content: text });
-      setDirty(false);
-      setError(null);
-      setSavedAt(Date.now());
-      onSaved?.(text);
+      await be.invoke("write_pi_config_if_unchanged", {
+        name,
+        expectedContent: file?.content ?? "{}",
+        content,
+      });
+      setFile((current) => ({
+        path: current?.path ?? "",
+        content,
+        exists: true,
+      }));
+      if (revision === editRevision.current) {
+        setDirty(false);
+        setError(null);
+        setSavedAt(Date.now());
+      }
+      onSaved?.(content);
     } catch (e) {
-      setError(String(e));
+      if (revision === editRevision.current) setError(String(e));
+    } finally {
+      saveInFlight.current = false;
+      setSaving(false);
     }
   };
 
@@ -337,9 +378,9 @@ function RawJsonEditor({
         </span>
         <div className="grow" />
         {savedAt && !dirty && <span className="hint" style={{ color: "var(--ok)" }}>сохранено ✓</span>}
-        <button onClick={() => void load()}>Перечитать</button>
-        <button className="primary" disabled={!dirty} onClick={() => void save()}>
-          Сохранить
+        <button disabled={saving} onClick={() => void load()}>Перечитать</button>
+        <button className="primary" disabled={!dirty || saving} onClick={() => void save()}>
+          {saving ? "Сохранение…" : "Сохранить"}
         </button>
       </div>
       {error && (
@@ -352,6 +393,8 @@ function RawJsonEditor({
         spellCheck={false}
         value={text}
         onChange={(e) => {
+          loadGeneration.current++;
+          editRevision.current++;
           setText(e.target.value);
           setDirty(true);
           setError(validate(e.target.value));
@@ -371,18 +414,37 @@ type PiSettings = Record<string, unknown> & {
   packages?: string[];
 };
 
+function mergeSettingsPatch(latest: PiSettings, patch: Partial<PiSettings>): PiSettings {
+  const next: PiSettings = { ...latest };
+  for (const [key, value] of Object.entries(patch)) {
+    const current = latest[key];
+    next[key] =
+      value && typeof value === "object" && !Array.isArray(value)
+        && current && typeof current === "object" && !Array.isArray(current)
+        ? { ...(current as Record<string, unknown>), ...(value as Record<string, unknown>) }
+        : value;
+  }
+  return next;
+}
+
 function useSettingsJson(): [PiSettings | null, (patch: Partial<PiSettings>) => Promise<boolean>, () => Promise<void>, string | null] {
   const [parsed, setParsed] = useState<PiSettings | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const writeQueue = useRef<Promise<void>>(Promise.resolve());
+  const loadGeneration = useRef(0);
 
   const reload = useCallback(async () => {
+    const generation = ++loadGeneration.current;
     try {
+      await writeQueue.current;
+      if (generation !== loadGeneration.current) return;
       const be = await getBackend();
       const f = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
+      if (generation !== loadGeneration.current) return;
       setParsed(parseJsonObject(f.content, "settings.json") as PiSettings);
       setSaveError(null);
     } catch (error) {
+      if (generation !== loadGeneration.current) return;
       setParsed(null);
       setSaveError(`Не удалось прочитать settings.json: ${String(error)}. Исправьте файл в Advanced-редакторе; визуальные настройки не будут его перезаписывать.`);
     }
@@ -390,24 +452,44 @@ function useSettingsJson(): [PiSettings | null, (patch: Partial<PiSettings>) => 
 
   useEffect(() => {
     void reload();
+    return () => {
+      loadGeneration.current++;
+    };
   }, [reload]);
 
   const update = useCallback((patch: Partial<PiSettings>) => {
+    const generation = ++loadGeneration.current;
     const run = async (): Promise<boolean> => {
       try {
         const be = await getBackend();
-        // Перечитываем перед записью, чтобы не затереть внешние изменения. Если
-        // JSON повреждён, визуальный CRUD обязан fail closed, а не стирать ключи,
-        // которых не понимает.
-        const f = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
-        const latest = parseJsonObject(f.content, "settings.json") as PiSettings;
-        const next = { ...latest, ...patch };
-        await be.invoke("write_pi_config", { name: "settings", content: JSON.stringify(next, null, 2) });
-        setParsed(next);
-        setSaveError(null);
-        return true;
+        for (let attempt = 0; attempt < CONFIG_WRITE_RETRIES; attempt++) {
+          // Перечитываем перед записью, чтобы не затереть внешние изменения. Если
+          // JSON повреждён, визуальный CRUD обязан fail closed, а не стирать ключи,
+          // которых не понимает.
+          const f = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
+          const latest = parseJsonObject(f.content, "settings.json") as PiSettings;
+          const next = mergeSettingsPatch(latest, patch);
+          try {
+            await be.invoke("write_pi_config_if_unchanged", {
+              name: "settings",
+              expectedContent: f.content,
+              content: JSON.stringify(next, null, 2),
+            });
+            if (generation === loadGeneration.current) {
+              setParsed(next);
+              setSaveError(null);
+            }
+            return true;
+          } catch (writeError) {
+            if (isConfigConflict(writeError) && attempt + 1 < CONFIG_WRITE_RETRIES) continue;
+            throw writeError;
+          }
+        }
+        return false;
       } catch (error) {
-        setSaveError(`Не удалось сохранить settings.json: ${String(error)}`);
+        if (generation === loadGeneration.current) {
+          setSaveError(`Не удалось сохранить settings.json: ${String(error)}`);
+        }
         return false;
       }
     };
@@ -512,7 +594,7 @@ function GeneralTab() {
             <GlassSwitch
               label="Автоматически уменьшать большие изображения"
               checked={images.autoResize !== false}
-              onChange={(autoResize) => void update({ images: { ...images, autoResize } })}
+              onChange={(autoResize) => void update({ images: { autoResize } })}
             />
           </div>
           <div className="form-row">
@@ -520,7 +602,7 @@ function GeneralTab() {
             <GlassSwitch
               label="Не отправлять изображения провайдерам"
               checked={images.blockImages === true}
-              onChange={(blockImages) => void update({ images: { ...images, blockImages } })}
+              onChange={(blockImages) => void update({ images: { blockImages } })}
             />
           </div>
           <div className="hint">
@@ -535,7 +617,7 @@ function GeneralTab() {
             <GlassSwitch
               label="Авто-компакция при заполнении окна"
               checked={compactionEnabled}
-              onChange={(enabled) => void update({ compaction: { ...compaction, enabled } })}
+              onChange={(enabled) => void update({ compaction: { enabled } })}
             />
           </div>
           <div className="form-row">
@@ -547,7 +629,7 @@ function GeneralTab() {
               step={1024}
               value={compaction.reserveTokens ?? 16384}
               onChange={(e) =>
-                void update({ compaction: { ...compaction, reserveTokens: Math.max(1024, Number(e.target.value) || 16384) } })
+                void update({ compaction: { reserveTokens: Math.max(1024, Number(e.target.value) || 16384) } })
               }
             />
           </div>
@@ -560,7 +642,7 @@ function GeneralTab() {
               step={1000}
               value={compaction.keepRecentTokens ?? 20000}
               onChange={(e) =>
-                void update({ compaction: { ...compaction, keepRecentTokens: Math.max(2000, Number(e.target.value) || 20000) } })
+                void update({ compaction: { keepRecentTokens: Math.max(2000, Number(e.target.value) || 20000) } })
               }
             />
           </div>
@@ -626,27 +708,58 @@ function ThemesTab() {
     return () => applyAppearanceConfig(useStore.getState().appConfig);
   }, [previewPalette]);
 
-  const writeActiveTheme = async (name: string | undefined): Promise<string | undefined> => {
+  const writeActiveTheme = async (name: string | undefined): Promise<{ previous: string | undefined; content: string }> => {
     const be = await getBackend();
-    const file = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
-    const parsed = JSON.parse(file.content || "{}") as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("settings.json: корень должен быть объектом");
-    const settings = parsed as Record<string, unknown>;
-    const previous = typeof settings.theme === "string" ? settings.theme : undefined;
-    if (name) settings.theme = name;
+    for (let attempt = 0; attempt < CONFIG_WRITE_RETRIES; attempt++) {
+      const file = await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
+      const settings = parseJsonObject(file.content || "{}", "settings.json");
+      const previous = typeof settings.theme === "string" ? settings.theme : undefined;
+      if (name) settings.theme = name;
+      else delete settings.theme;
+      const content = JSON.stringify(settings, null, 2);
+      try {
+        await be.invoke("write_pi_config_if_unchanged", {
+          name: "settings",
+          expectedContent: file.content,
+          content,
+        });
+        return { previous, content };
+      } catch (writeError) {
+        if (isConfigConflict(writeError) && attempt + 1 < CONFIG_WRITE_RETRIES) continue;
+        throw writeError;
+      }
+    }
+    throw new Error("Не удалось сохранить тему после конкурентных изменений settings.json");
+  };
+
+  const rollbackActiveTheme = async (change: { previous: string | undefined; content: string }): Promise<boolean> => {
+    const be = await getBackend();
+    const settings = parseJsonObject(change.content, "settings.json");
+    if (change.previous) settings.theme = change.previous;
     else delete settings.theme;
-    await be.invoke("write_pi_config", { name: "settings", content: JSON.stringify(settings, null, 2) });
-    return previous;
+    try {
+      await be.invoke("write_pi_config_if_unchanged", {
+        name: "settings",
+        expectedContent: change.content,
+        content: JSON.stringify(settings, null, 2),
+      });
+      return true;
+    } catch (rollbackError) {
+      if (isConfigConflict(rollbackError)) return false;
+      throw rollbackError;
+    }
   };
 
   const applyInstalled = async (theme: PiThemeInfo) => {
     try {
       const palette = paletteFromPiColors(theme.name, theme.resolvedColors);
-      const previous = await writeActiveTheme(theme.name);
+      const change = await writeActiveTheme(theme.name);
       const saved = await updateAppConfig({ appearancePreset: "custom", accentColor: palette.accent, customTheme: palette });
       if (!saved) {
-        await writeActiveTheme(previous).catch(() => {});
-        throw new Error("палитра приложения не сохранилась; активная тема pi восстановлена");
+        const restored = await rollbackActiveTheme(change).catch(() => false);
+        throw new Error(restored
+          ? "палитра приложения не сохранилась; активная тема pi восстановлена"
+          : "палитра приложения не сохранилась; settings.json уже изменён другим процессом и не был перезаписан");
       }
       setError(null);
     } catch (applyError) {
@@ -695,11 +808,13 @@ function ThemesTab() {
     try {
       const be = await getBackend();
       await be.invoke("save_pi_theme", { draft, scope, cwd });
-      const previous = await writeActiveTheme(draft.name);
+      const change = await writeActiveTheme(draft.name);
       const saved = await updateAppConfig({ appearancePreset: "custom", accentColor: previewPalette.accent, customTheme: previewPalette });
       if (!saved) {
-        await writeActiveTheme(previous).catch(() => {});
-        throw new Error("палитра приложения не сохранилась; активная тема pi восстановлена");
+        const restored = await rollbackActiveTheme(change).catch(() => false);
+        throw new Error(restored
+          ? "палитра приложения не сохранилась; активная тема pi восстановлена"
+          : "палитра приложения не сохранилась; settings.json уже изменён другим процессом и не был перезаписан");
       }
       await load();
       await messageDialog(`Тема «${draft.name}» сохранена и применена к pi и приложению.`, { kind: "info" });
@@ -768,11 +883,19 @@ function ThemesTab() {
               <div className="pi-theme-card-copy">
                 <strong>{theme.name}</strong>
                 <span className="hint">{theme.packageName ?? (theme.source === "project" ? "Проект" : "Глобальная")}</span>
+                {!theme.enabled && <span className="badge">выключено в этом scope</span>}
                 {!theme.valid && <span className="hint" style={{ color: "var(--warn)" }}>{theme.error}</span>}
               </div>
               <div className="pi-theme-actions">
                 <button onClick={() => startEditor(theme)}>Дублировать</button>
-                <button className="primary" disabled={!theme.valid} onClick={() => void applyInstalled(theme)}>Применить</button>
+                <button
+                  className="primary"
+                  disabled={!theme.valid || !theme.enabled}
+                  title={!theme.enabled ? "Включите ресурс темы у пакета в Library" : undefined}
+                  onClick={() => void applyInstalled(theme)}
+                >
+                  Применить
+                </button>
                 {theme.source !== "package" && <button className="danger" aria-label={`Удалить тему ${theme.name}`} onClick={() => void deleteInstalled(theme)}>Удалить</button>}
               </div>
             </div>
@@ -829,6 +952,9 @@ function McpTab() {
   const [servers, setServers] = useState<Record<string, Record<string, unknown>>>({});
   const [reloadKey, setReloadKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [mutating, setMutating] = useState(false);
+  const loadGeneration = useRef(0);
+  const mutationInFlight = useRef(false);
 
   const parseServers = (content: string): { root: Record<string, unknown>; servers: Record<string, Record<string, unknown>> } => {
     const root = JSON.parse(content) as unknown;
@@ -843,33 +969,65 @@ function McpTab() {
   };
 
   useEffect(() => {
+    const generation = ++loadGeneration.current;
     void (async () => {
       try {
         const be = await getBackend();
         const f = await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
+        if (generation !== loadGeneration.current) return;
         setServers(parseServers(f.content).servers);
         setError(null);
       } catch (readError) {
+        if (generation !== loadGeneration.current) return;
         setServers({});
         setError(`Не удалось прочитать mcp.json: ${String(readError)}. Исправьте его в Advanced-редакторе.`);
       }
     })();
+    return () => {
+      loadGeneration.current++;
+    };
   }, [reloadKey]);
 
   const removeServer = async (name: string) => {
+    let ownsMutation = false;
     try {
+      if (mutationInFlight.current) return;
+      mutationInFlight.current = true;
+      ownsMutation = true;
+      setMutating(true);
       if (!(await confirmDialog(`Удалить MCP-сервер «${name}» из mcp.json?`))) return;
+      const generation = ++loadGeneration.current;
       const be = await getBackend();
-      const f = await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
-      const parsed = parseServers(f.content);
-      const nextServers = { ...parsed.servers };
-      delete nextServers[name];
-      await be.invoke("write_pi_config", { name: "mcp", content: JSON.stringify({ ...parsed.root, mcpServers: nextServers }, null, 2) });
-      setServers(nextServers);
-      setError(null);
-      setReloadKey((k) => k + 1);
+      for (let attempt = 0; attempt < CONFIG_WRITE_RETRIES; attempt++) {
+        const f = await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
+        const parsed = parseServers(f.content);
+        const nextServers = { ...parsed.servers };
+        delete nextServers[name];
+        try {
+          await be.invoke("write_pi_config_if_unchanged", {
+            name: "mcp",
+            expectedContent: f.content,
+            content: JSON.stringify({ ...parsed.root, mcpServers: nextServers }, null, 2),
+          });
+          if (generation === loadGeneration.current) {
+            setServers(nextServers);
+            setError(null);
+          }
+          setReloadKey((k) => k + 1);
+          return;
+        } catch (writeError) {
+          if (isConfigConflict(writeError) && attempt + 1 < CONFIG_WRITE_RETRIES) continue;
+          throw writeError;
+        }
+      }
+      throw new Error("Не удалось удалить MCP-сервер после конкурентных изменений");
     } catch (removeError) {
       setError(`Не удалось удалить MCP-сервер: ${String(removeError)}`);
+    } finally {
+      if (ownsMutation) {
+        mutationInFlight.current = false;
+        setMutating(false);
+      }
     }
   };
 
@@ -882,7 +1040,7 @@ function McpTab() {
             <span className="c-title">{name}</span>
             <span className="badge">{String(cfg.lifecycle ?? "eager")}</span>
             <div className="grow" />
-            <button className="danger" aria-label={`Удалить MCP-сервер ${name}`} onClick={() => void removeServer(name)}>
+            <button className="danger" disabled={mutating} aria-label={`Удалить MCP-сервер ${name}`} onClick={() => void removeServer(name)}>
               Удалить
             </button>
           </div>
@@ -1064,8 +1222,11 @@ function ModelsTab() {
   const [providers, setProviders] = useState<Record<string, ProviderCfg>>({});
   const [reloadKey, setReloadKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const loadGeneration = useRef(0);
+  const mutationQueue = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
+    const generation = ++loadGeneration.current;
     void (async () => {
       try {
         const be = await getBackend();
@@ -1075,35 +1236,62 @@ function ModelsTab() {
         if (!rawProviders || typeof rawProviders !== "object" || Array.isArray(rawProviders)) throw new Error("models.json: providers должен быть объектом");
         const entries = Object.entries(rawProviders);
         if (entries.some(([, value]) => !value || typeof value !== "object" || Array.isArray(value))) throw new Error("models.json: каждый провайдер должен быть объектом");
+        if (generation !== loadGeneration.current) return;
         setProviders(rawProviders as Record<string, ProviderCfg>);
         setError(null);
       } catch (readError) {
+        if (generation !== loadGeneration.current) return;
         setProviders({});
         setError(`Не удалось прочитать models.json: ${String(readError)}. Визуальный редактор не будет перезаписывать файл.`);
       }
     })();
+    return () => {
+      loadGeneration.current++;
+    };
   }, [reloadKey]);
 
-  const mutateProviders = async (mutate: (current: Record<string, ProviderCfg>) => Record<string, ProviderCfg>): Promise<boolean> => {
-    try {
-      const be = await getBackend();
-      const f = await be.invoke<ConfigFile>("read_pi_config", { name: "models" });
-      const parsed = parseJsonObject(f.content, "models.json");
-      const rawProviders = parsed.providers ?? {};
-      if (!rawProviders || typeof rawProviders !== "object" || Array.isArray(rawProviders)) throw new Error("models.json: providers должен быть объектом");
-      if (Object.values(rawProviders).some((value) => !value || typeof value !== "object" || Array.isArray(value))) throw new Error("models.json: каждый провайдер должен быть объектом");
-      const current = rawProviders as Record<string, ProviderCfg>;
-      const next = mutate(current);
-      parsed.providers = next;
-      await be.invoke("write_pi_config", { name: "models", content: JSON.stringify(parsed, null, 2) });
-      setProviders(next);
-      setError(null);
-      setReloadKey((k) => k + 1);
-      return true;
-    } catch (writeError) {
-      setError(`Не удалось сохранить models.json: ${String(writeError)}`);
-      return false;
-    }
+  const mutateProviders = (mutate: (current: Record<string, ProviderCfg>) => Record<string, ProviderCfg>): Promise<boolean> => {
+    const run = async (): Promise<boolean> => {
+      const generation = ++loadGeneration.current;
+      try {
+        const be = await getBackend();
+        for (let attempt = 0; attempt < CONFIG_WRITE_RETRIES; attempt++) {
+          const f = await be.invoke<ConfigFile>("read_pi_config", { name: "models" });
+          const parsed = parseJsonObject(f.content, "models.json");
+          const rawProviders = parsed.providers ?? {};
+          if (!rawProviders || typeof rawProviders !== "object" || Array.isArray(rawProviders)) throw new Error("models.json: providers должен быть объектом");
+          if (Object.values(rawProviders).some((value) => !value || typeof value !== "object" || Array.isArray(value))) throw new Error("models.json: каждый провайдер должен быть объектом");
+          const current = rawProviders as Record<string, ProviderCfg>;
+          const next = mutate(current);
+          parsed.providers = next;
+          try {
+            await be.invoke("write_pi_config_if_unchanged", {
+              name: "models",
+              expectedContent: f.content,
+              content: JSON.stringify(parsed, null, 2),
+            });
+            if (generation === loadGeneration.current) {
+              setProviders(next);
+              setError(null);
+            }
+            setReloadKey((k) => k + 1);
+            return true;
+          } catch (writeError) {
+            if (isConfigConflict(writeError) && attempt + 1 < CONFIG_WRITE_RETRIES) continue;
+            throw writeError;
+          }
+        }
+        return false;
+      } catch (writeError) {
+        if (generation === loadGeneration.current) {
+          setError(`Не удалось сохранить models.json: ${String(writeError)}`);
+        }
+        return false;
+      }
+    };
+    const result = mutationQueue.current.then(run, run);
+    mutationQueue.current = result.then(() => undefined, () => undefined);
+    return result;
   };
 
   const addProvider = async (name: string, cfg: ProviderCfg) => {

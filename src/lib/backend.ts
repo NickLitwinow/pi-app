@@ -775,6 +775,7 @@ export class MockBackend implements Backend {
             resolvedColors: { accent: "#62d6b5", border: "#34504b", borderMuted: "#283d3a", success: "#4ade80", error: "#fb7185", warning: "#fbbf24", muted: "#94a3b8", text: "#f8fafc", selectedBg: "#223532", userMessageBg: "#1d2928", customMessageBg: "#111918", toolPendingBg: "#111918" },
             valid: true,
             error: null,
+            enabled: true,
           },
         ].filter((theme) => !this.deletedThemes.has(theme.path)) as T;
       case "save_pi_theme":
@@ -831,6 +832,9 @@ export class MockBackend implements Backend {
       case "read_pi_config": {
         const name = String(args.name);
         const content = name === "settings" ? this.settings : name === "mcp" ? this.mcp : this.models;
+        // Keep reads observably asynchronous so UI regressions cannot assume
+        // that config I/O always wins a race against a user's next edit.
+        await sleep(80);
         return { path: `~/.pi/agent/${name}.json`, content, exists: true } satisfies ConfigFile as T;
       }
       case "read_project_settings": {
@@ -860,9 +864,17 @@ export class MockBackend implements Backend {
             : this.projectMcpExists.has(cwd),
         } satisfies ConfigFile as T;
       }
-      case "write_project_pi_config": {
+      case "write_project_pi_config":
+      case "write_project_pi_config_if_unchanged": {
         const cwd = String(args.cwd);
-        if (String(args.name) === "settings") {
+        const name = String(args.name);
+        const current = name === "settings"
+          ? this.projectSettings.get(cwd) ?? "{}"
+          : this.projectMcp.get(cwd) ?? "{}";
+        if (cmd === "write_project_pi_config_if_unchanged" && current !== String(args.expectedContent)) {
+          throw new Error("CONFIG_CONFLICT: файл изменился после чтения");
+        }
+        if (name === "settings") {
           this.projectSettings.set(cwd, String(args.content));
           this.projectSettingsExists.add(cwd);
         } else {
@@ -871,9 +883,14 @@ export class MockBackend implements Backend {
         }
         return undefined as T;
       }
-      case "write_pi_config": {
+      case "write_pi_config":
+      case "write_pi_config_if_unchanged": {
         const name = String(args.name);
         const content = String(args.content);
+        const current = name === "settings" ? this.settings : name === "mcp" ? this.mcp : this.models;
+        if (cmd === "write_pi_config_if_unchanged" && current !== String(args.expectedContent)) {
+          throw new Error("CONFIG_CONFLICT: файл изменился после чтения");
+        }
         if (name === "settings") this.settings = content;
         else if (name === "mcp") this.mcp = content;
         else this.models = content;

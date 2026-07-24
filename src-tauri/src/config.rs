@@ -119,6 +119,26 @@ pub async fn write_project_pi_config(
     write_project_pi_config_impl(cwd, name, content)
 }
 
+#[tauri::command]
+pub async fn write_project_pi_config_if_unchanged(
+    cwd: String,
+    name: String,
+    expected_content: String,
+    content: String,
+) -> Result<(), String> {
+    let _lifecycle_lock = crate::extension_lifecycle::acquire_lifecycle_lock().await?;
+    if !matches!(name.as_str(), "settings" | "mcp") {
+        return Err(format!("unknown project config: {name}"));
+    }
+    let root = PathBuf::from(&cwd);
+    if !root.is_dir() {
+        return Err("workspace не существует".into());
+    }
+    let path = root.join(".pi").join(format!("{name}.json"));
+    ensure_config_unchanged(&path, &expected_content)?;
+    write_project_pi_config_impl(cwd, name, content)
+}
+
 fn write_project_pi_config_impl(cwd: String, name: String, content: String) -> Result<(), String> {
     if !matches!(name.as_str(), "settings" | "mcp") {
         return Err(format!("unknown project config: {name}"));
@@ -128,6 +148,7 @@ fn write_project_pi_config_impl(cwd: String, name: String, content: String) -> R
         return Err("workspace не существует".into());
     }
     let path = root.join(".pi").join(format!("{name}.json"));
+    validate_config_object(&name, &content)?;
     if name == "settings" {
         reject_unmanaged_package_change(&path, &content)?;
     }
@@ -165,10 +186,51 @@ pub fn write_json_atomic(path: &Path, content: &str) -> Result<(), String> {
 pub async fn write_pi_config(name: String, content: String) -> Result<(), String> {
     let _lifecycle_lock = crate::extension_lifecycle::acquire_lifecycle_lock().await?;
     let path = pi_config_path(&name)?;
+    validate_config_object(&name, &content)?;
     if name == "settings" {
         reject_unmanaged_package_change(&path, &content)?;
     }
     write_json_atomic(&path, &content)
+}
+
+#[tauri::command]
+pub async fn write_pi_config_if_unchanged(
+    name: String,
+    expected_content: String,
+    content: String,
+) -> Result<(), String> {
+    let _lifecycle_lock = crate::extension_lifecycle::acquire_lifecycle_lock().await?;
+    let path = pi_config_path(&name)?;
+    ensure_config_unchanged(&path, &expected_content)?;
+    validate_config_object(&name, &content)?;
+    if name == "settings" {
+        reject_unmanaged_package_change(&path, &content)?;
+    }
+    write_json_atomic(&path, &content)
+}
+
+fn ensure_config_unchanged(path: &Path, expected_content: &str) -> Result<(), String> {
+    let current = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".into(),
+        Err(error) => return Err(error.to_string()),
+    };
+    if current != expected_content {
+        return Err(
+            "CONFIG_CONFLICT: файл изменился после чтения; перечитайте его и повторите действие"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_config_object(name: &str, content: &str) -> Result<(), String> {
+    let value: Value =
+        serde_json::from_str(content).map_err(|error| format!("невалидный JSON: {error}"))?;
+    if !value.is_object() {
+        return Err(format!("{name}.json: корень должен быть объектом"));
+    }
+    Ok(())
 }
 
 fn reject_unmanaged_package_change(path: &Path, content: &str) -> Result<(), String> {
@@ -1455,5 +1517,27 @@ mod tests {
         assert!(read.path.ends_with(".pi/mcp.json"));
         assert!(read.content.contains("mcpServers"));
         assert!(read_project_pi_config(cwd, "../models".into()).is_err());
+    }
+
+    #[test]
+    fn config_root_must_be_a_json_object() {
+        assert!(validate_config_object("settings", r#"{"theme":"dark"}"#).is_ok());
+        assert!(validate_config_object("settings", "[]")
+            .unwrap_err()
+            .contains("корень должен быть объектом"));
+        assert!(validate_config_object("settings", "null").is_err());
+        assert!(validate_config_object("settings", "{").is_err());
+    }
+
+    #[test]
+    fn conditional_config_write_detects_stale_content_and_missing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        assert!(ensure_config_unchanged(&path, "{}").is_ok());
+        fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+        assert!(ensure_config_unchanged(&path, r#"{"theme":"dark"}"#).is_ok());
+        assert!(ensure_config_unchanged(&path, "{}")
+            .unwrap_err()
+            .starts_with("CONFIG_CONFLICT:"));
     }
 }

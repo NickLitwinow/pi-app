@@ -137,6 +137,25 @@ describe("MockBackend session isolation", () => {
     await expect(backend.invoke("read_permission_mode", { cwd: "/Users/dev/website" })).resolves.toBe("ask");
   });
 
+  it("rejects stale conditional config writes instead of overwriting newer content", async () => {
+    const backend = new MockBackend();
+    const initial = await backend.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
+    const newer = "{\"mcpServers\":{\"newer\":{\"command\":\"node\"}}}";
+    await backend.invoke("write_pi_config", { name: "mcp", content: newer });
+
+    await expect(backend.invoke("write_pi_config_if_unchanged", {
+      name: "mcp",
+      expectedContent: initial.content,
+      content: "{\"mcpServers\":{}}",
+    })).rejects.toThrow("CONFIG_CONFLICT");
+
+    await expect(backend.invoke("write_pi_config_if_unchanged", {
+      name: "mcp",
+      expectedContent: newer,
+      content: "{\"mcpServers\":{\"final\":{\"command\":\"npx\"}}}",
+    })).resolves.toBeUndefined();
+  });
+
   it("fails closed when a resource toggle does not match the scoped package", async () => {
     const backend = new MockBackend();
     await expect(backend.invoke("set_extension_resource_enabled", {

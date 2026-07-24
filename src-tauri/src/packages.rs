@@ -439,7 +439,7 @@ fn git_package_source(spec: &str) -> Option<GitPackageSource> {
     })
 }
 
-fn package_dir_for_root(root: &Path, spec: &str) -> Option<PathBuf> {
+pub(crate) fn package_dir_for_root(root: &Path, spec: &str) -> Option<PathBuf> {
     if let Some(raw) = spec.strip_prefix("npm:") {
         let (name, _) = npm_name_and_pin(raw)?;
         return Some(root.join("npm").join("node_modules").join(name));
@@ -458,6 +458,19 @@ fn package_dir_for_root(root: &Path, spec: &str) -> Option<PathBuf> {
     } else {
         root.join(expanded)
     })
+}
+
+pub(crate) fn package_identity_for_root(root: &Path, spec: &str) -> Option<String> {
+    if let Some(raw) = spec.strip_prefix("npm:") {
+        let (name, _) = npm_name_and_pin(raw)?;
+        return Some(format!("npm:{name}"));
+    }
+    if let Some(git) = git_package_source(spec) {
+        return Some(format!("git:{}/{}", git.host, git.path));
+    }
+    let path = package_dir_for_root(root, spec)?;
+    let resolved = path.canonicalize().unwrap_or(path);
+    Some(format!("local:{}", resolved.to_string_lossy()))
 }
 
 fn read_json_limited(path: &Path) -> Option<Value> {
@@ -546,10 +559,8 @@ fn convention_has_resources(package_dir: &Path, key: &str) -> Option<bool> {
 
 fn resource_kinds_from_package(package_dir: &Path) -> Option<Vec<String>> {
     let manifest: Value = read_json_limited(&package_dir.join("package.json"))?;
-    let config = manifest
-        .get("pi")
-        .or_else(|| manifest.get("pi-package"))
-        .and_then(Value::as_object);
+    let manifest_config = manifest.get("pi").or_else(|| manifest.get("pi-package"));
+    let config = manifest_config.and_then(Value::as_object);
     let mut kinds = Vec::new();
     for (key, kind) in [
         ("extensions", "extension"),
@@ -557,14 +568,22 @@ fn resource_kinds_from_package(package_dir: &Path) -> Option<Vec<String>> {
         ("themes", "theme"),
         ("prompts", "prompt"),
     ] {
-        let configured = config.and_then(|config| config.get(key));
-        let declared = configured
-            .and_then(Value::as_array)
-            .is_some_and(|entries| !entries.is_empty())
-            || configured
-                .and_then(Value::as_str)
-                .is_some_and(|entry| !entry.trim().is_empty())
-            || (configured.is_none() && convention_has_resources(package_dir, key)?);
+        // Pi treats the presence of a `pi` manifest as authoritative for every
+        // resource type. A missing key does not fall back to a same-named
+        // directory, otherwise stray build/example files appear installed in
+        // Library even though Pi never loads them.
+        let declared = if manifest_config.is_some() {
+            config
+                .and_then(|config| config.get(key))
+                .and_then(Value::as_array)
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.as_str().is_some_and(|entry| !entry.trim().is_empty()))
+                })
+        } else {
+            convention_has_resources(package_dir, key)?
+        };
         if declared {
             kinds.push(kind.to_string());
         }
@@ -826,6 +845,14 @@ mod tests {
             package_dir_for_root(root, "../../workspace/custom-package"),
             Some(PathBuf::from("/agent/../../workspace/custom-package"))
         );
+        assert_eq!(
+            package_identity_for_root(root, "npm:@scope/pkg@2.0.0").as_deref(),
+            Some("npm:@scope/pkg")
+        );
+        assert_eq!(
+            package_identity_for_root(root, "git:github.com/owner/repo.git#main").as_deref(),
+            Some("git:github.com/owner/repo")
+        );
     }
 
     #[test]
@@ -890,7 +917,7 @@ mod tests {
                     "extensions": ["./index.ts"],
                     "skills": ["./skills"],
                     "themes": [],
-                    "prompts": "./prompts"
+                    "prompts": ["./prompts"]
                 }
             }"#,
         )
@@ -939,5 +966,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resource_kinds_from_package(temp.path()), Some(Vec::new()));
+
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"name":"manifest-wins","pi":{"extensions":["./extensions/index.ts"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resource_kinds_from_package(temp.path()),
+            Some(vec!["extension".to_string()])
+        );
     }
 }

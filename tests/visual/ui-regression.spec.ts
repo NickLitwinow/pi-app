@@ -82,6 +82,45 @@ test("Settings / Interface — minimalist app icon background is independent and
   await expect(page.locator(".app-icon-style-section")).toHaveScreenshot("settings-icon-styles.png");
 });
 
+test("Settings raw editor keeps a newer draft when an older reread finishes late", async ({ page }) => {
+  await boot(page);
+  await page.getByRole("button", { name: "Настройки", exact: true }).click();
+  const editor = page.locator("details.advanced-editor").filter({ hasText: "Advanced · raw settings.json" });
+  await editor.locator("summary").click();
+  const textarea = editor.locator("textarea");
+  await expect(textarea).not.toHaveValue("");
+
+  await editor.getByRole("button", { name: "Перечитать" }).click();
+  const newerDraft = '{\n  "draft": "user edit must win"\n}';
+  await textarea.fill(newerDraft);
+  await page.waitForTimeout(140);
+  await expect(textarea).toHaveValue(newerDraft);
+  await expect(editor.getByText("Не сохранено", { exact: true })).toBeVisible();
+});
+
+test("Settings serializes rapid nested updates without dropping sibling values", async ({ page }) => {
+  await boot(page);
+  await page.getByRole("button", { name: "Настройки", exact: true }).click();
+  const autoResize = page.getByRole("switch", { name: "Автоматически уменьшать большие изображения" });
+  const blockImages = page.getByRole("switch", { name: "Не отправлять изображения провайдерам" });
+  await expect(autoResize).toHaveAttribute("aria-checked", "true");
+  await expect(blockImages).toHaveAttribute("aria-checked", "false");
+
+  await autoResize.click();
+  await blockImages.click();
+  await expect(autoResize).toHaveAttribute("aria-checked", "false");
+  await expect(blockImages).toHaveAttribute("aria-checked", "true");
+
+  const editor = page.locator("details.advanced-editor").filter({ hasText: "Advanced · raw settings.json" });
+  await editor.locator("summary").click();
+  await editor.getByRole("button", { name: "Перечитать" }).click();
+  await expect.poll(async () => {
+    const value = await editor.locator("textarea").inputValue();
+    const settings = JSON.parse(value) as { images?: { autoResize?: boolean; blockImages?: boolean } };
+    return settings.images;
+  }).toEqual({ autoResize: false, blockImages: true });
+});
+
 test("Library / Extensions — long scoped package and responsive actions", async ({ page }) => {
   await boot(page);
   await page.getByRole("button", { name: "Library" }).click();
@@ -302,6 +341,7 @@ test("Library harness profiles — context cost and scope", async ({ page }) => 
   await page.getByText("Local reasoning boost", { exact: true }).scrollIntoViewIfNeeded();
   await page.getByRole("button", { name: "Включить boost" }).click();
   await expect(page.getByRole("button", { name: "Выключить boost" })).toBeVisible();
+  await expect(page.locator(".profile-console")).toHaveCount(0);
   await expectNoHorizontalOverflow(page);
   await expect(page).toHaveScreenshot("library-profiles.png", { fullPage: true });
 });

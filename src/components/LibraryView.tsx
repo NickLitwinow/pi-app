@@ -68,6 +68,8 @@ const REASONING_SERVER = {
   lifecycle: "eager",
 };
 
+const isConfigConflict = (error: unknown) => String(error).includes("CONFIG_CONFLICT:");
+
 function useReasoningPreset(scope: "global" | "project", cwd: string | null) {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -109,22 +111,42 @@ function useReasoningPreset(scope: "global" | "project", cwd: string | null) {
     setError(null);
     try {
       const be = await getBackend();
-      const file = scope === "project"
-        ? await be.invoke<ConfigFile>("read_project_pi_config", { cwd, name: "mcp" })
-        : await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
-      const parsed = JSON.parse(file.content) as unknown;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file.path}: корень должен быть объектом`);
-      const config = parsed as Record<string, unknown>;
-      const rawServers = config.mcpServers ?? {};
-      if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) throw new Error(`${file.path}: mcpServers должен быть объектом`);
-      const servers = { ...rawServers as Record<string, unknown> };
-      if (nextEnabled) servers["sequential-thinking"] = REASONING_SERVER;
-      else delete servers["sequential-thinking"];
-      const next = { ...config, mcpServers: servers };
-      const content = JSON.stringify(next, null, 2) + "\n";
-      if (scope === "project") await be.invoke("write_project_pi_config", { cwd, name: "mcp", content });
-      else await be.invoke("write_pi_config", { name: "mcp", content });
-      if (generation === generationRef.current) setEnabled(nextEnabled);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const file = scope === "project"
+          ? await be.invoke<ConfigFile>("read_project_pi_config", { cwd, name: "mcp" })
+          : await be.invoke<ConfigFile>("read_pi_config", { name: "mcp" });
+        const parsed = JSON.parse(file.content) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file.path}: корень должен быть объектом`);
+        const config = parsed as Record<string, unknown>;
+        const rawServers = config.mcpServers ?? {};
+        if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) throw new Error(`${file.path}: mcpServers должен быть объектом`);
+        const servers = { ...rawServers as Record<string, unknown> };
+        if (nextEnabled) servers["sequential-thinking"] = REASONING_SERVER;
+        else delete servers["sequential-thinking"];
+        const next = { ...config, mcpServers: servers };
+        const content = JSON.stringify(next, null, 2) + "\n";
+        try {
+          if (scope === "project") {
+            await be.invoke("write_project_pi_config_if_unchanged", {
+              cwd,
+              name: "mcp",
+              expectedContent: file.content,
+              content,
+            });
+          } else {
+            await be.invoke("write_pi_config_if_unchanged", {
+              name: "mcp",
+              expectedContent: file.content,
+              content,
+            });
+          }
+          if (generation === generationRef.current) setEnabled(nextEnabled);
+          return;
+        } catch (writeError) {
+          if (isConfigConflict(writeError) && attempt < 2) continue;
+          throw writeError;
+        }
+      }
     } catch (presetError) {
       if (generation === generationRef.current) setError(String(presetError));
     } finally {
@@ -136,7 +158,13 @@ function useReasoningPreset(scope: "global" | "project", cwd: string | null) {
 }
 
 function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | null }) {
-  const { installed, specs, reload } = useInstalledPackages(scope, cwd);
+  const {
+    installed,
+    specs,
+    loading: installedLoading,
+    error: installedError,
+    reload,
+  } = useInstalledPackages(scope, cwd);
   const runner = useRunPi(reload);
   const reasoning = useReasoningPreset(scope, cwd);
   const [error, setError] = useState<string | null>(null);
@@ -179,6 +207,7 @@ function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | n
       <div className="hint profile-additive-note">
         Профили устанавливают недостающие пакеты и не удаляют существующие. Оценка контекста относится только к пакету связки, а не ко всему текущему окружению.
       </div>
+      {installedError && <div className="profile-error" role="alert">{installedError}</div>}
       {error && <div className="profile-error" role="alert">{error}</div>}
       {PROFILES.map((profile) => {
         const installedCount = profile.packages.filter(hasProfilePackage).length;
@@ -201,7 +230,7 @@ function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | n
                 return <code key={profilePackageSource(pkg)} className={present ? "installed" : ""}>{present && <CheckIcon size={10} />}{name}</code>;
               })}
             </div>
-            <button className={complete ? "" : "primary"} disabled={complete || runner.running || (scope === "project" && !cwd)} onClick={() => void installProfile(profile.packages)}>
+            <button className={complete ? "" : "primary"} disabled={installedLoading || Boolean(installedError) || complete || runner.running || (scope === "project" && !cwd)} onClick={() => void installProfile(profile.packages)}>
               {complete ? "Установлен" : installedCount > 0 ? `Доустановить ${profile.packages.length - installedCount}` : "Установить профиль"}
             </button>
           </article>
@@ -220,7 +249,7 @@ function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | n
         </div>
         <button
           className={reasoning.enabled && installed.has("pi-mcp-adapter") ? "" : "primary"}
-          disabled={reasoning.busy || runner.running || (scope === "project" && !cwd)}
+          disabled={installedLoading || Boolean(installedError) || reasoning.busy || runner.running || (scope === "project" && !cwd)}
           onClick={() => void (async () => {
             const active = reasoning.enabled && installed.has("pi-mcp-adapter");
             if (active) {

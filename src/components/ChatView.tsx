@@ -1825,10 +1825,19 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const [pinned, setPinned] = useState(true);
   const pinnedRef = useRef(true);
   const touchYRef = useRef<number | null>(null);
+  const detachUntilRef = useRef(0);
   const transcriptMode = useStore((s) => s.appConfig.transcriptMode ?? "normal");
 
   const updatePinned = (next: boolean) => {
     pinnedRef.current = next;
+    if (next) {
+      detachUntilRef.current = 0;
+    } else {
+      // A queued atBottom=true can arrive before the browser applies the
+      // upward wheel/touch delta. Keep that stale callback from immediately
+      // stealing explicit user detach.
+      detachUntilRef.current = performance.now() + 1_000;
+    }
     setPinned(next);
   };
 
@@ -1986,7 +1995,9 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
       ref={rootRef}
       style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}
       onWheelCapture={(event) => {
-        if (event.deltaY < 0) updatePinned(false);
+        if (event.deltaY < 0) {
+          updatePinned(false);
+        }
       }}
       onTouchStartCapture={(event) => {
         touchYRef.current = event.touches[0]?.clientY ?? null;
@@ -1999,7 +2010,9 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         touchYRef.current = next ?? null;
       }}
       onKeyDownCapture={(event) => {
-        if (["ArrowUp", "PageUp", "Home"].includes(event.key)) updatePinned(false);
+        if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+          updatePinned(false);
+        }
         if (event.key === "End") updatePinned(true);
       }}
       onPointerDownCapture={(event) => {
@@ -2010,7 +2023,9 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         const bounds = scroller.getBoundingClientRect();
         // Dragging the scrollbar is another explicit request to leave follow
         // mode. atBottomStateChange reattaches if it is dragged back to bottom.
-        if (event.clientX >= bounds.right - 14) updatePinned(false);
+        if (event.clientX >= bounds.right - 14) {
+          updatePinned(false);
+        }
       }}
     >
       {searchOpen && (
@@ -2060,6 +2075,7 @@ function MessageList({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
           followOutput={pinned ? "auto" : false}
           atBottomStateChange={(atBottom) => {
             if (!atBottom) return;
+            if (performance.now() < detachUntilRef.current) return;
             const scroller = rootRef.current?.querySelector<HTMLElement>(".msg-scroll");
             const gap = scroller
               ? scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop

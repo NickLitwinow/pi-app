@@ -83,7 +83,15 @@ export default function Marketplace({
   const catalogLoadGeneration = useRef(0);
   const detailsLoadGeneration = useRef(0);
 
-  const { installed, specs, entries, reload, setResourceEnabled } = useInstalledPackages(scope, cwd);
+  const {
+    installed,
+    specs,
+    entries,
+    loading: installedSettingsLoading,
+    error: installedSettingsError,
+    reload,
+    setResourceEnabled,
+  } = useInstalledPackages(scope, cwd);
   const { log, running, runPi, logRef } = useRunPi(() => {
     reload();
     setInstalledRefresh((value) => value + 1);
@@ -176,7 +184,9 @@ export default function Marketplace({
     setPackageDetails({});
   }, [cwd, kind, scope]);
 
-  const missingRec = (recommended ?? []).filter((r) => !installed.has(r.pkg.replace(/^npm:/, "")));
+  const missingRec = installedSettingsLoading || installedSettingsError
+    ? []
+    : (recommended ?? []).filter((r) => !installed.has(r.pkg.replace(/^npm:/, "")));
   const installedForKind = installedMeta.filter((pkg) => packageProvidesResource(pkg, kind));
   const shown = onlyInstalled ? sortPackages(installedForKind, sort) : sortPackages(results, sort);
   const canLoadMore = !onlyInstalled && results.length < total;
@@ -290,7 +300,7 @@ export default function Marketplace({
             <>
               <button
                 className={`resource-toggle ${resourceEnabled ? "on" : ""}`}
-                disabled={running || resourceBusy !== null || coreResource}
+                disabled={installedSettingsLoading || Boolean(installedSettingsError) || running || resourceBusy !== null || coreResource}
                 aria-pressed={resourceEnabled}
                 title={coreResource
                   ? "Ядро harness всегда активно"
@@ -300,11 +310,11 @@ export default function Marketplace({
                 <span aria-hidden="true" /> {resourceEnabled ? "Активно" : "Выключено"}
               </button>
               {updateAvailable && (
-                <button className="primary" disabled={running || resourceBusy !== null} onClick={() => updatePackage(p)}>Обновить</button>
+                <button className="primary" disabled={installedSettingsLoading || Boolean(installedSettingsError) || running || resourceBusy !== null} onClick={() => updatePackage(p)}>Обновить</button>
               )}
               <button
                 className="danger"
-                disabled={running || resourceBusy !== null || isHarnessCorePackage(p)}
+                disabled={installedSettingsLoading || Boolean(installedSettingsError) || running || resourceBusy !== null || isHarnessCorePackage(p)}
                 title={isHarnessCorePackage(p) ? "Ядро harness нельзя удалить" : "Удалить пакет и его ресурсы"}
                 onClick={() => void remove(p)}
               >
@@ -312,7 +322,7 @@ export default function Marketplace({
               </button>
             </>
           ) : (
-            <button className="primary" disabled={running || resourceBusy !== null} onClick={() => install(p.name)}>
+            <button className="primary" disabled={installedSettingsLoading || Boolean(installedSettingsError) || running || resourceBusy !== null} onClick={() => install(p.name)}>
               Установить
             </button>
           )}
@@ -371,7 +381,7 @@ export default function Marketplace({
                 <span className="c-title">{r.name}</span>
                 <span className="badge">не установлено</span>
                 <div className="grow" />
-                <button className="primary" disabled={running} onClick={() => install(r.pkg.replace(/^npm:/, ""))}>
+                <button className="primary" disabled={installedSettingsLoading || Boolean(installedSettingsError) || running} onClick={() => install(r.pkg.replace(/^npm:/, ""))}>
                   Установить
                 </button>
               </div>
@@ -399,7 +409,7 @@ export default function Marketplace({
         <button className={onlyInstalled ? "active" : ""} onClick={() => setOnlyInstalled(!onlyInstalled)} title="Только установленные">
           <CheckIcon size={13} /> Установленные
         </button>
-        <button disabled={running || resourceBusy !== null} onClick={() => void runPi(["update", "--extensions"], scope === "project" ? cwd : null)} title="Обновить все незакреплённые пакеты">
+        <button disabled={installedSettingsLoading || Boolean(installedSettingsError) || running || resourceBusy !== null} onClick={() => void runPi(["update", "--extensions"], scope === "project" ? cwd : null)} title="Обновить все незакреплённые пакеты">
           <RefreshIcon size={13} /> Обновить всё
         </button>
       </div>
@@ -415,6 +425,7 @@ export default function Marketplace({
       </div>
 
       {error && <div className="card" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>{error}</div>}
+      {installedSettingsError && <div className="card" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>{installedSettingsError}</div>}
 
       {shown.map(renderCard)}
 
