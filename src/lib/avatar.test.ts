@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { avatarHash, avatarVariant, decodeDataUrlJson, DEFAULT_PRESET, isLottieData } from "../components/AgentAvatar";
+import { avatarHash, avatarVariant, decodeDataUrlJson, DEFAULT_PRESET, isLottieData } from "./avatar";
 import { formatRunDuration, parseTurnTiming } from "../components/MessageView";
 
 describe("avatarHash", () => {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getBackend } from "../lib/backend";
 import type { ConfigFile, PackageKind, SkillInfo } from "../lib/types";
 import { updateAppConfig, useStore } from "../state/store";
@@ -71,8 +71,13 @@ function useReasoningPreset(scope: "global" | "project", cwd: string | null) {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const generationRef = useRef(0);
 
   const read = useCallback(async () => {
+    const generation = ++generationRef.current;
+    setBusy(false);
+    setEnabled(false);
+    setError(null);
     try {
       const be = await getBackend();
       const file = scope === "project" && cwd
@@ -82,10 +87,15 @@ function useReasoningPreset(scope: "global" | "project", cwd: string | null) {
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file.path}: корень должен быть объектом`);
       const rawServers = (parsed as Record<string, unknown>).mcpServers ?? {};
       if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) throw new Error(`${file.path}: mcpServers должен быть объектом`);
-      setEnabled(Object.prototype.hasOwnProperty.call(rawServers, "sequential-thinking"));
-      setError(null);
+      if (generation === generationRef.current) {
+        setEnabled(Object.prototype.hasOwnProperty.call(rawServers, "sequential-thinking"));
+        setError(null);
+      }
     } catch (readError) {
-      setError(`Не удалось прочитать MCP-пресет: ${String(readError)}`);
+      if (generation === generationRef.current) {
+        setEnabled(false);
+        setError(`Не удалось прочитать MCP-пресет: ${String(readError)}`);
+      }
     }
   }, [cwd, scope]);
 
@@ -93,6 +103,7 @@ function useReasoningPreset(scope: "global" | "project", cwd: string | null) {
 
   const setPreset = async (nextEnabled: boolean) => {
     if (scope === "project" && !cwd) return;
+    const generation = ++generationRef.current;
     setBusy(true);
     setError(null);
     try {
@@ -112,11 +123,11 @@ function useReasoningPreset(scope: "global" | "project", cwd: string | null) {
       const content = JSON.stringify(next, null, 2) + "\n";
       if (scope === "project") await be.invoke("write_project_pi_config", { cwd, name: "mcp", content });
       else await be.invoke("write_pi_config", { name: "mcp", content });
-      setEnabled(nextEnabled);
+      if (generation === generationRef.current) setEnabled(nextEnabled);
     } catch (presetError) {
-      setError(String(presetError));
+      if (generation === generationRef.current) setError(String(presetError));
     } finally {
-      setBusy(false);
+      if (generation === generationRef.current) setBusy(false);
     }
   };
 

@@ -1,86 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getBackend } from "../lib/backend";
 import { confirmDialog } from "../lib/dialog";
+import {
+  isPackageResourceEnabled,
+  packageCliSource,
+  packageNameFromSpec,
+  packageProvidesResource,
+  packageRisk,
+  packageSource,
+} from "../lib/marketplace";
 import type { ConfigFile, PackageDetails, PackageKind, PackageSearch, PackageSetting, PiPackage } from "../lib/types";
 import { openExternalUrl } from "../state/store";
 import { CheckIcon, ExternalIcon, PackageIcon, RefreshIcon } from "./icons";
 import { Markdown } from "./Markdown";
 
 // ---------- installed packages (settings.json → packages[]) ----------
-
-const RESOURCE_KEY: Record<PackageKind, "extensions" | "skills" | "themes" | "prompts"> = {
-  extension: "extensions",
-  skill: "skills",
-  theme: "themes",
-  prompt: "prompts",
-};
-
-function packageSource(spec: PackageSetting): string {
-  return typeof spec === "string" ? spec : spec.source;
-}
-
-/** Convert package specs into the stable display/resource-filter name. */
-export function packageNameFromSpec(spec: PackageSetting | unknown): string | null {
-  const sourceSpec = typeof spec === "string"
-    ? spec
-    : spec && typeof spec === "object" && "source" in spec && typeof spec.source === "string"
-      ? spec.source
-      : "";
-  if (sourceSpec.startsWith("git:")) {
-    const clean = sourceSpec.slice(4).split(/[?#]/, 1)[0].replace(/\/$/, "");
-    const name = clean.slice(clean.lastIndexOf("/") + 1).replace(/\.git$/, "");
-    return name || null;
-  }
-  if (sourceSpec.startsWith("npm:")) {
-    const source = sourceSpec.slice(4);
-    if (source.startsWith("@")) {
-      const versionSeparator = source.indexOf("@", source.indexOf("/") + 1);
-      return versionSeparator > 0 ? source.slice(0, versionSeparator) : source;
-    }
-    const versionSeparator = source.indexOf("@");
-    return versionSeparator > 0 ? source.slice(0, versionSeparator) : source;
-  }
-  // Pi also accepts local package directories. Keep those visible in the
-  // Installed view instead of silently dropping every non-npm/non-git spec.
-  const clean = sourceSpec.trim().replace(/^file:/, "").split(/[?#]/, 1)[0].replace(/[\\/]+$/, "");
-  const name = clean.split(/[\\/]/).pop()?.replace(/\.git$/, "");
-  return name || null;
-}
-
-export function isPackageResourceEnabled(spec: PackageSetting, kind: PackageKind): boolean {
-  if (typeof spec === "string") return true;
-  const filter = spec[RESOURCE_KEY[kind]];
-  return filter === undefined || filter.length > 0;
-}
-
-export function setPackageResourceEnabled(
-  packages: PackageSetting[],
-  packageIdentifier: string,
-  kind: PackageKind,
-  enabled: boolean,
-): PackageSetting[] {
-  const key = RESOURCE_KEY[kind];
-  return packages.map((spec) => {
-    if (packageSource(spec) !== packageIdentifier && packageNameFromSpec(spec) !== packageIdentifier) return spec;
-    const next: Exclude<PackageSetting, string> = typeof spec === "string" ? { source: spec } : { ...spec };
-    if (enabled) delete next[key];
-    else next[key] = [];
-    return Object.keys(next).length === 1 ? next.source : next;
-  });
-}
-
-export function packageCliSource(pkg: Pick<PiPackage, "name" | "source">): string {
-  return pkg.source || `npm:${pkg.name}`;
-}
-
-/** Unknown manifests remain visible so custom package layouts are manageable;
- * a successfully inspected manifest with no matching resource is filtered. */
-export function packageProvidesResource(
-  pkg: Pick<PiPackage, "resourceKinds">,
-  kind: PackageKind,
-): boolean {
-  return !Array.isArray(pkg.resourceKinds) || pkg.resourceKinds.includes(kind);
-}
 
 function isHarnessCorePackage(pkg: Pick<PiPackage, "name" | "source">): boolean {
   return pkg.name === "harness-extension" && Boolean(pkg.source && !pkg.source.startsWith("npm:"));
@@ -95,7 +29,9 @@ export function useInstalledPackages(scope: "global" | "project" = "global", cwd
   setResourceEnabled: (packageName: string, kind: PackageKind, enabled: boolean) => Promise<void>;
 } {
   const [entries, setEntries] = useState<PackageSetting[]>([]);
+  const reloadGeneration = useRef(0);
   const reload = useCallback(() => {
+    const generation = ++reloadGeneration.current;
     void (async () => {
       const be = await getBackend();
       const f = scope === "project" && cwd
@@ -107,16 +43,20 @@ export function useInstalledPackages(scope: "global" | "project" = "global", cwd
           ? parsed.packages.filter((item): item is PackageSetting =>
             typeof item === "string" || Boolean(item && typeof item === "object" && "source" in item && typeof item.source === "string"))
           : [];
-        setEntries(packages);
+        if (generation === reloadGeneration.current) setEntries(packages);
       } catch {
-        setEntries([]);
+        if (generation === reloadGeneration.current) setEntries([]);
       }
     })();
   }, [scope, cwd]);
-  useEffect(reload, [reload]);
+  useEffect(() => {
+    setEntries([]);
+    reload();
+  }, [reload]);
   const installed = new Set(entries.map(packageNameFromSpec).filter((name): name is string => Boolean(name)));
   const specs = entries.map(packageSource);
   const setResourceEnabled = useCallback(async (packageName: string, kind: PackageKind, enabled: boolean) => {
+    const generation = ++reloadGeneration.current;
     try {
       const be = await getBackend();
       if (scope === "project" && !cwd) throw new Error("Сначала откройте проект");
@@ -132,9 +72,9 @@ export function useInstalledPackages(scope: "global" | "project" = "global", cwd
         ? parsed.packages.filter((item): item is PackageSetting =>
           typeof item === "string" || Boolean(item && typeof item === "object" && "source" in item && typeof item.source === "string"))
         : [];
-      setEntries(packages);
+      if (generation === reloadGeneration.current) setEntries(packages);
     } catch (error) {
-      reload();
+      if (generation === reloadGeneration.current) reload();
       throw error;
     }
   }, [cwd, reload, scope]);
@@ -230,23 +170,6 @@ const KIND_LABEL: Record<PackageKind, string> = {
   prompt: "prompts и AGENTS.md",
 };
 
-const KIND_RISK: Record<PackageKind, { label: string; title: string; className: string }> = {
-  extension: { label: "исполняет код", title: "Расширение исполняется с правами текущего пользователя", className: "danger" },
-  skill: { label: "контекст модели", title: "Описание и инструкции skill влияют на системный контекст", className: "context" },
-  theme: { label: "только оформление", title: "Тема меняет палитру и оформление", className: "safe" },
-  prompt: { label: "инструкции модели", title: "Prompt меняет инструкции, передаваемые модели", className: "context" },
-};
-
-const INSTALLED_PACKAGE_RISK = {
-  label: "может исполнять код",
-  title: "Установленный pi-пакет может одновременно содержать extensions, skills, themes и prompts; эта вкладка управляет только выбранным типом ресурса",
-  className: "danger",
-};
-
-export function packageRisk(kind: PackageKind, installed: boolean) {
-  return installed ? INSTALLED_PACKAGE_RISK : KIND_RISK[kind];
-}
-
 export default function Marketplace({
   kind,
   recommended,
@@ -285,23 +208,27 @@ export default function Marketplace({
   const [installedMeta, setInstalledMeta] = useState<PiPackage[]>([]);
   const [loadingInstalled, setLoadingInstalled] = useState(false);
   const [resourceBusy, setResourceBusy] = useState<string | null>(null);
+  const installedLoadGeneration = useRef(0);
   const specsKey = specs.join("\u0000");
   const loadInstalledMeta = useCallback(async () => {
+    const generation = ++installedLoadGeneration.current;
     if (specs.length === 0) {
       setInstalledMeta([]);
+      setLoadingInstalled(false);
       return;
     }
     setLoadingInstalled(true);
     try {
       const be = await getBackend();
-      setInstalledMeta(await be.invoke<PiPackage[]>("pi_packages_meta", {
+      const packages = await be.invoke<PiPackage[]>("pi_packages_meta", {
         names: specs,
         cwd: scope === "project" ? cwd : null,
-      }));
+      });
+      if (generation === installedLoadGeneration.current) setInstalledMeta(packages);
     } catch {
-      setInstalledMeta([]);
+      if (generation === installedLoadGeneration.current) setInstalledMeta([]);
     } finally {
-      setLoadingInstalled(false);
+      if (generation === installedLoadGeneration.current) setLoadingInstalled(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [specsKey, scope, cwd]);

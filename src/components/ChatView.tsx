@@ -150,14 +150,14 @@ function ModeSelector({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const [open, setOpen] = useState(false);
   const current = MODES.find((m) => m.id === ws.mode) ?? MODES[0];
   const planActive = Object.values(ws.chat.statusEntries).some((s) => stripAnsi(s).includes("plan"));
-  const backgroundCount = activeBackgroundTaskCount(ws);
+  const activeWork = workspaceHasActiveWork(ws);
 
   return (
     <div style={{ position: "relative" }}>
       <button
         className="chip"
         title={current.desc}
-        disabled={ws.chat.isStreaming || backgroundCount > 0}
+        disabled={activeWork}
         onClick={() => setOpen(!open)}
         style={ws.mode === "bypass" ? { color: "var(--warn)" } : ws.mode === "plan" || planActive ? { color: "var(--accent)" } : undefined}
       >
@@ -1706,7 +1706,7 @@ function fmtNum(n: number): string {
 
 // ---------- processing indicator ----------
 
-export const MODEL_ACTIVITY_LABELS = [
+const MODEL_ACTIVITY_LABELS = [
   "размышляет",
   "анализирует запрос",
   "изучает контекст",

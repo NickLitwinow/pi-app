@@ -122,6 +122,86 @@ test("Library installed view only lists packages that declare the selected resou
   await page.getByRole("button", { name: "Все проекты" }).click();
   await page.getByRole("button", { name: "Текущий проект" }).click();
   await expect(projectSkill.getByRole("button", { name: "Выключено" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Выбрать проект «website»" }).click();
+  await expect(page.getByText("Пакеты с ресурсом «skills»: 0", { exact: true })).toBeVisible();
+  await expect(page.getByText("Пакетов с ресурсами этого типа нет", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Выбрать проект «pi-app»" }).click();
+  await expect(page.getByText("Пакеты с ресурсом «skills»: 1", { exact: true })).toBeVisible();
+  await expect(projectSkill.getByRole("button", { name: "Выключено" })).toBeVisible();
+});
+
+test("Sidebar session CRUD stays scoped to its workspace", async ({ page }) => {
+  await boot(page);
+  const projects = page.locator(".proj");
+  const piProject = projects.nth(0);
+  const websiteProject = projects.nth(1);
+
+  await websiteProject.locator(".proj-head").click();
+  await expect(websiteProject.locator(".sess-row[aria-label^='Открыть сессию']")).toHaveCount(2);
+  await expect(websiteProject.getByText("Landing page accessibility", { exact: true })).toBeVisible();
+  await expect(websiteProject.getByText("Deploy preview", { exact: true })).toBeVisible();
+  await expect(websiteProject.getByText("Fix supervisor race", { exact: true })).toHaveCount(0);
+
+  const sessionActions = piProject.getByRole("button", { name: "Действия с сессией «Fix supervisor race»" });
+  await sessionActions.click();
+  await piProject.getByRole("button", { name: "Переименовать" }).click();
+  const rename = piProject.getByRole("textbox", { name: "Новое имя сессии «Fix supervisor race»" });
+  await rename.fill("Supervisor lifecycle audit");
+  await rename.press("Enter");
+  await expect(piProject.getByRole("button", { name: "Открыть сессию «Supervisor lifecycle audit»" })).toBeVisible();
+
+  const renamedActions = piProject.getByRole("button", { name: "Действия с сессией «Supervisor lifecycle audit»" });
+  await renamedActions.click();
+  await piProject.getByRole("button", { name: "Закрепить" }).click();
+  await renamedActions.click();
+  await expect(piProject.getByRole("button", { name: "Открепить" })).toBeVisible();
+  await piProject.getByRole("button", { name: "В группу… ›" }).click();
+  const groupName = piProject.getByRole("textbox", { name: "Название новой группы" });
+  await groupName.fill("Lifecycle");
+  await groupName.press("Enter");
+  await expect(piProject.getByRole("button", { name: "Свернуть группу «Lifecycle»" })).toContainText("1");
+
+  await renamedActions.click();
+  await piProject.getByRole("button", { name: "Архивировать" }).click();
+  await expect(piProject.getByRole("button", { name: "Архив (1)" })).toBeVisible();
+  await piProject.getByRole("button", { name: "Архив (1)" }).click();
+  await renamedActions.click();
+  await piProject.getByRole("button", { name: "Разархивировать" }).click();
+  await expect(piProject.getByRole("button", { name: "Свернуть группу «Lifecycle»" })).toContainText("1");
+
+  await renamedActions.click();
+  await piProject.getByRole("button", { name: "Форк сессии" }).click();
+  const fork = piProject.getByRole("button", { name: "Открыть сессию «Форк: s1»" });
+  await expect(fork).toBeVisible();
+  await piProject.getByRole("button", { name: "Действия с сессией «Форк: s1»" }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await piProject.getByRole("button", { name: "Удалить" }).click();
+  await expect(fork).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Настройки", exact: true }).click();
+  await page.getByRole("button", { name: "Чат", exact: true }).click();
+  await expect(piProject.getByRole("button", { name: "Свернуть группу «Lifecycle»" })).toContainText("1");
+});
+
+test("Active workflow protects permission mode and project detachment", async ({ page }) => {
+  await boot(page);
+  const composer = page.locator(".composer textarea");
+  await composer.fill("[mock-workflow] protect the live workspace");
+  await composer.press("Enter");
+  await expect(page.getByRole("region", { name: "Workflow control center" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "⌁ Ask permissions" })).toBeDisabled();
+
+  const dialogs: string[] = [];
+  page.on("dialog", async (dialog) => {
+    dialogs.push(dialog.message());
+    await dialog.accept();
+  });
+  await page.getByRole("button", { name: "Действия с проектом «pi-app»" }).click();
+  await page.getByRole("button", { name: "Открепить от сайдбара" }).click();
+  await expect.poll(() => dialogs.length).toBe(2);
+  expect(dialogs[1]).toContain("сначала остановите");
+  await expect(page.getByRole("button", { name: "Проект «pi-app»" })).toBeVisible();
 });
 
 test("Themes marketplace state", async ({ page }) => {

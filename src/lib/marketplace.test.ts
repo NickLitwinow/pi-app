@@ -6,7 +6,7 @@ import {
   packageProvidesResource,
   packageRisk,
   setPackageResourceEnabled,
-} from "../components/Marketplace";
+} from "./marketplace";
 
 describe("package risk", () => {
   it("never labels an installed multi-resource package as theme-only", () => {

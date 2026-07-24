@@ -48,30 +48,30 @@ async function makeTauriBackend(): Promise<Backend> {
 
 type Handler = (payload: Record<string, unknown>) => void;
 
-class MockBackend implements Backend {
+export class MockBackend implements Backend {
   isMock = true;
   private handlers = new Map<string, Set<Handler>>();
   private agentSeq = 1;
   private uiSeq = 1;
   private pendingUi = new Map<string, (resp: Record<string, unknown>) => void>();
-  private steerQueue: { text: string; images: Record<string, unknown>[] }[] = [];
-  private followUpQueue: { text: string; images: Record<string, unknown>[] }[] = [];
+  private agentSessions = new Map<string, string>();
+  private agentCwds = new Map<string, string>();
+  private steerQueues = new Map<string, { text: string; images: Record<string, unknown>[] }[]>();
+  private followUpQueues = new Map<string, { text: string; images: Record<string, unknown>[] }[]>();
   private flags: Record<string, unknown> = { pinned: [], archived: [], groups: [], groupOf: {}, pinnedMessages: {}, hiddenProjects: [] };
   private deleted = new Set<string>();
   private renamed = new Map<string, string>();
   private forked: SessionMeta[] = [];
   private deletedThemes = new Set<string>();
-  private currentSession = "/mock/a/live.jsonl";
   private rewindTargetBySession = new Map<string, string>();
-  private permMode: string | null = null;
+  private permissionModes = new Map<string, string>();
   private previewRuntime: PreviewStatus | null = null;
-  private projectSettings = JSON.stringify(
-    { packages: ["npm:pi-skill-code-review"] },
-    null,
-    2,
-  );
-  private projectMcp = "{}";
-  private projectMcpExists = false;
+  private projectSettings = new Map<string, string>([
+    ["/Users/dev/pi-app", JSON.stringify({ packages: ["npm:pi-skill-code-review"] }, null, 2)],
+  ]);
+  private projectSettingsExists = new Set<string>(["/Users/dev/pi-app"]);
+  private projectMcp = new Map<string, string>();
+  private projectMcpExists = new Set<string>();
   private settings = JSON.stringify(
     {
       defaultProvider: "ollama",
@@ -128,6 +128,36 @@ class MockBackend implements Backend {
     2,
   );
 
+  private mockSessionRoot(cwd: string): string {
+    if (cwd === "/Users/dev/pi-app") return "/mock/a";
+    if (cwd === "/Users/dev/website") return "/mock/b";
+    return `/mock/workspaces/${encodeURIComponent(cwd)}`;
+  }
+
+  private agentQueue(
+    queues: Map<string, { text: string; images: Record<string, unknown>[] }[]>,
+    agentId: string,
+  ): { text: string; images: Record<string, unknown>[] }[] {
+    let queue = queues.get(agentId);
+    if (!queue) {
+      queue = [];
+      queues.set(agentId, queue);
+    }
+    return queue;
+  }
+
+  private packageNameForSource(source: string): string {
+    if (source.startsWith("npm:")) {
+      const raw = source.slice(4);
+      if (raw.startsWith("@")) {
+        const versionAt = raw.indexOf("@", raw.indexOf("/") + 1);
+        return versionAt > 0 ? raw.slice(0, versionAt) : raw;
+      }
+      return raw.split("@", 1)[0];
+    }
+    return source.replace(/[\\/]+$/, "").split(/[\\/]/).pop()?.replace(/\.git(?:[#?].*)?$/, "") ?? source;
+  }
+
   private emit(event: string, payload: Record<string, unknown>) {
     this.handlers.get(event)?.forEach((h) => h(payload));
   }
@@ -173,6 +203,8 @@ class MockBackend implements Backend {
 
   private async runScript(agentId: string, prompt: string) {
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const steerQueue = this.agentQueue(this.steerQueues, agentId);
+    const followUpQueue = this.agentQueue(this.followUpQueues, agentId);
     const runStartedAt = Date.now();
     const streamDelay = prompt.includes("цепочку") ? 120 : 30;
     const respond = (id: unknown, command: string, data: Record<string, unknown> = {}) =>
@@ -397,9 +429,9 @@ class MockBackend implements Backend {
     });
 
     // обработать steer, если пользователь вмешался во время рана
-    if (this.steerQueue.length > 0) {
-      const steer = this.steerQueue.splice(0);
-      this.emitAgent(agentId, { type: "queue_update", steering: [], followUp: this.followUpQueue.map((item) => item.text) });
+    if (steerQueue.length > 0) {
+      const steer = steerQueue.splice(0);
+      this.emitAgent(agentId, { type: "queue_update", steering: [], followUp: followUpQueue.map((item) => item.text) });
       for (const item of steer) {
         this.emitAgent(agentId, {
           type: "message_end",
@@ -448,11 +480,11 @@ class MockBackend implements Backend {
     // Pi drains follow_up only after the current turn. Keep the mock lifecycle
     // honest so queued image blocks are echoed from the same payload rather
     // than appearing to succeed only because the UI added an optimistic row.
-    const followUps = this.followUpQueue.splice(0);
+    const followUps = followUpQueue.splice(0);
     if (followUps.length > 0) {
       this.emitAgent(agentId, {
         type: "queue_update",
-        steering: this.steerQueue.map((item) => item.text),
+        steering: steerQueue.map((item) => item.text),
         followUp: [],
       });
       for (const item of followUps) {
@@ -513,7 +545,7 @@ class MockBackend implements Backend {
         ] satisfies ProjectInfo[] as T;
       case "list_sessions_for_cwd":
       case "list_sessions": {
-        const base: SessionMeta[] = [
+        const piAppSessions: SessionMeta[] = [
           {
             path: "/mock/a/s1.jsonl", id: "s1", cwd: "/Users/dev/pi-app", name: "Fix supervisor race",
             createdAt: new Date(Date.now() - 7200e3).toISOString(), modifiedMs: Date.now() - 3600e3,
@@ -547,15 +579,31 @@ class MockBackend implements Backend {
             messageCount: 3, userSnippet: "Подготовь pull/merge request по текущим изменениям", costTotal: 0.02, tokensIn: 8000, tokensOut: 500,
           },
         ];
-        return [...this.forked, ...base]
+        const websiteSessions: SessionMeta[] = [
+          {
+            path: "/mock/b/accessibility.jsonl", id: "web-a11y", cwd: "/Users/dev/website", name: "Landing page accessibility",
+            createdAt: new Date(Date.now() - 5400e3).toISOString(), modifiedMs: Date.now() - 2700e3,
+            messageCount: 12, userSnippet: "Проверь доступность лендинга", costTotal: 0.12, tokensIn: 42000, tokensOut: 3100,
+          },
+          {
+            path: "/mock/b/deploy.jsonl", id: "web-deploy", cwd: "/Users/dev/website", name: "Deploy preview",
+            createdAt: new Date(Date.now() - 1800e3).toISOString(), modifiedMs: Date.now() - 600e3,
+            messageCount: 8, userSnippet: "Подготовь preview deploy", costTotal: 0.04, tokensIn: 18000, tokensOut: 1400,
+          },
+        ];
+        const requestedCwd = cmd === "list_sessions_for_cwd" ? String(args.cwd ?? "") : null;
+        return [...this.forked, ...piAppSessions, ...websiteSessions]
+          .filter((session) => requestedCwd == null || session.cwd === requestedCwd)
           .filter((s) => !this.deleted.has(s.path))
           .map((s) => (this.renamed.has(s.path) ? { ...s, name: this.renamed.get(s.path)! } : s)) as T;
       }
       case "fork_session": {
         const src = String(args.path);
+        const sourceRoot = src.startsWith("/mock/b/") ? "/mock/b" : "/mock/a";
+        const sourceCwd = src.startsWith("/mock/b/") ? "/Users/dev/website" : "/Users/dev/pi-app";
         const id = `fork-${Date.now().toString(36)}`;
         const meta: SessionMeta = {
-          path: `/mock/a/${id}.jsonl`, id, cwd: "/Users/dev/pi-app",
+          path: `${sourceRoot}/${id}.jsonl`, id, cwd: sourceCwd,
           name: `Форк: ${src.split("/").pop()?.replace(".jsonl", "") ?? "сессия"}`,
           createdAt: new Date().toISOString(), modifiedMs: Date.now(),
           messageCount: args.upToEntryId ? 1 : 3, userSnippet: "форк (mock)", costTotal: 0, tokensIn: 0, tokensOut: 0,
@@ -791,25 +839,41 @@ class MockBackend implements Backend {
         const content = name === "settings" ? this.settings : name === "mcp" ? this.mcp : this.models;
         return { path: `~/.pi/agent/${name}.json`, content, exists: true } satisfies ConfigFile as T;
       }
-      case "read_project_settings":
-        return { path: `/Users/dev/pi-app/.pi/settings.json`, content: this.projectSettings, exists: true } satisfies ConfigFile as T;
+      case "read_project_settings": {
+        const cwd = String(args.cwd);
+        return {
+          path: `${cwd}/.pi/settings.json`,
+          content: this.projectSettings.get(cwd) ?? "{}",
+          exists: this.projectSettingsExists.has(cwd),
+        } satisfies ConfigFile as T;
+      }
       case "write_project_settings": {
-        this.projectSettings = String(args.content);
+        const cwd = String(args.cwd);
+        this.projectSettings.set(cwd, String(args.content));
+        this.projectSettingsExists.add(cwd);
         return undefined as T;
       }
       case "read_project_pi_config": {
+        const cwd = String(args.cwd);
         const name = String(args.name);
         return {
-          path: `/Users/dev/pi-app/.pi/${name}.json`,
-          content: name === "settings" ? this.projectSettings : this.projectMcp,
-          exists: name === "settings" || this.projectMcpExists,
+          path: `${cwd}/.pi/${name}.json`,
+          content: name === "settings"
+            ? this.projectSettings.get(cwd) ?? "{}"
+            : this.projectMcp.get(cwd) ?? "{}",
+          exists: name === "settings"
+            ? this.projectSettingsExists.has(cwd)
+            : this.projectMcpExists.has(cwd),
         } satisfies ConfigFile as T;
       }
       case "write_project_pi_config": {
-        if (String(args.name) === "settings") this.projectSettings = String(args.content);
-        else {
-          this.projectMcp = String(args.content);
-          this.projectMcpExists = true;
+        const cwd = String(args.cwd);
+        if (String(args.name) === "settings") {
+          this.projectSettings.set(cwd, String(args.content));
+          this.projectSettingsExists.add(cwd);
+        } else {
+          this.projectMcp.set(cwd, String(args.content));
+          this.projectMcpExists.add(cwd);
         }
         return undefined as T;
       }
@@ -823,20 +887,31 @@ class MockBackend implements Backend {
       }
       case "set_extension_resource_enabled": {
         const projectScope = String(args.scope) === "project";
-        const parsed = JSON.parse(projectScope ? this.projectSettings : this.settings) as Record<string, unknown>;
+        const cwd = String(args.cwd ?? "");
+        const parsed = JSON.parse(
+          projectScope ? this.projectSettings.get(cwd) ?? "{}" : this.settings,
+        ) as Record<string, unknown>;
         const key = ({ extension: "extensions", skill: "skills", theme: "themes", prompt: "prompts" } as const)[String(args.kind) as "extension" | "skill" | "theme" | "prompt"];
         const identifier = String(args.packageIdentifier);
+        let matched = false;
         const packages = Array.isArray(parsed.packages) ? parsed.packages.map((raw) => {
           const source = typeof raw === "string" ? raw : raw && typeof raw === "object" && "source" in raw ? String(raw.source) : "";
-          if (source !== identifier && !source.includes(identifier)) return raw;
+          if (source !== identifier && this.packageNameForSource(source) !== identifier) return raw;
+          if (String(args.kind) === "extension" && args.enabled === false && source.includes("harness-extension")) {
+            throw new Error("harness-extension является ядром приложения и не может быть отключён");
+          }
+          matched = true;
           const next: Record<string, unknown> = typeof raw === "string" ? { source: raw } : { ...raw as Record<string, unknown> };
           if (Boolean(args.enabled)) delete next[key];
           else next[key] = [];
           return Object.keys(next).length === 1 ? source : next;
         }) : [];
+        if (!matched) throw new Error(`package is not configured: ${identifier}`);
         const content = JSON.stringify({ ...parsed, packages }, null, 2) + "\n";
-        if (projectScope) this.projectSettings = content;
-        else this.settings = content;
+        if (projectScope) {
+          this.projectSettings.set(cwd, content);
+          this.projectSettingsExists.add(cwd);
+        } else this.settings = content;
         return content as T;
       }
       case "list_skills":
@@ -866,48 +941,58 @@ class MockBackend implements Backend {
         const id = `mock-agent-${this.agentSeq++}`;
         // как реальный pi: агент открывается на переданной сессии (get_state
         // затем вернёт её в sessionFile). null → новая сессия.
-        const opts = (args.opts ?? {}) as { sessionPath?: string | null };
-        this.currentSession = opts.sessionPath ?? `/mock/a/new-${Date.now()}.jsonl`;
+        const opts = (args.opts ?? {}) as { cwd?: string; sessionPath?: string | null };
+        const cwd = opts.cwd ?? "/Users/dev/pi-app";
+        this.agentCwds.set(id, cwd);
+        this.agentSessions.set(id, opts.sessionPath ?? `${this.mockSessionRoot(cwd)}/new-${Date.now()}.jsonl`);
+        this.steerQueues.set(id, []);
+        this.followUpQueues.set(id, []);
         return id as T;
       }
       case "agent_send": {
         const line = JSON.parse(String(args.line));
         const agentId = String(args.agentId);
+        let currentSession = this.agentSessions.get(agentId) ?? "/mock/a/live.jsonl";
+        const steerQueue = this.agentQueue(this.steerQueues, agentId);
+        const followUpQueue = this.agentQueue(this.followUpQueues, agentId);
         if (line.type === "prompt") {
           const prompt = String(line.message ?? "");
           if (prompt.startsWith("/pi-rewind ")) {
-            this.rewindTargetBySession.set(this.currentSession, prompt.slice("/pi-rewind ".length).trim());
+            this.rewindTargetBySession.set(currentSession, prompt.slice("/pi-rewind ".length).trim());
             this.emitAgent(agentId, { type: "response", id: line.id, command: "prompt", success: true, data: { sameSession: true } });
           } else {
             void this.runScript(agentId, prompt);
           }
         } else if (line.type === "steer") {
-          this.steerQueue.push({
+          steerQueue.push({
             text: String(line.message ?? ""),
             images: Array.isArray(line.images) ? line.images as Record<string, unknown>[] : [],
           });
           this.emitAgent(agentId, {
             type: "queue_update",
-            steering: this.steerQueue.map((item) => item.text),
-            followUp: this.followUpQueue.map((item) => item.text),
+            steering: steerQueue.map((item) => item.text),
+            followUp: followUpQueue.map((item) => item.text),
           });
         } else if (line.type === "follow_up") {
-          this.followUpQueue.push({
+          followUpQueue.push({
             text: String(line.message ?? ""),
             images: Array.isArray(line.images) ? line.images as Record<string, unknown>[] : [],
           });
           this.emitAgent(agentId, {
             type: "queue_update",
-            steering: this.steerQueue.map((item) => item.text),
-            followUp: this.followUpQueue.map((item) => item.text),
+            steering: steerQueue.map((item) => item.text),
+            followUp: followUpQueue.map((item) => item.text),
           });
         } else if (line.type === "extension_ui_response") {
           this.pendingUi.get(String(line.id))?.(line as Record<string, unknown>);
         } else if (line.type === "switch_session" && line.id) {
-          this.currentSession = String(line.sessionPath ?? this.currentSession);
+          currentSession = String(line.sessionPath ?? currentSession);
+          this.agentSessions.set(agentId, currentSession);
           this.emitAgent(agentId, { type: "response", id: line.id, command: "switch_session", success: true, data: { cancelled: false } });
         } else if (line.type === "new_session" && line.id) {
-          this.currentSession = `/mock/a/new-${Date.now()}.jsonl`;
+          const cwd = this.agentCwds.get(agentId) ?? "/Users/dev/pi-app";
+          currentSession = `${this.mockSessionRoot(cwd)}/new-${Date.now()}.jsonl`;
+          this.agentSessions.set(agentId, currentSession);
           this.emitAgent(agentId, { type: "response", id: line.id, command: "new_session", success: true, data: {} });
         } else if (line.id) {
           await sleep(30);
@@ -915,7 +1000,7 @@ class MockBackend implements Backend {
             line.type === "get_state"
               ? {
                   model: { id: "qwen-local", provider: "ollama", contextWindow: 262144, input: ["text", "image"] },
-                  thinkingLevel: "high", isStreaming: false, sessionId: "mock", sessionFile: this.currentSession, messageCount: 2,
+                  thinkingLevel: "high", isStreaming: false, sessionId: agentId, sessionFile: currentSession, messageCount: 2,
                 }
               : line.type === "get_available_models"
                 ? { models: [
@@ -931,7 +1016,7 @@ class MockBackend implements Backend {
                   : line.type === "set_auto_compaction"
                     ? {}
                   : line.type === "get_fork_messages"
-                    ? { messages: this.currentSession.endsWith("/rewind.jsonl") ? [
+                    ? { messages: currentSession.endsWith("/rewind.jsonl") ? [
                         { entryId: "rewind-u1", text: "Первый запрос остаётся в активной ветке" },
                         { entryId: "rewind-u2", text: "Второй запрос с изображением" },
                       ] : [
@@ -954,8 +1039,14 @@ class MockBackend implements Backend {
         }
         return undefined as T;
       }
-      case "kill_agent":
+      case "kill_agent": {
+        const agentId = String(args.agentId);
+        this.agentSessions.delete(agentId);
+        this.agentCwds.delete(agentId);
+        this.steerQueues.delete(agentId);
+        this.followUpQueues.delete(agentId);
         return undefined as T;
+      }
       case "list_agents":
         return [] as T;
       case "git_is_repo":
@@ -1057,10 +1148,10 @@ class MockBackend implements Backend {
       case "set_pi_path":
         return { path: String(args.path ?? "/opt/homebrew/bin/pi"), version: "0.80.3 (mock)", agentDir: "~/.pi/agent" } satisfies PiInfo as T;
       case "write_permission_preset":
-        this.permMode = String(args.mode);
+        this.permissionModes.set(String(args.cwd), String(args.mode));
         return undefined as T;
       case "read_permission_mode":
-        return (this.permMode ?? null) as T;
+        return (this.permissionModes.get(String(args.cwd)) ?? null) as T;
       case "read_file_base64":
         return { data: "iVBORw0KGgo=", mimeType: "image/png", sizeBytes: 8 } as T;
       case "git_checkpoint":

@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { activeBackgroundTaskCount, emptyWorkspaceChat, workspaceHasActiveWork } from "../state/store";
+import {
+  activeBackgroundTaskCount,
+  emptyWorkspaceChat,
+  nextVisibleWorkspace,
+  preserveWorkspaceLiveState,
+  samePath,
+  workspaceHasActiveWork,
+} from "../state/store";
 
 describe("background work lifecycle", () => {
   it("keeps the workspace busy after the foreground turn ends", () => {
@@ -86,5 +93,48 @@ describe("background work lifecycle", () => {
 
     ws.alive = false;
     expect(workspaceHasActiveWork(ws)).toBe(false);
+  });
+
+  it("restores current background tasks when returning from a browsed session", () => {
+    const snapshot = emptyWorkspaceChat().chat;
+    snapshot.backgroundTasks = [
+      { id: "stale", type: "reviewer", description: "Old task", status: "completed" },
+    ];
+    const current = emptyWorkspaceChat().chat;
+    current.backgroundTasks = [
+      { id: "live", type: "builder", description: "Live task", status: "running" },
+    ];
+
+    expect(preserveWorkspaceLiveState(snapshot, current).backgroundTasks).toEqual(current.backgroundTasks);
+  });
+
+  it("does not select a hidden project after the current workspace is detached", () => {
+    const project = (cwd: string) => ({
+      cwd,
+      dir: cwd,
+      name: cwd.slice(1),
+      sessionCount: 0,
+      lastModifiedMs: 0,
+    });
+    expect(nextVisibleWorkspace(
+      "/current",
+      [project("/duplicate")],
+      [project("/hidden"), project("/duplicate"), project("/next")],
+      ["/hidden"],
+    )).toBe("/duplicate");
+    expect(nextVisibleWorkspace(
+      "/current",
+      [],
+      [project("/hidden")],
+      ["/hidden"],
+    )).toBeNull();
+  });
+
+  it("recognizes equivalent Pi session paths by their unique JSONL basename", () => {
+    expect(samePath(
+      "/private/var/folders/agent/sessions/0f4a.jsonl",
+      "/var/folders/agent/sessions/0f4a.jsonl",
+    )).toBe(true);
+    expect(samePath("/sessions/first.jsonl", "/sessions/second.jsonl")).toBe(false);
   });
 });

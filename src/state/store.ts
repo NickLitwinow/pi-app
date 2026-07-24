@@ -107,6 +107,28 @@ export function workspaceHasActiveWork(ws: WorkspaceChat): boolean {
   return ws.liveStreaming || activeBackgroundTaskCount(ws) > 0 || hasRunningWorkflowStep(ws);
 }
 
+/** Merge the latest workspace-level live state into a JSONL snapshot. */
+export function preserveWorkspaceLiveState(snapshot: ChatState, current: ChatState): ChatState {
+  return {
+    ...snapshot,
+    backgroundTasks: current.backgroundTasks,
+    uiRequests: current.uiRequests.length > 0 ? current.uiRequests : snapshot.uiRequests,
+  };
+}
+
+export function nextVisibleWorkspace(
+  removedCwd: string,
+  extraWorkspaces: ProjectInfo[],
+  projects: ProjectInfo[],
+  hiddenProjects: Iterable<string>,
+): string | null {
+  const hidden = new Set(hiddenProjects);
+  return [...extraWorkspaces, ...projects].find((project, index, all) =>
+    project.cwd !== removedCwd
+    && !hidden.has(project.cwd)
+    && all.findIndex((candidate) => candidate.cwd === project.cwd) === index)?.cwd ?? null;
+}
+
 export function emptyWorkspaceChat(): WorkspaceChat {
   return {
     chat: emptyChatState(),
@@ -985,11 +1007,16 @@ export async function refreshProjects(): Promise<void> {
   useStore.setState({ projects });
 }
 
+const sessionLoadGeneration = new Map<string, number>();
+
 export async function refreshSessions(cwd: string): Promise<void> {
+  const generation = (sessionLoadGeneration.get(cwd) ?? 0) + 1;
+  sessionLoadGeneration.set(cwd, generation);
   const be = await getBackend();
   // резолв каталога сессий по cwd на стороне бэкенда: работает и для только что
   // добавленных workspace, у которых ещё нет записи в projects
   const sessions = await be.invoke<SessionMeta[]>("list_sessions_for_cwd", { cwd }).catch(() => [] as SessionMeta[]);
+  if (sessionLoadGeneration.get(cwd) !== generation) return;
   useStore.setState({ sessions: { ...useStore.getState().sessions, [cwd]: sessions } });
 }
 
@@ -1040,9 +1067,14 @@ export function selectWorkspace(cwd: string): void {
   })();
 }
 
+const permissionModeGeneration = new Map<string, number>();
+
 async function loadPermissionMode(cwd: string): Promise<void> {
+  const generation = (permissionModeGeneration.get(cwd) ?? 0) + 1;
+  permissionModeGeneration.set(cwd, generation);
   const be = await getBackend();
   const mode = await be.invoke<string | null>("read_permission_mode", { cwd }).catch(() => null);
+  if (permissionModeGeneration.get(cwd) !== generation) return;
   if (mode && ["ask", "accept-edits", "auto", "bypass"].includes(mode)) {
     updateChat(cwd, (w) => ({ ...w, mode: mode as AgentMode }));
   }
@@ -1055,26 +1087,40 @@ export async function setAgentMode(cwd: string, mode: AgentMode): Promise<void> 
   const prev = getChat(cwd).mode;
   if (prev === mode) return;
   const current = getChat(cwd);
-  if (activeBackgroundTaskCount(current) > 0) {
-    throw new Error("Нельзя перезапустить permission mode, пока выполняются background-задачи");
+  if (workspaceHasActiveWork(current)) {
+    throw new Error("Нельзя переключить режим, пока сессия выполняет foreground/background работу");
   }
-  updateChat(cwd, (w) => ({ ...w, mode }));
+  permissionModeGeneration.set(cwd, (permissionModeGeneration.get(cwd) ?? 0) + 1);
 
   // Контракт гейтов (§5.10-2): write_permission_preset сам синхронизирует
   // конфиги известных сторонних гейтов (pi-guardrails) и возвращает сообщение.
 
   if (mode === "plan") {
     await ensureAgent(cwd);
-    await rpcSend(cwd, { type: "prompt", message: "/plannotator" }).catch(() => {});
+    await rpcSend(cwd, { type: "prompt", message: "/plannotator" });
+    updateChat(cwd, (w) => ({ ...w, mode }));
     return;
   }
+  let exitedPlan = false;
   if (prev === "plan" && getChat(cwd).alive) {
     // выйти из plan mode перед сменой политики
-    await rpcSend(cwd, { type: "prompt", message: "/plannotator" }).catch(() => {});
+    await rpcSend(cwd, { type: "prompt", message: "/plannotator" });
+    exitedPlan = true;
   }
 
   const be = await getBackend();
-  const gateNotice = await be.invoke<string | null>("write_permission_preset", { cwd, mode });
+  let gateNotice: string | null;
+  try {
+    gateNotice = await be.invoke<string | null>("write_permission_preset", { cwd, mode });
+  } catch (error) {
+    // We already toggled plannotator off. Best-effort restore keeps the UI and
+    // runtime aligned when the permission preset itself could not be written.
+    if (exitedPlan && getChat(cwd).alive) {
+      await rpcSend(cwd, { type: "prompt", message: "/plannotator" }).catch(() => {});
+    }
+    throw error;
+  }
+  updateChat(cwd, (w) => ({ ...w, mode }));
   if (gateNotice) {
     // «не трогает» = чужой конфиг guardrails остался активен — это предупреждение
     notifyChat(cwd, gateNotice.includes("не трогает") ? "warning" : "info", gateNotice);
@@ -1113,6 +1159,9 @@ export async function removeWorkspace(cwd: string): Promise<void> {
   const s = useStore.getState();
   // остановить живого агента этого workspace
   const ws = s.chats[cwd];
+  if (ws && workspaceHasActiveWork(ws)) {
+    throw new Error("Проект выполняет foreground/background работу — сначала остановите её");
+  }
   if (ws?.agentId) {
     const be = await getBackend();
     await be.invoke("kill_agent", { agentId: ws.agentId }).catch(() => {});
@@ -1124,12 +1173,17 @@ export async function removeWorkspace(cwd: string): Promise<void> {
   delete chats[cwd];
   const sessions = { ...s.sessions };
   delete sessions[cwd];
+  sessionLoadGeneration.delete(cwd);
+  permissionModeGeneration.delete(cwd);
   const extraWorkspaces = s.extraWorkspaces.filter((p) => p.cwd !== cwd);
   const isDiscovered = s.projects.some((p) => p.cwd === cwd);
 
   // следующий доступный workspace становится активным
-  const remaining = [...extraWorkspaces, ...s.projects.filter((p) => p.cwd !== cwd)];
-  const nextCwd = s.currentCwd === cwd ? (remaining[0]?.cwd ?? null) : s.currentCwd;
+  const hiddenAfter = new Set(s.sessionFlags.hiddenProjects);
+  if (isDiscovered) hiddenAfter.add(cwd);
+  const nextCwd = s.currentCwd === cwd
+    ? nextVisibleWorkspace(cwd, extraWorkspaces, s.projects, hiddenAfter)
+    : s.currentCwd;
 
   useStore.setState({ chats, sessions, extraWorkspaces, currentCwd: nextCwd });
 
@@ -1187,7 +1241,7 @@ export async function openSession(cwd: string, meta: SessionMeta): Promise<void>
   }
 
   // 1) мгновенный рендер полной истории из файла (активная ветка)
-  const fileChat = await loadSessionFromFile(meta.path);
+  let fileChat = await loadSessionFromFile(meta.path);
   if (token !== openToken) return; // клик перекрыт более новым — не применяем
   const cur = getChat(cwd);
   // возврат в live-сессию (из browse/другого вида): файл не несёт флаг стрима и
@@ -1196,11 +1250,8 @@ export async function openSession(cwd: string, meta: SessionMeta): Promise<void>
   const returningToLive = cur.alive && Boolean(cur.agentId) && samePath(cur.liveSessionPath, meta.path);
   const willBrowse =
     cur.alive && Boolean(cur.liveSessionPath) && !samePath(cur.liveSessionPath, meta.path) && workspaceHasActiveWork(cur);
-  if ((returningToLive || willBrowse) && cur.chat.uiRequests.length > 0) {
-    fileChat.uiRequests = cur.chat.uiRequests;
-  }
   if (returningToLive || willBrowse) {
-    fileChat.backgroundTasks = cur.chat.backgroundTasks;
+    fileChat = preserveWorkspaceLiveState(fileChat, cur.chat);
   }
   if (returningToLive) {
     fileChat.isStreaming = cur.liveStreaming;
@@ -1254,9 +1305,12 @@ export async function returnToLiveSession(cwd: string): Promise<void> {
   const live = ws.liveSessionPath;
   const token = ++openToken;
   const pendingUi = ws.chat.uiRequests; // диалоги живого агента переносим
-  const fileChat = await loadSessionFromFile(live);
+  let fileChat = await loadSessionFromFile(live);
   if (token !== openToken) return;
-  if (pendingUi.length > 0) fileChat.uiRequests = pendingUi;
+  fileChat = preserveWorkspaceLiveState(fileChat, {
+    ...ws.chat,
+    uiRequests: pendingUi,
+  });
   // Восстанавливаем флаг стрима из независимого live-трекинга: файл его не несёт,
   // иначе кнопка «стоп»/индикатор пропали бы, хотя агент ещё работает. Следующий
   // message_update (pi шлёт полный снапшот) вернёт само стримящееся сообщение.
@@ -1272,15 +1326,36 @@ export async function returnToLiveSession(cwd: string): Promise<void> {
 export async function deleteSessionAction(cwd: string, path: string): Promise<void> {
   const be = await getBackend();
   const ws = getChat(cwd);
-  // если удаляем открытую/активную сессию — сначала гасим агента
-  // (samePath: pi может вернуть иную форму пути, чем листинг)
-  if (samePath(ws.sessionPath, path)) {
+  // Просматриваемая и live-сессия могут различаться: удаление browse-файла не
+  // должно убивать работающего в фоне агента, а live-файл нельзя удалять во
+  // время foreground/background работы.
+  const deletingViewed = samePath(ws.sessionPath, path);
+  const deletingLive = samePath(ws.liveSessionPath, path);
+  if (deletingLive && workspaceHasActiveWork(ws)) {
+    throw new Error("Сессия выполняет foreground/background работу — сначала остановите её");
+  }
+  if (deletingLive) {
     if (ws.agentId) {
       await be.invoke("kill_agent", { agentId: ws.agentId }).catch(() => {});
       agentToCwd.delete(ws.agentId);
     }
     discardQueuedEvents(cwd);
+  }
+  if (deletingViewed && ws.alive && ws.agentId && ws.liveSessionPath && !deletingLive) {
+    await returnToLiveSession(cwd);
+  } else if (deletingViewed) {
     updateChat(cwd, (w) => ({ ...w, chat: emptyChatState(), draftScope: {}, sessionPath: null, liveSessionPath: null, liveStreaming: false, agentId: null, alive: false, checkpoints: [], pendingCheckpoint: null, stats: null }));
+  } else if (deletingLive) {
+    updateChat(cwd, (w) => ({
+      ...w,
+      agentId: null,
+      alive: false,
+      liveSessionPath: null,
+      liveStreaming: false,
+      checkpoints: [],
+      pendingCheckpoint: null,
+      stats: null,
+    }));
   }
   await be.invoke("delete_session", { path });
   // подчистить флаги
@@ -1302,7 +1377,7 @@ export async function deleteSessionAction(cwd: string, path: string): Promise<vo
 
 export async function renameSessionAction(cwd: string, path: string, name: string): Promise<void> {
   const ws = getChat(cwd);
-  if (ws.alive && ws.agentId && ws.sessionPath === path) {
+  if (ws.alive && ws.agentId && samePath(ws.liveSessionPath ?? ws.sessionPath, path)) {
     await rpcRequest(cwd, { type: "set_session_name", name }, 10000).catch(async () => {
       const be = await getBackend();
       await be.invoke("rename_session", { path, name });

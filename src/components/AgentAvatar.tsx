@@ -1,43 +1,18 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
+import {
+	avatarHash,
+	avatarVariant,
+	AVATAR_PRESETS,
+	decodeDataUrlJson,
+	DEFAULT_PRESET,
+	isLottieData,
+} from "../lib/avatar";
 import { getBackend } from "../lib/backend";
 import type { ModelAvatarConfig } from "../lib/types";
 import { updateAppConfig, useStore } from "../state/store";
 
-const PRESETS = [
-	{ id: "pi", glyph: "π", label: "Pi" },
-	{ id: "spark", glyph: "✦", label: "Spark" },
-	{ id: "orbit", glyph: "◈", label: "Orbit" },
-	{ id: "terminal", glyph: "›_", label: "Terminal" },
-	{ id: "reasoning", glyph: "Σ", label: "Reasoning" },
-] as const;
-
-/** Аватар не настроен → стандартная иконка Pi (не пёстрый identicon). */
-export const DEFAULT_PRESET = PRESETS[0];
-
 const dataCache = new Map<string, Promise<string>>();
-
-/** Lottie-данные приходят как data:application/json (или dotlottie) — их рисует плеер. */
-export function isLottieData(data: string): boolean {
-	return (
-		data.startsWith("data:application/json") ||
-		data.startsWith("data:application/vnd.dotlottie")
-	);
-}
-
-export function decodeDataUrlJson(data: string): unknown | null {
-	const comma = data.indexOf(",");
-	if (comma < 0) return null;
-	try {
-		const raw = data.slice(comma + 1);
-		const text = data.slice(0, comma).includes(";base64")
-			? decodeURIComponent(escape(atob(raw)))
-			: decodeURIComponent(raw);
-		return JSON.parse(text);
-	} catch {
-		return null;
-	}
-}
 
 /** Плеер Lottie: lottie-web подгружается лениво — только когда реально нужен. */
 function LottieAvatar({ data, size }: { data: string; size: number }) {
@@ -75,27 +50,6 @@ function LottieAvatar({ data, size }: { data: string; size: number }) {
 	);
 }
 
-export function avatarHash(identity: string): number {
-	let hash = 2166136261;
-	for (let index = 0; index < identity.length; index++) {
-		hash ^= identity.charCodeAt(index);
-		hash = Math.imul(hash, 16777619);
-	}
-	return hash >>> 0;
-}
-
-export function avatarVariant(
-	config: ModelAvatarConfig | undefined,
-	working: boolean,
-): { kind: "preset" | "path"; value: string } | null {
-	if (working && config?.workingKind && config.workingValue) {
-		return { kind: config.workingKind, value: config.workingValue };
-	}
-	return config?.kind && config.value
-		? { kind: config.kind, value: config.value }
-		: null;
-}
-
 function useAvatarConfig(modelKey: string): ModelAvatarConfig | undefined {
 	return useStore((state) => state.appConfig.modelAvatars?.[modelKey]);
 }
@@ -120,7 +74,7 @@ export function ModelAvatar({
 	// без настроенного варианта показываем стандартную иконку Pi
 	const preset =
 		activeKind === "preset"
-			? PRESETS.find((item) => item.id === activeValue) ?? DEFAULT_PRESET
+			? AVATAR_PRESETS.find((item) => item.id === activeValue) ?? DEFAULT_PRESET
 			: variant == null
 				? DEFAULT_PRESET
 				: null;
@@ -349,7 +303,7 @@ export function ModelAvatarPicker({
 						</button>
 					</div>
 					<div className="avatar-presets">
-						{PRESETS.map((preset) => (
+						{AVATAR_PRESETS.map((preset) => (
 							<button
 								key={preset.id}
 								className={
