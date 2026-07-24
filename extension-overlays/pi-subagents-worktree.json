@@ -1,0 +1,18 @@
+{
+  "id": "pi-subagents-worktree-cwd-v1",
+  "packageRoot": "npm/node_modules/@tintinweb/pi-subagents",
+  "patches": [
+    {
+      "path": "src/agent-runner.ts",
+      "marker": "pi-app worktree cwd rebase",
+      "before": "  // Get parent system prompt for append-mode agents\n  const parentSystemPrompt = ctx.getSystemPrompt();",
+      "after": "  // pi-app worktree cwd rebase: append-mode inherits the parent's generated\n  // environment block, including its absolute cwd. Rebase exact references so\n  // local models cannot mistake the parent checkout for the isolated child.\n  const rawParentSystemPrompt = ctx.getSystemPrompt();\n  const parentSystemPrompt = effectiveCwd === ctx.cwd\n    ? rawParentSystemPrompt\n    : rawParentSystemPrompt.split(ctx.cwd).join(effectiveCwd);"
+    },
+    {
+      "path": "src/prompts.ts",
+      "marker": "The Environment working directory below is authoritative.",
+      "before": "- Make independent tool calls in parallel\n- Use absolute file paths\n- Do not use emojis",
+      "after": "- Make independent tool calls in parallel\n- The Environment working directory below is authoritative. Keep every project\n  read and write inside it; ignore any different workspace path inherited from\n  the parent and never modify the parent worktree directly.\n- Use absolute file paths rooted at that authoritative working directory\n- Do not use emojis"
+    }
+  ]
+}

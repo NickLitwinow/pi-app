@@ -3,6 +3,7 @@ pub mod app_update;
 pub mod avatars;
 pub mod config;
 pub mod editor;
+pub mod extension_lifecycle;
 pub mod gitops;
 pub mod jsonl;
 pub mod packages;
@@ -23,6 +24,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            // A crash or force-quit during a package mutation must restore the
+            // last known-good extension generation before any agent can start.
+            if let Err(error) = extension_lifecycle::reconcile_startup() {
+                eprintln!("extension lifecycle startup reconciliation failed: {error}");
+            }
             let sup = supervisor::Supervisor::new(app.handle().clone());
             app.manage(sup);
             watcher::start_sessions_watcher(app.handle().clone());
@@ -154,6 +160,7 @@ pub fn run() {
             config::migrate_permission_configs,
             config::list_skills,
             pi_cli::pi_cli_run,
+            extension_lifecycle::set_extension_resource_enabled,
             pi_cli::check_pi_update,
             pi_cli::probe_url,
             packages::search_pi_packages,

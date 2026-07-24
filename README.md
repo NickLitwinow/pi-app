@@ -51,6 +51,10 @@ Git review with checkpoints, unified diffs, line comments, and file revert.
 ### Marketplace
 
 Browse and install community extensions and skills from the npm registry.
+Package install/update/remove and per-resource activation are transactional:
+Pi App snapshots the affected scopes, reapplies reviewed harness overlays,
+boots the real extension runtime, and rolls back automatically on a load or
+capability conflict. See [Extension lifecycle](docs/EXTENSION-LIFECYCLE.md).
 
 ## 🚀 Getting Started
 

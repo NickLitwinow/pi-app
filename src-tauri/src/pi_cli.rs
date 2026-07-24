@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Runtime, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
@@ -35,7 +35,7 @@ pub fn stop_all_runs() {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PiCliOutput {
+pub(crate) struct PiCliOutput {
     run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<String>,
@@ -46,7 +46,7 @@ struct PiCliOutput {
     code: Option<i32>,
 }
 
-const ALLOWED: &[&str] = &[
+pub(crate) const ALLOWED: &[&str] = &[
     "install",
     "remove",
     "uninstall",
@@ -146,9 +146,14 @@ pub async fn check_pi_update() -> PiUpdateInfo {
 #[tauri::command]
 pub async fn pi_cli_run(
     app: AppHandle,
+    sup: State<'_, crate::supervisor::Supervisor<tauri::Wry>>,
     args: Vec<String>,
     cwd: Option<String>,
 ) -> Result<String, String> {
+    validate_management_args(&args, cwd.as_deref())?;
+    if crate::extension_lifecycle::is_extension_mutation(&args) {
+        return crate::extension_lifecycle::start_extension_mutation(app, &sup, args, cwd).await;
+    }
     pi_cli_run_impl(app, args, cwd).await
 }
 
@@ -201,31 +206,73 @@ pub async fn probe_url(url: String) -> Result<String, String> {
     }
 }
 
-pub async fn pi_cli_run_impl<R: Runtime>(
-    app: AppHandle<R>,
-    args: Vec<String>,
-    cwd: Option<String>,
-) -> Result<String, String> {
+pub(crate) fn validate_management_args(args: &[String], cwd: Option<&str>) -> Result<(), String> {
     if args.is_empty() || !ALLOWED.contains(&args[0].as_str()) {
         return Err("subcommand not allowed".into());
     }
-    let pi = find_pi_binary().ok_or("pi binary not found")?;
-    let run_id = format!("run-{}", RUN_COUNTER.fetch_add(1, Ordering::Relaxed));
+    if let Some(cwd) = cwd {
+        if !std::path::Path::new(cwd).is_dir() {
+            return Err("workspace для локальной установки не существует".into());
+        }
+    }
+    Ok(())
+}
 
+pub(crate) fn next_run_id() -> String {
+    format!("run-{}", RUN_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+pub(crate) fn emit_cli_line<R: Runtime>(
+    app: &AppHandle<R>,
+    run_id: &str,
+    stream: &str,
+    line: impl Into<String>,
+) {
+    let _ = app.emit(
+        "pi-cli-output",
+        PiCliOutput {
+            run_id: run_id.to_string(),
+            stream: Some(stream.to_string()),
+            line: Some(line.into()),
+            done: false,
+            code: None,
+        },
+    );
+}
+
+pub(crate) fn emit_cli_done<R: Runtime>(app: &AppHandle<R>, run_id: &str, code: i32) {
+    let _ = app.emit(
+        "pi-cli-output",
+        PiCliOutput {
+            run_id: run_id.to_string(),
+            stream: None,
+            line: None,
+            done: true,
+            code: Some(code),
+        },
+    );
+}
+
+pub(crate) async fn run_pi_process<R: Runtime>(
+    app: AppHandle<R>,
+    run_id: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    extra_env: Vec<(String, String)>,
+) -> Result<i32, String> {
+    validate_management_args(&args, cwd.as_deref())?;
+    let pi = find_pi_binary().ok_or("pi binary not found")?;
     let mut cmd = Command::new(&pi);
     cmd.args(&args)
         .env("NO_COLOR", "1")
         .env("PATH", child_path())
+        .envs(extra_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     if let Some(cwd) = cwd {
-        let path = std::path::PathBuf::from(cwd);
-        if !path.is_dir() {
-            return Err("workspace для локальной установки не существует".into());
-        }
-        cmd.current_dir(path);
+        cmd.current_dir(cwd);
     }
     #[cfg(unix)]
     unsafe {
@@ -244,7 +291,7 @@ pub async fn pi_cli_run_impl<R: Runtime>(
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-
+    let mut readers = Vec::new();
     for (stream_name, reader) in [
         (
             "out",
@@ -255,51 +302,54 @@ pub async fn pi_cli_run_impl<R: Runtime>(
             stderr.map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
         ),
     ] {
-        if let Some(r) = reader {
+        if let Some(reader) = reader {
             let app = app.clone();
             let run_id = run_id.clone();
             let stream_name = stream_name.to_string();
-            tauri::async_runtime::spawn(async move {
-                let mut lines = BufReader::new(r).lines();
+            readers.push(tauri::async_runtime::spawn(async move {
+                let mut lines = BufReader::new(reader).lines();
                 while let Ok(Some(mut line)) = lines.next_line().await {
                     crate::text::truncate_bytes(&mut line, 4000);
-                    let _ = app.emit(
-                        "pi-cli-output",
-                        PiCliOutput {
-                            run_id: run_id.clone(),
-                            stream: Some(stream_name.clone()),
-                            line: Some(line),
-                            done: false,
-                            code: None,
-                        },
-                    );
+                    emit_cli_line(&app, &run_id, &stream_name, line);
                 }
-            });
+            }));
         }
     }
 
-    {
-        let app = app.clone();
-        let run_id = run_id.clone();
-        tauri::async_runtime::spawn(async move {
-            let code = child.wait().await.ok().and_then(|s| s.code());
-            if let Some(pid) = child_pid {
-                if let Ok(mut groups) = RUNNING_GROUPS.lock() {
-                    groups.remove(&pid);
-                }
-            }
-            let _ = app.emit(
-                "pi-cli-output",
-                PiCliOutput {
-                    run_id,
-                    stream: None,
-                    line: None,
-                    done: true,
-                    code,
-                },
-            );
-        });
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| format!("pi management command failed: {error}"));
+    if let Some(pid) = child_pid {
+        if let Ok(mut groups) = RUNNING_GROUPS.lock() {
+            groups.remove(&pid);
+        }
     }
+    for reader in readers {
+        let _ = reader.await;
+    }
+    status.map(|value| value.code().unwrap_or(1))
+}
+
+pub async fn pi_cli_run_impl<R: Runtime>(
+    app: AppHandle<R>,
+    args: Vec<String>,
+    cwd: Option<String>,
+) -> Result<String, String> {
+    validate_management_args(&args, cwd.as_deref())?;
+    let run_id = next_run_id();
+    let task_run_id = run_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let code =
+            match run_pi_process(app.clone(), task_run_id.clone(), args, cwd, Vec::new()).await {
+                Ok(code) => code,
+                Err(error) => {
+                    emit_cli_line(&app, &task_run_id, "err", error);
+                    1
+                }
+            };
+        emit_cli_done(&app, &task_run_id, code);
+    });
 
     Ok(run_id)
 }

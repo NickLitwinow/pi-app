@@ -36,4 +36,55 @@ describe("background work lifecycle", () => {
     expect(activeBackgroundTaskCount(ws)).toBe(0);
     expect(workspaceHasActiveWork(ws)).toBe(false);
   });
+
+  it("keeps the composer in stop mode while a persisted workflow step is running", () => {
+    const ws = emptyWorkspaceChat();
+    ws.alive = true;
+    ws.chat.workflow = {
+      version: 3,
+      runId: "wf-active",
+      createdAt: 1,
+      updatedAt: 2,
+      objective: "Finish the workflow",
+      profile: "feature",
+      status: "active",
+      approved: true,
+      editsPending: true,
+      changedFiles: [],
+      intent: {
+        primary: "build",
+        profile: "feature",
+        risk: "medium",
+        needsResearch: false,
+        needsPreview: false,
+        allowsMutation: true,
+        allowsDeletion: false,
+        requiresPlan: true,
+        requiresSandbox: true,
+        requiresEvaluator: true,
+        requiresHumanApproval: false,
+        signals: [],
+      },
+      steps: [{
+        id: "evaluate",
+        label: "Independent evaluation",
+        kind: "evaluate",
+        deps: [],
+        status: "running",
+        acceptance: "Evaluator completes.",
+        required: true,
+        owner: "evaluator",
+        maxAttempts: 5,
+        attempts: 1,
+      }],
+      events: [],
+    };
+
+    expect(ws.liveStreaming).toBe(false);
+    expect(activeBackgroundTaskCount(ws)).toBe(0);
+    expect(workspaceHasActiveWork(ws)).toBe(true);
+
+    ws.alive = false;
+    expect(workspaceHasActiveWork(ws)).toBe(false);
+  });
 });

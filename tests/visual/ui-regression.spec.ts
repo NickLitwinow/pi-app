@@ -263,7 +263,35 @@ test("Workflow control center — plan, tasks, timeline and gates", async ({ pag
   await expect(dock.getByText("Review rewind transaction", { exact: true })).toBeVisible();
   await expectNoHorizontalOverflow(page);
   await expect(page).toHaveScreenshot("workflow-control-center.png", { fullPage: true });
+
+  const tabs = dock.locator(".workflow-tabs button");
+  const widthsBefore = await tabs.evaluateAll((buttons) => buttons.map((button) => button.getBoundingClientRect().width));
+  await dock.getByRole("button", { name: "Transcript" }).click();
+  await expect(dock.locator(".task-transcript")).toBeVisible();
+  const widthsAfter = await tabs.evaluateAll((buttons) => buttons.map((button) => button.getBoundingClientRect().width));
+  expect(widthsAfter).toEqual(widthsBefore);
+  await expectNoHorizontalOverflow(page);
+
   await blockPermission.click();
+  await expect(page.locator(".composer textarea")).toHaveAttribute("placeholder", "Workflow продолжает работу · Esc — остановить");
+  await expect(page.getByTitle("Остановить активный workflow и фоновые задачи (Esc)")).toBeVisible();
+});
+
+test("Workflow repair prompt is a compact system card instead of a user bubble", async ({ page }) => {
+  await boot(page);
+  const composer = page.locator(".composer textarea");
+  await composer.fill("[mock-workflow-retry] show retry card");
+  await composer.press("Enter");
+
+  const card = page.locator(".workflow-continuation");
+  await expect(card).toBeVisible();
+  await expect(card.getByText("Workflow продолжает работу", { exact: true })).toBeVisible();
+  await expect(card.getByText("Independent evaluation запросила исправления", { exact: true })).toBeVisible();
+  await expect(card.locator(".workflow-continuation-body")).toBeHidden();
+  await card.locator("summary").click();
+  await expect(card.locator(".workflow-continuation-body")).toBeVisible();
+  await expect(card).toContainText("machine-checkable clause protocol");
+  await expectNoHorizontalOverflow(page);
 });
 
 test("Same-session rewind restores text and image, then resends without creating a session", async ({ page }) => {

@@ -105,12 +105,21 @@ pub fn read_project_pi_config(cwd: String, name: String) -> Result<ConfigFile, S
 }
 
 #[tauri::command]
-pub fn write_project_settings(cwd: String, content: String) -> Result<(), String> {
-    write_project_pi_config(cwd, "settings".into(), content)
+pub async fn write_project_settings(cwd: String, content: String) -> Result<(), String> {
+    write_project_pi_config(cwd, "settings".into(), content).await
 }
 
 #[tauri::command]
-pub fn write_project_pi_config(cwd: String, name: String, content: String) -> Result<(), String> {
+pub async fn write_project_pi_config(
+    cwd: String,
+    name: String,
+    content: String,
+) -> Result<(), String> {
+    let _lifecycle_lock = crate::extension_lifecycle::acquire_lifecycle_lock().await?;
+    write_project_pi_config_impl(cwd, name, content)
+}
+
+fn write_project_pi_config_impl(cwd: String, name: String, content: String) -> Result<(), String> {
     if !matches!(name.as_str(), "settings" | "mcp") {
         return Err(format!("unknown project config: {name}"));
     }
@@ -118,7 +127,11 @@ pub fn write_project_pi_config(cwd: String, name: String, content: String) -> Re
     if !root.is_dir() {
         return Err("workspace не существует".into());
     }
-    write_json_atomic(&root.join(".pi").join(format!("{name}.json")), &content)
+    let path = root.join(".pi").join(format!("{name}.json"));
+    if name == "settings" {
+        reject_unmanaged_package_change(&path, &content)?;
+    }
+    write_json_atomic(&path, &content)
 }
 
 /// Validate JSON, back up the previous version, then write atomically (tmp + rename).
@@ -149,9 +162,29 @@ pub fn write_json_atomic(path: &Path, content: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn write_pi_config(name: String, content: String) -> Result<(), String> {
+pub async fn write_pi_config(name: String, content: String) -> Result<(), String> {
+    let _lifecycle_lock = crate::extension_lifecycle::acquire_lifecycle_lock().await?;
     let path = pi_config_path(&name)?;
+    if name == "settings" {
+        reject_unmanaged_package_change(&path, &content)?;
+    }
     write_json_atomic(&path, &content)
+}
+
+fn reject_unmanaged_package_change(path: &Path, content: &str) -> Result<(), String> {
+    let next: Value =
+        serde_json::from_str(content).map_err(|error| format!("невалидный JSON: {error}"))?;
+    let current: Value = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if current.get("packages") != next.get("packages") {
+        return Err(
+            "Список packages управляется транзакционно через Library; используйте установку, удаление или переключатель ресурса там"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 // ---------- app's own config ----------
@@ -1008,6 +1041,24 @@ mod tests {
     }
 
     #[test]
+    fn generic_settings_editor_cannot_bypass_package_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(&path, r#"{"theme":"dark","packages":["npm:one"]}"#).unwrap();
+        assert!(reject_unmanaged_package_change(
+            &path,
+            r#"{"theme":"light","packages":["npm:one"]}"#
+        )
+        .is_ok());
+        assert!(reject_unmanaged_package_change(
+            &path,
+            r#"{"theme":"dark","packages":["npm:two"]}"#
+        )
+        .unwrap_err()
+        .contains("Library"));
+    }
+
+    #[test]
     fn concurrent_atomic_writes_use_distinct_temp_files() {
         let tmp = tempfile::tempdir().unwrap();
         let path = std::sync::Arc::new(tmp.path().join("settings.json"));
@@ -1398,7 +1449,8 @@ mod tests {
     fn project_config_is_scoped_and_rejects_unknown_names() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().to_string_lossy().into_owned();
-        write_project_pi_config(cwd.clone(), "mcp".into(), "{\"mcpServers\":{}}".into()).unwrap();
+        write_project_pi_config_impl(cwd.clone(), "mcp".into(), "{\"mcpServers\":{}}".into())
+            .unwrap();
         let read = read_project_pi_config(cwd.clone(), "mcp".into()).unwrap();
         assert!(read.path.ends_with(".pi/mcp.json"));
         assert!(read.content.contains("mcpServers"));

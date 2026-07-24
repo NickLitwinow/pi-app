@@ -212,6 +212,9 @@ export default function UpdateModal({ onClose }: { onClose: () => void }) {
                 Обновить всё
               </button>
             </div>
+            <div className="hint update-empty">
+              Safe update: snapshot → compatibility overlays → запуск реального Pi → commit. При ошибке прежняя версия восстановится автоматически; активные agent/background задачи не прерываются.
+            </div>
             {packageUpdates.length > 0 ? (
               <div className="update-package-list">
                 {packageUpdates.map((pkg) => (

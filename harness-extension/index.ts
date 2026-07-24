@@ -275,6 +275,7 @@ export default function harness(pi: ExtensionAPI) {
 	let previewRuntime: PreviewRuntime = { status: "idle", updatedAt: Date.now(), source: "agent" };
 	const toolArgs = new Map<string, unknown>();
 	const backgroundTasks = new Map<string, BackgroundTask>();
+	const intentionallyStoppedTaskIds = new Set<string>();
 
 	const log = (line: string) => {
 		if (!debugLog) return;
@@ -448,14 +449,33 @@ export default function harness(pi: ExtensionAPI) {
 	const stopTask = async (id: string) => {
 		const prior = backgroundTasks.get(id);
 		const live = subagentRegistry()?.getRecord(id);
+		const stoppedEvaluator = state.evaluatorTaskId === id;
+		intentionallyStoppedTaskIds.add(id);
+		const settleIntentionalStop = () => {
+			if (!stoppedEvaluator) return;
+			state.evaluatorTaskId = undefined;
+			const evaluate = state.steps.find((step) => step.id === "evaluate");
+			if (evaluate?.status === "running") {
+				state = resetWorkflowStep(state, "evaluate", "Evaluator stopped by the user; retry remains available in this session.");
+				state.editsPending = true;
+				publishState();
+			}
+		};
 		if (!live && prior && (prior.status === "queued" || prior.status === "running")) {
 			rememberTask({ ...prior, status: "cancelled", error: prior.error ?? "Task process is no longer live; stale state recovered.", completedAt: Date.now() });
 			publishTasks();
+			settleIntentionalStop();
 			return;
 		}
-		await rpc<void>("subagents:rpc:stop", { agentId: id });
+		try {
+			await rpc<void>("subagents:rpc:stop", { agentId: id });
+		} catch (error) {
+			intentionallyStoppedTaskIds.delete(id);
+			throw error;
+		}
 		if (prior) rememberTask({ ...prior, status: "cancelled", completedAt: Date.now() });
 		publishTasks();
+		settleIntentionalStop();
 	};
 
 	const spawnTask = async (type: string, prompt: string, description: string, isBackground = true, isolation?: "worktree"): Promise<string> => {
@@ -541,6 +561,7 @@ export default function harness(pi: ExtensionAPI) {
 			const status = task.status === "failed" || task.status === "cancelled" ? task.status : fallback;
 			rememberTask({ ...task, status });
 			publishTasks();
+			if (intentionallyStoppedTaskIds.delete(task.id)) return;
 
 			if (task.id !== state.evaluatorTaskId) return;
 			state.evaluatorTaskId = undefined;
@@ -1642,6 +1663,7 @@ export default function harness(pi: ExtensionAPI) {
 		for (const key of ["pi-app-workflow-state", "pi-app-background-state", "pi-app-checkpoint-state", "pi-app-preview-state"]) ctx.ui.setWidget(key, undefined);
 		taskUi = undefined;
 		backgroundTasks.clear();
+		intentionallyStoppedTaskIds.clear();
 	});
 
 	log(`loaded v3 profile=${enabled ? "workflow" : "baseline"} maxLoops=${MAX_AUTO_LOOPS} ablations=${[...ABLATIONS].join(",")}`);

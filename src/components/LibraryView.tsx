@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { getBackend } from "../lib/backend";
-import type { ConfigFile, PackageKind, PackageSetting, SkillInfo } from "../lib/types";
+import type { ConfigFile, PackageKind, SkillInfo } from "../lib/types";
 import { updateAppConfig, useStore } from "../state/store";
-import Marketplace, { setPackageResourceEnabled, useInstalledPackages, useRunPi } from "./Marketplace";
+import Marketplace, { useInstalledPackages, useRunPi } from "./Marketplace";
 import { CheckIcon, PackageIcon } from "./icons";
 
 type LibraryTab = PackageKind | "profiles";
@@ -137,17 +137,13 @@ function Profiles({ scope, cwd }: { scope: "global" | "project"; cwd: string | n
   const applyProfilePolicy = async (pkg: ProfilePackage) => {
     if (typeof pkg === "string" || !pkg.disableSkills) return;
     const be = await getBackend();
-    const file = scope === "project"
-      ? await be.invoke<ConfigFile>("read_project_settings", { cwd })
-      : await be.invoke<ConfigFile>("read_pi_config", { name: "settings" });
-    const parsed = JSON.parse(file.content) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file.path}: корень должен быть объектом`);
-    const settings = parsed as Record<string, unknown>;
-    const entries = Array.isArray(settings.packages) ? settings.packages as PackageSetting[] : [];
-    const packages = setPackageResourceEnabled(entries, pkg.name, "skill", false);
-    const content = JSON.stringify({ ...settings, packages }, null, 2) + "\n";
-    if (scope === "project") await be.invoke("write_project_settings", { cwd, content });
-    else await be.invoke("write_pi_config", { name: "settings", content });
+    await be.invoke("set_extension_resource_enabled", {
+      scope,
+      cwd,
+      packageIdentifier: profilePackageSource(pkg),
+      kind: "skill",
+      enabled: false,
+    });
   };
 
   const installProfile = async (packages: ProfilePackage[]) => {
@@ -318,7 +314,7 @@ export default function LibraryView() {
             </div>
           </section>
         )}
-        <div className="library-risk"><span>Безопасность</span> Extensions исполняют код с правами пользователя; Skills и Prompts меняют инструкции модели. Проверяйте repo перед установкой.</div>
+        <div className="library-risk"><span>Безопасность</span> Extensions исполняют код с правами пользователя. Установка, обновление, отключение и удаление проходят snapshot, проверку harness и автоматический rollback; активная задача никогда не прерывается.</div>
         <nav className="library-tabs">
           {COLLECTIONS.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => setTab(item.id)}><span>{item.label}</span><small>{item.desc}</small></button>)}
         </nav>

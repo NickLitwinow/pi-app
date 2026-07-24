@@ -8,7 +8,6 @@ import { modelAliasKey, modelDisplayName, modelIdDisplayName } from "../lib/mode
 import type { BackgroundTaskView, ComposerAttachment, ExtUiRequest, GitSummary, ModelInfo } from "../lib/types";
 import { formatRunDuration } from "../lib/turn-timing";
 import {
-  abortAgent,
   activeBackgroundTaskCount,
   compactContext,
   controlBackgroundTask,
@@ -29,9 +28,11 @@ import {
   setAutoCompaction,
   setModel,
   setThinkingLevel,
+  stopWorkspaceWork,
   toggleMessagePin,
   updateAppConfig,
   useStore,
+  workspaceHasActiveWork,
   emptyWorkspaceChat,
   effectiveModel,
   effectiveThinking,
@@ -856,6 +857,7 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const streaming = ws.chat.isStreaming;
+  const activeWork = workspaceHasActiveWork(ws);
   const pendingInsert = useStore((s) => s.pendingInsert);
   const pendingFiles = useStore((s) => s.pendingFiles);
   const sendKeyBehavior = useStore((s) => s.appConfig.sendKeyBehavior ?? "enter");
@@ -1059,8 +1061,10 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
         void submit(streaming && e.altKey);
       }
     }
-    if (e.key === "Escape" && streaming) {
-      void abortAgent(cwd);
+    if (e.key === "Escape" && activeWork) {
+      void stopWorkspaceWork(cwd).catch((error) => {
+        notifyChat(cwd, "warning", error instanceof Error ? error.message : String(error));
+      });
     }
   };
 
@@ -1167,6 +1171,8 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
           placeholder={
             streaming
               ? `${sendKeyBehavior === "mod-enter" ? "⌘Enter" : "Enter"} — вмешаться (steer), ⌥ — после завершения, Esc — стоп`
+              : activeWork
+                ? "Workflow продолжает работу · Esc — остановить"
               : `Сообщение для агента в ${cwd.split("/").pop()}… (/ — команды)`
           }
           value={text}
@@ -1235,10 +1241,22 @@ function Composer({ cwd, ws }: { cwd: string; ws: WorkspaceChat }) {
               >
                 Затем
               </button>
-              <button className="danger" title="Остановить (Esc)" onClick={() => void abortAgent(cwd)}>
+              <button className="danger" title="Остановить активную работу (Esc)" onClick={() => void stopWorkspaceWork(cwd).catch((error) => {
+                notifyChat(cwd, "warning", error instanceof Error ? error.message : String(error));
+              })}>
                 <StopIcon size={15} />
               </button>
             </>
+          ) : activeWork ? (
+            <button
+              className="danger"
+              title="Остановить активный workflow и фоновые задачи (Esc)"
+              onClick={() => void stopWorkspaceWork(cwd).catch((error) => {
+                notifyChat(cwd, "warning", error instanceof Error ? error.message : String(error));
+              })}
+            >
+              <StopIcon size={15} />
+            </button>
           ) : (
             <button className="primary" title={`Отправить (${sendKeyBehavior === "mod-enter" ? "⌘Enter" : "Enter"})`} disabled={!text.trim()} onClick={() => void submit()}>
               <SendIcon size={14} motion={text.trim() ? "lift" : undefined} />

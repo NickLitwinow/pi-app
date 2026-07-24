@@ -553,6 +553,54 @@ function toolCallIds(msg: ChatMessage): string[] {
   return ids;
 }
 
+function workflowContinuationMeta(msg: ChatMessage, viaExtension?: boolean): {
+  title: string;
+  reason: string;
+  text: string;
+} | null {
+  const text = contentText(msg.content).trim();
+  const isWorkflowMessage = msg.customType === "pi-app-workflow"
+    || (viaExtension && /^Continue the existing objective\./i.test(text));
+  if (!isWorkflowMessage || !text) return null;
+  const details = msg.details && typeof msg.details === "object"
+    ? msg.details as Record<string, unknown>
+    : {};
+  const reason = typeof details.reason === "string" ? details.reason : "";
+  const labels: Record<string, string> = {
+    "evaluator-rejected": "Independent evaluation запросила исправления",
+    "verifier-failed": "Не прошла обязательная проверка проекта",
+    "no-observed-mutation": "Harness не обнаружил ожидаемых изменений",
+    "preview-evidence-missing": "Не хватает проверки через live preview",
+    "delegated-work-settled": "Фоновая работа готова к интеграции",
+  };
+  const attempt = /\((\d+\/\d+)\)/.exec(text)?.[1];
+  return {
+    title: "Workflow продолжает работу",
+    reason: `${labels[reason] ?? "Harness запустил следующий repair-шаг"}${attempt ? ` · попытка ${attempt}` : ""}`,
+    text,
+  };
+}
+
+function WorkflowContinuationCard({ msg, viaExtension }: { msg: ChatMessage; viaExtension?: boolean }) {
+  const meta = workflowContinuationMeta(msg, viaExtension);
+  if (!meta) return null;
+  return (
+    <div className="msg workflow-continuation" role="status">
+      <details>
+        <summary>
+          <span className="workflow-continuation-icon"><WarnIcon size={13} /></span>
+          <span>
+            <strong>{meta.title}</strong>
+            <small>{meta.reason}</small>
+          </span>
+          <ChevronIcon size={12} />
+        </summary>
+        <div className="workflow-continuation-body">{meta.text}</div>
+      </details>
+    </div>
+  );
+}
+
 const MessageViewImpl = function MessageView({
   msg,
   execs,
@@ -597,6 +645,9 @@ const MessageViewImpl = function MessageView({
   const aliases = useStore((s) => s.appConfig.modelAliases ?? {});
 
   if (msg.role === "user") {
+    if (workflowContinuationMeta(msg, viaExtension)) {
+      return <WorkflowContinuationCard msg={msg} viaExtension={viaExtension} />;
+    }
     return (
       <div className="msg user" data-pin={pinId}>
         {cwd != null && userIndex != null && (

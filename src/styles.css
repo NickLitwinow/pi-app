@@ -569,6 +569,30 @@ html[data-effects="on"] .background-task-popover { background: color-mix(in srgb
   padding: 8px 14px; max-width: 78%;
 }
 .msg.assistant { line-height: 1.55; }
+.workflow-continuation { display: flex; justify-content: center; margin: 4px 0 14px; }
+.workflow-continuation details {
+  width: min(100%, 680px); overflow: hidden; border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--border));
+  border-radius: 10px; background: color-mix(in srgb, var(--warn) 5%, var(--bg-raised));
+}
+.workflow-continuation summary {
+  display: grid; grid-template-columns: 25px minmax(0, 1fr) 14px; align-items: center; gap: 8px;
+  padding: 8px 10px; cursor: pointer; list-style: none; color: var(--text-dim);
+}
+.workflow-continuation summary::-webkit-details-marker { display: none; }
+.workflow-continuation summary:hover { background: color-mix(in srgb, var(--warn) 7%, transparent); }
+.workflow-continuation summary > span:nth-child(2) { display: grid; min-width: 0; gap: 1px; }
+.workflow-continuation summary strong { color: var(--text); font-size: 11.5px; font-weight: 620; }
+.workflow-continuation summary small { overflow: hidden; color: var(--text-dim); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.workflow-continuation summary > svg { transition: transform var(--dur-1) ease; }
+.workflow-continuation details[open] summary > svg { transform: rotate(90deg); }
+.workflow-continuation-icon {
+  display: grid; place-items: center; width: 25px; height: 25px; border-radius: 7px;
+  color: var(--warn); background: color-mix(in srgb, var(--warn) 13%, transparent);
+}
+.workflow-continuation-body {
+  max-height: 220px; overflow: auto; padding: 9px 11px 11px 43px; border-top: 1px solid var(--border);
+  color: var(--text-dim); font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
+}
 
 .md :first-child { margin-top: 0; }
 .md :last-child { margin-bottom: 0; }
@@ -849,7 +873,7 @@ html[data-effects="on"] .background-task-popover { background: color-mix(in srgb
 /* persisted workflow / background tasks control center */
 .workflow-dock {
   margin: 0 0 8px; border: 1px solid var(--border); border-radius: 11px;
-  background: var(--bg-raised); overflow: hidden; box-shadow: var(--hairline-top);
+  min-width: 0; background: var(--bg-raised); overflow: hidden; box-shadow: var(--hairline-top);
 }
 .workflow-summary {
   width: 100%; min-height: 34px; display: flex; align-items: center; gap: 8px;
@@ -864,17 +888,18 @@ html[data-effects="on"] .background-task-popover { background: color-mix(in srgb
 .step-state.waiting, .step-state.queued { background: #d99c2b; }
 .step-state.skipped, .step-state.cancelled { background: var(--text-dim); opacity: .55; }
 .workflow-error { color: var(--danger); }
-.workflow-panel { border-top: 1px solid var(--border); max-height: min(440px, 52vh); overflow: hidden; display: flex; flex-direction: column; }
-.workflow-tabs { padding: 5px 6px; display: flex; gap: 3px; border-bottom: 1px solid var(--border); overflow-x: auto; }
-.workflow-tabs button { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 6px; color: var(--text-dim); font-size: 11px; white-space: nowrap; }
+.workflow-panel { min-width: 0; border-top: 1px solid var(--border); max-height: min(440px, 52vh); overflow: hidden; display: flex; flex-direction: column; }
+.workflow-tabs { min-width: 0; padding: 5px 6px; display: flex; gap: 3px; border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: none; }
+.workflow-tabs::-webkit-scrollbar { display: none; }
+.workflow-tabs button { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 6px; color: var(--text-dim); font-size: 11px; white-space: nowrap; }
 .workflow-tabs button:hover, .workflow-tabs button.active { color: var(--text); background: var(--bg-hover); }
 .workflow-tabs small { min-width: 15px; padding: 0 4px; border-radius: 8px; background: var(--brand-soft); color: var(--brand); text-align: center; }
-.workflow-list { padding: 7px; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
+.workflow-list { min-width: 0; padding: 7px; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; overflow-x: hidden; }
 .workflow-empty { color: var(--text-dim); font-size: 11.5px; padding: 10px; text-align: center; }
 .workflow-objective { display: grid; gap: 4px; padding: 8px 9px; border-left: 2px solid var(--brand); border-radius: 6px; background: var(--brand-soft); }
 .workflow-objective strong { color: var(--text); font-size: 11px; font-weight: 600; line-height: 1.4; }
 .workflow-objective small { color: var(--text-dim); font: 9.5px/1.35 var(--font-mono); }
-.workflow-step, .task-card, .branch-card, .context-record { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+.workflow-step, .task-card, .branch-card, .context-record { min-width: 0; max-width: 100%; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
 .plan-backlog-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 2px 0; }
 .plan-backlog-head small { color: var(--muted); }
 .plan-task-body { display: flex; flex-direction: column; gap: 3px; }
@@ -887,7 +912,7 @@ html[data-effects="on"] .background-task-popover { background: color-mix(in srgb
 .workflow-step > div { min-width: 0; }
 .workflow-step strong, .task-head strong, .branch-card strong { color: var(--text); font-size: 11.5px; font-weight: 610; }
 .workflow-step p, .branch-card p { margin: 2px 0; color: var(--text-dim); font-size: 10.5px; line-height: 1.35; }
-.workflow-step small, .branch-card small { color: var(--text-dim); font-family: var(--font-mono); font-size: 9.5px; }
+.workflow-step small, .branch-card small { color: var(--text-dim); font-family: var(--font-mono); font-size: 9.5px; overflow-wrap: anywhere; }
 .workflow-step b { color: var(--text-dim); font-size: 9.5px; font-weight: 500; text-transform: uppercase; }
 .workflow-primary { align-self: flex-start; padding: 6px 10px; border-radius: 7px; background: var(--brand); color: white; font-size: 11px; }
 .workflow-primary:disabled { opacity: .55; }
@@ -896,7 +921,7 @@ html[data-effects="on"] .background-task-popover { background: color-mix(in srgb
 .workflow-timeline > div { display: grid; grid-template-columns: 70px minmax(0,1fr); gap: 6px; margin-top: 5px; color: var(--text-dim); }
 .workflow-timeline time { font-family: var(--font-mono); }
 .context-record p { margin: 7px 0; color: var(--text-dim); white-space: pre-wrap; }
-.context-record pre, .task-transcript { max-height: 190px; overflow: auto; margin: 7px 0 0; padding: 7px; border-radius: 6px; background: var(--bg); color: var(--text-dim); font: 10px/1.4 var(--font-mono); white-space: pre-wrap; }
+.context-record pre, .task-transcript { box-sizing: border-box; width: 100%; max-width: 100%; max-height: 190px; overflow: auto; margin: 7px 0 0; padding: 7px; border-radius: 6px; background: var(--bg); color: var(--text-dim); font: 10px/1.4 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .task-card { padding: 8px; }
 .task-head { display: grid; grid-template-columns: 10px minmax(0,1fr) auto; align-items: center; gap: 7px; }
 .task-head small { color: var(--text-dim); font-size: 9.5px; }

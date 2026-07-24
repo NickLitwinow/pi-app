@@ -92,10 +92,15 @@ export function activeBackgroundTaskCount(ws: WorkspaceChat): number {
   return ws.chat.backgroundTasks.filter((task) => task.status === "queued" || task.status === "running").length;
 }
 
-/** Foreground generation and harness background workers share one pi process.
- * Both therefore protect its live session from switching, restart, and close. */
+export function hasRunningWorkflowStep(ws: WorkspaceChat): boolean {
+  return Boolean(ws.alive && ws.chat.workflow?.steps.some((step) => step.status === "running"));
+}
+
+/** Foreground generation, persisted workflow steps and harness background
+ * workers share one Pi session. Every one of them therefore protects the live
+ * session from switching, restart and close. */
 export function workspaceHasActiveWork(ws: WorkspaceChat): boolean {
-  return ws.liveStreaming || activeBackgroundTaskCount(ws) > 0;
+  return ws.liveStreaming || activeBackgroundTaskCount(ws) > 0 || hasRunningWorkflowStep(ws);
 }
 
 export function emptyWorkspaceChat(): WorkspaceChat {
@@ -796,6 +801,35 @@ export async function sendFollowUp(cwd: string, text: string): Promise<void> {
 
 export async function abortAgent(cwd: string): Promise<void> {
   await rpcSend(cwd, { type: "abort" }).catch(() => {});
+}
+
+/** Stop everything represented by the composer's square control. Foreground
+ * generation is aborted first so slash commands can safely cancel retained
+ * background workers afterwards. */
+export async function stopWorkspaceWork(cwd: string): Promise<void> {
+  const before = getChat(cwd);
+  const taskIds = before.chat.backgroundTasks
+    .filter((task) => task.status === "queued" || task.status === "running")
+    .map((task) => task.id);
+  if (before.liveStreaming || before.chat.isStreaming) {
+    await abortAgent(cwd);
+    await waitForAgentIdle(cwd, 10_000).catch(() => {});
+  }
+  const failures: string[] = [];
+  for (const id of taskIds) {
+    try {
+      await controlBackgroundTask(cwd, "cancel", id);
+    } catch (error) {
+      failures.push(`${id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  // A running workflow step without a foreground/background worker can still
+  // be in the short agent-settlement window; abort is harmless and lets the
+  // harness reconcile that persisted step.
+  if (taskIds.length === 0 && hasRunningWorkflowStep(getChat(cwd))) {
+    await abortAgent(cwd);
+  }
+  if (failures.length > 0) throw new Error(`Не удалось остановить часть фоновой работы:\n${failures.join("\n")}`);
 }
 
 /** Агента ещё нет — выбор запоминаем и применяем сразу после спавна (ensureAgent). */

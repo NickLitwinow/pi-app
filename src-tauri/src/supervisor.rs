@@ -342,6 +342,31 @@ pub struct Supervisor<R: Runtime> {
     app: AppHandle<R>,
     agents: Arc<Mutex<HashMap<String, Agent>>>,
     counter: AtomicU64,
+    extension_mutation: Arc<AtomicBool>,
+    agents_starting: Arc<AtomicU64>,
+}
+
+/// Keeps extension package mutations and agent startup mutually exclusive.
+/// The lease is owned by the complete transaction (including validation and
+/// rollback), so a new extension host can never observe a half-written tree.
+pub struct ExtensionMutationLease {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for ExtensionMutationLease {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+struct AgentStartLease {
+    count: Arc<AtomicU64>,
+}
+
+impl Drop for AgentStartLease {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -589,9 +614,53 @@ impl<R: Runtime> Supervisor<R> {
             app,
             agents: Arc::new(Mutex::new(HashMap::new())),
             counter: AtomicU64::new(1),
+            extension_mutation: Arc::new(AtomicBool::new(false)),
+            agents_starting: Arc::new(AtomicU64::new(0)),
         };
         sup.start_reaper();
         sup
+    }
+
+    pub fn begin_extension_mutation(&self) -> Result<ExtensionMutationLease, String> {
+        self.extension_mutation
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "Другая операция с дополнениями уже выполняется".to_string())?;
+        Ok(ExtensionMutationLease {
+            flag: self.extension_mutation.clone(),
+        })
+    }
+
+    /// Extension hosts are process-scoped. Idle hosts can be restarted without
+    /// losing a session; an active foreground/background workload must never be
+    /// interrupted by a package update.
+    pub async fn quiesce_extension_hosts(&self) -> Result<usize, String> {
+        // A spawn that started immediately before the mutation flag was raised
+        // must finish registering before we inspect the host table.
+        let start_wait = std::time::Instant::now();
+        while self.agents_starting.load(Ordering::Acquire) > 0 {
+            if start_wait.elapsed() > std::time::Duration::from_secs(30) {
+                return Err("Не удалось дождаться запуска текущей agent-сессии".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (busy, idle): (Vec<_>, Vec<_>) = {
+            let agents = self.agents.lock().await;
+            agents
+                .iter()
+                .map(|(id, agent)| (id.clone(), agent_is_busy(agent)))
+                .partition(|(_, is_busy)| *is_busy)
+        };
+        if !busy.is_empty() {
+            return Err(format!(
+                "Обновление дополнений отложено: {} активн. agent/background задач. Дождитесь их завершения или остановите вручную.",
+                busy.len()
+            ));
+        }
+        let count = idle.len();
+        for (id, _) in idle {
+            kill_by_id(&self.agents, &self.app, &id, "extensions-reload").await;
+        }
+        Ok(count)
     }
 
     /// Kill agents that have been idle (no foreground turn, background task,
@@ -712,6 +781,26 @@ pub async fn spawn_agent_impl<R: Runtime>(
     sup: &Supervisor<R>,
     opts: SpawnOpts,
 ) -> Result<String, String> {
+    if let Some(error) = crate::extension_lifecycle::extension_start_blocker() {
+        return Err(format!(
+            "Agent не запущен: установленное дополнение не прошло harness compatibility check: {error}"
+        ));
+    }
+    if crate::extension_lifecycle::mutation_active_in_another_process() {
+        return Err(
+            "Дополнения обновляются в другом окне Pi; повторите отправку после завершения".into(),
+        );
+    }
+    sup.agents_starting.fetch_add(1, Ordering::AcqRel);
+    let _starting = AgentStartLease {
+        count: sup.agents_starting.clone(),
+    };
+    if sup.extension_mutation.load(Ordering::Acquire) {
+        return Err(
+            "Дополнения обновляются и проходят проверку; повторите отправку после завершения"
+                .into(),
+        );
+    }
     let pi = find_pi_binary()
         .ok_or("pi binary not found — install pi first (brew install pi or see pi.dev)")?;
 
@@ -1230,7 +1319,7 @@ pub async fn process_stats_impl<R: Runtime>(sup: &Supervisor<R>) -> Result<Vec<P
 mod tests {
     use super::{
         background_task_count, idle_reap_eligible, kill_group, parse_ps, preview_bridge_request,
-        workload_is_active, PREVIEW_BRIDGE_PREFIX,
+        workload_is_active, Supervisor, PREVIEW_BRIDGE_PREFIX,
     };
     use std::process::Stdio;
     use std::sync::Arc;
@@ -1266,6 +1355,18 @@ mod tests {
         assert!(workload_is_active(false, 2));
         assert!(workload_is_active(true, 0));
         assert!(!workload_is_active(false, 0));
+    }
+
+    #[test]
+    fn extension_mutation_lease_serializes_runtime_changes() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let supervisor = Supervisor::new(app.handle().clone());
+        let first = supervisor.begin_extension_mutation().unwrap();
+        assert!(supervisor.begin_extension_mutation().is_err());
+        drop(first);
+        assert!(supervisor.begin_extension_mutation().is_ok());
     }
 
     #[test]

@@ -200,6 +200,18 @@ class MockBackend implements Backend {
         })],
       });
     }
+    if (prompt.includes("[mock-workflow-retry]")) {
+      this.emitAgent(agentId, {
+        type: "message_end",
+        message: {
+          role: "user",
+          customType: "pi-app-workflow",
+          content: "Continue the existing objective. The evaluator claimed PASS but its output was discarded because it did not complete the required machine-checkable clause protocol.\n\nPerform a fresh adversarial audit against the authoritative contract before claiming there is nothing to repair.",
+          display: false,
+          details: { reason: "evaluator-rejected", evaluatorTaskId: "eval-mock" },
+        },
+      });
+    }
     if (prompt.includes("[mock-workflow]")) {
       const now = Date.now();
       const workflow = {
@@ -238,6 +250,7 @@ class MockBackend implements Backend {
         priority: "normal",
         branch: "pi-agent/rewind-review",
         baseSha: "abc1234",
+        transcript: `Independent evaluation\n${"clause-with-an-intentionally-long-unbroken-proof-segment-".repeat(180)}`,
       }];
       this.emitAgent(agentId, { type: "extension_ui_request", method: "setWidget", widgetKey: "pi-app-workflow-state", widgetLines: [JSON.stringify(workflow)] });
       this.emitAgent(agentId, { type: "extension_ui_request", method: "setWidget", widgetKey: "pi-app-background-state", widgetLines: [JSON.stringify(tasks)] });
@@ -742,6 +755,24 @@ class MockBackend implements Backend {
         else if (name === "mcp") this.mcp = content;
         else this.models = content;
         return undefined as T;
+      }
+      case "set_extension_resource_enabled": {
+        if (String(args.scope) !== "global") {
+          return JSON.stringify({ packages: ["npm:pi-skill-code-review"] }, null, 2) as T;
+        }
+        const parsed = JSON.parse(this.settings) as Record<string, unknown>;
+        const key = ({ extension: "extensions", skill: "skills", theme: "themes", prompt: "prompts" } as const)[String(args.kind) as "extension" | "skill" | "theme" | "prompt"];
+        const identifier = String(args.packageIdentifier);
+        const packages = Array.isArray(parsed.packages) ? parsed.packages.map((raw) => {
+          const source = typeof raw === "string" ? raw : raw && typeof raw === "object" && "source" in raw ? String(raw.source) : "";
+          if (source !== identifier && !source.includes(identifier)) return raw;
+          const next: Record<string, unknown> = typeof raw === "string" ? { source: raw } : { ...raw as Record<string, unknown> };
+          if (Boolean(args.enabled)) delete next[key];
+          else next[key] = [];
+          return Object.keys(next).length === 1 ? source : next;
+        }) : [];
+        this.settings = JSON.stringify({ ...parsed, packages }, null, 2) + "\n";
+        return this.settings as T;
       }
       case "list_skills":
         return [

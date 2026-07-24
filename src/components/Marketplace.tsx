@@ -86,7 +86,6 @@ export function useInstalledPackages(scope: "global" | "project" = "global", cwd
   setResourceEnabled: (packageName: string, kind: PackageKind, enabled: boolean) => Promise<void>;
 } {
   const [entries, setEntries] = useState<PackageSetting[]>([]);
-  const [settings, setSettings] = useState<Record<string, unknown>>({});
   const reload = useCallback(() => {
     void (async () => {
       const be = await getBackend();
@@ -99,10 +98,8 @@ export function useInstalledPackages(scope: "global" | "project" = "global", cwd
           ? parsed.packages.filter((item): item is PackageSetting =>
             typeof item === "string" || Boolean(item && typeof item === "object" && "source" in item && typeof item.source === "string"))
           : [];
-        setSettings(parsed);
         setEntries(packages);
       } catch {
-        setSettings({});
         setEntries([]);
       }
     })();
@@ -111,24 +108,27 @@ export function useInstalledPackages(scope: "global" | "project" = "global", cwd
   const installed = new Set(entries.map(packageNameFromSpec).filter((name): name is string => Boolean(name)));
   const specs = entries.map(packageSource);
   const setResourceEnabled = useCallback(async (packageName: string, kind: PackageKind, enabled: boolean) => {
-    const nextEntries = setPackageResourceEnabled(entries, packageName, kind, enabled);
-    const nextSettings = { ...settings, packages: nextEntries };
-    setEntries(nextEntries);
-    setSettings(nextSettings);
     try {
       const be = await getBackend();
-      const content = JSON.stringify(nextSettings, null, 2) + "\n";
-      if (scope === "project") {
-        if (!cwd) throw new Error("Сначала откройте проект");
-        await be.invoke("write_project_settings", { cwd, content });
-      } else {
-        await be.invoke("write_pi_config", { name: "settings", content });
-      }
+      if (scope === "project" && !cwd) throw new Error("Сначала откройте проект");
+      const content = await be.invoke<string>("set_extension_resource_enabled", {
+        scope,
+        cwd: cwd ?? null,
+        packageIdentifier: packageName,
+        kind,
+        enabled,
+      });
+      const parsed = JSON.parse(content) as Record<string, unknown>;
+      const packages = Array.isArray(parsed.packages)
+        ? parsed.packages.filter((item): item is PackageSetting =>
+          typeof item === "string" || Boolean(item && typeof item === "object" && "source" in item && typeof item.source === "string"))
+        : [];
+      setEntries(packages);
     } catch (error) {
       reload();
       throw error;
     }
-  }, [cwd, entries, reload, scope, settings]);
+  }, [cwd, reload, scope]);
   return { installed, specs, entries, reload, setResourceEnabled };
 }
 
@@ -396,6 +396,7 @@ export default function Marketplace({
     const packageIdentifier = p.source ?? p.name;
     const installedSpec = entries.find((spec) => packageSource(spec) === packageIdentifier || packageNameFromSpec(spec) === p.name);
     const resourceEnabled = installedSpec ? isPackageResourceEnabled(installedSpec, kind) : true;
+    const coreResource = isHarnessCorePackage(p) && kind === "extension";
     return (
       <div key={packageIdentifier} className="card mk-card">
         <div className="mk-card-head">
@@ -437,9 +438,11 @@ export default function Marketplace({
             <>
               <button
                 className={`resource-toggle ${resourceEnabled ? "on" : ""}`}
-                disabled={running || resourceBusy !== null}
+                disabled={running || resourceBusy !== null || coreResource}
                 aria-pressed={resourceEnabled}
-                title={`${resourceEnabled ? "Отключить" : "Включить"} ${KIND_LABEL[kind]} пакета в этом scope`}
+                title={coreResource
+                  ? "Ядро harness всегда активно"
+                  : `${resourceEnabled ? "Отключить" : "Включить"} ${KIND_LABEL[kind]} пакета в этом scope`}
                 onClick={() => void toggleResource(packageIdentifier, !resourceEnabled)}
               >
                 <span aria-hidden="true" /> {resourceEnabled ? "Активно" : "Выключено"}
@@ -447,7 +450,14 @@ export default function Marketplace({
               {updateAvailable && (
                 <button className="primary" disabled={running || resourceBusy !== null} onClick={() => updatePackage(p)}>Обновить</button>
               )}
-              <button className="danger" disabled={running || resourceBusy !== null} onClick={() => void remove(p)}>Удалить</button>
+              <button
+                className="danger"
+                disabled={running || resourceBusy !== null || isHarnessCorePackage(p)}
+                title={isHarnessCorePackage(p) ? "Ядро harness нельзя удалить" : "Удалить пакет и его ресурсы"}
+                onClick={() => void remove(p)}
+              >
+                Удалить
+              </button>
             </>
           ) : (
             <button className="primary" disabled={running || resourceBusy !== null} onClick={() => install(p.name)}>
